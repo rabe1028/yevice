@@ -31,9 +31,17 @@ impl ServiceCatalog {
     }
 
     /// Register a typed service implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a service with the same `service_id` has already been registered.
     pub fn register<S: Service + 'static>(&mut self, service: S) {
-        self.services
-            .insert(service.id().to_string(), Box::new(ServiceAdapter(service)));
+        let id = service.id().to_string();
+        assert!(
+            !self.services.contains_key(&id),
+            "duplicate service registration for service_id '{id}'"
+        );
+        self.services.insert(id, Box::new(ServiceAdapter(service)));
     }
 
     /// Register a single connection rule.
@@ -155,5 +163,48 @@ impl ServiceCatalog {
             }
         }
         models
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use yevice_core::{cost::ResourceCost, resource::Provider, types::LogicalId};
+    use yevice_pricing::catalog::PriceCatalog;
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct DummySpec;
+
+    struct DummyService;
+
+    impl Service for DummyService {
+        type Spec = DummySpec;
+
+        fn id(&self) -> &'static str {
+            "test.dummy"
+        }
+
+        fn provider(&self) -> Provider {
+            Provider::Other
+        }
+
+        fn build_cost(
+            &self,
+            _id: &LogicalId,
+            _resource_type: &yevice_core::types::ResourceType,
+            _spec: &Self::Spec,
+            _pricing: &dyn PriceCatalog,
+        ) -> Result<ResourceCost, crate::CostError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn duplicate_service_registration_panics() {
+        let mut catalog = ServiceCatalog::new();
+        catalog.register(DummyService);
+        catalog.register(DummyService);
     }
 }

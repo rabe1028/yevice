@@ -5,7 +5,6 @@ use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
 use yevice_solver::{EnumerationSolver, Solver, SolverError};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 
 use yevice_cfn::convert as cfn_convert;
 use yevice_cfn::parser;
@@ -171,48 +170,10 @@ pub fn evaluate(cost_model_path: &str, params_path: &str, breakdown: bool) -> Re
     println!("\n{}: Monthly Cost Estimate", result.name);
 
     if breakdown {
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
-        table.set_header(vec!["Resource / Component", "Monthly Cost (USD)"]);
-
-        for r in &result.resources {
-            table.add_row(vec![
-                Cell::new(&r.label).fg(Color::Cyan),
-                Cell::new(format!("${:.2}", r.monthly_cost)).fg(Color::Cyan),
-            ]);
-            for (name, cost) in &r.component_costs {
-                table.add_row(vec![
-                    Cell::new(format!("  └─ {name}")),
-                    Cell::new(format!("${cost:.4}")),
-                ]);
-            }
-        }
-
-        table.add_row(vec![
-            Cell::new("TOTAL").fg(Color::Green),
-            Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
-        ]);
-
+        let table = crate::render::render_eval_breakdown_table(&result);
         println!("{table}");
     } else {
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
-        table.set_header(vec!["Resource", "Type", "Monthly Cost (USD)"]);
-
-        for r in &result.resources {
-            table.add_row(vec![
-                Cell::new(&r.label),
-                Cell::new(&r.resource_type),
-                Cell::new(format!("${:.2}", r.monthly_cost)),
-            ]);
-        }
-
-        table.add_row(vec![
-            Cell::new("TOTAL").fg(Color::Green),
-            Cell::new(""),
-            Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
-        ]);
-
+        let table = crate::render::render_eval_table(&result);
         println!("{table}");
     }
 
@@ -230,92 +191,7 @@ pub fn compare(cost_model_paths: &[String], params_path: &str, breakdown: bool) 
         results.push(result);
     }
 
-    // Summary table
-    let mut summary = Table::new();
-    summary.load_preset(UTF8_FULL);
-
-    let mut header = vec![Cell::new("Architecture")];
-    for r in &results {
-        header.push(Cell::new(&r.name));
-    }
-    summary.set_header(header);
-
-    // Total row
-    let mut total_row = vec![Cell::new("Total Monthly Cost").fg(Color::Green)];
-    for r in &results {
-        total_row.push(Cell::new(format!("${:.2}", r.total_monthly_cost)));
-    }
-    summary.add_row(total_row);
-
-    // Collect all unique resource types across architectures
-    let mut all_labels: Vec<String> = Vec::new();
-    for r in &results {
-        for res in &r.resources {
-            if !all_labels.contains(&res.label) {
-                all_labels.push(res.label.clone());
-            }
-        }
-    }
-
-    for label in &all_labels {
-        let mut row = vec![Cell::new(label)];
-        for r in &results {
-            let cost = r
-                .resources
-                .iter()
-                .find(|res| &res.label == label)
-                .map_or_else(
-                    || "-".to_string(),
-                    |res| format!("${:.2}", res.monthly_cost),
-                );
-            row.push(Cell::new(cost));
-        }
-        summary.add_row(row);
-
-        // Breakdown: component rows
-        if breakdown {
-            // Collect all component names across all architectures for this resource label
-            let mut all_component_names: Vec<String> = Vec::new();
-            for r in &results {
-                if let Some(res) = r.resources.iter().find(|res| &res.label == label) {
-                    for (name, _) in &res.component_costs {
-                        if !all_component_names.contains(name) {
-                            all_component_names.push(name.clone());
-                        }
-                    }
-                }
-            }
-            for comp_name in &all_component_names {
-                let mut comp_row = vec![Cell::new(format!("  └─ {comp_name}"))];
-                for r in &results {
-                    let comp_cost = r
-                        .resources
-                        .iter()
-                        .find(|res| &res.label == label)
-                        .and_then(|res| res.component_costs.iter().find(|(n, _)| n == comp_name))
-                        .map_or_else(|| "-".to_string(), |(_, v)| format!("${v:.4}"));
-                    comp_row.push(Cell::new(comp_cost));
-                }
-                summary.add_row(comp_row);
-            }
-        }
-    }
-
-    // Difference row (if exactly 2 architectures)
-    if results.len() == 2 {
-        let diff = results[1].total_monthly_cost - results[0].total_monthly_cost;
-        let diff_str = if diff >= 0.0 {
-            format!("+${diff:.2}")
-        } else {
-            format!("-${:.2}", diff.abs())
-        };
-        let color = if diff > 0.0 { Color::Red } else { Color::Green };
-        summary.add_row(vec![
-            Cell::new("Difference"),
-            Cell::new("-"),
-            Cell::new(diff_str).fg(color),
-        ]);
-    }
+    let summary = crate::render::render_compare_table(&results, breakdown);
 
     println!("\nArchitecture Cost Comparison");
     println!("{summary}");
@@ -348,15 +224,8 @@ pub fn sensitivity(
         .map(|r| r.label.clone())
         .collect();
 
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.set_header(vec![
-        Cell::new(var_name),
-        Cell::new("Total Monthly Cost"),
-        Cell::new("Delta from Base"),
-    ]);
-
     // When breakdown is true, collect step results for a second table.
+    let mut sensitivity_rows: Vec<crate::render::SensitivityRow> = Vec::new();
     let mut breakdown_rows: Vec<(f64, Vec<f64>)> = Vec::new();
 
     for i in 0..=steps {
@@ -367,23 +236,11 @@ pub fn sensitivity(
         match evaluate_architecture(&arch, &params) {
             Ok(result) => {
                 let delta = result.total_monthly_cost - base_cost;
-                let delta_str = if delta >= 0.0 {
-                    format!("+${delta:.2}")
-                } else {
-                    format!("-${:.2}", delta.abs())
-                };
-                let color = if delta > 0.0 {
-                    Color::Red
-                } else if delta < 0.0 {
-                    Color::Green
-                } else {
-                    Color::White
-                };
-                table.add_row(vec![
-                    Cell::new(format_number(value)),
-                    Cell::new(format!("${:.2}", result.total_monthly_cost)),
-                    Cell::new(delta_str).fg(color),
-                ]);
+                sensitivity_rows.push(crate::render::SensitivityRow::Ok {
+                    value,
+                    total: result.total_monthly_cost,
+                    delta,
+                });
 
                 if breakdown {
                     let costs: Vec<f64> = resource_labels
@@ -400,11 +257,10 @@ pub fn sensitivity(
                 }
             }
             Err(e) => {
-                table.add_row(vec![
-                    Cell::new(format_number(value)),
-                    Cell::new(format!("ERROR: {e}")),
-                    Cell::new("-"),
-                ]);
+                sensitivity_rows.push(crate::render::SensitivityRow::Err {
+                    value,
+                    message: e.to_string(),
+                });
                 if breakdown {
                     breakdown_rows.push((value, vec![0.0; resource_labels.len()]));
                 }
@@ -412,10 +268,12 @@ pub fn sensitivity(
         }
     }
 
+    let table = crate::render::render_sensitivity_table(var_name, &sensitivity_rows);
+
     println!("\nSensitivity Analysis: {var_name}");
     println!(
         "Base value: {}",
-        format_number(
+        crate::render::format_number(
             base_params
                 .get(&VariableName::new(var_name))
                 .copied()
@@ -427,22 +285,8 @@ pub fn sensitivity(
 
     if breakdown && !resource_labels.is_empty() {
         println!("\nResource Breakdown by Step:");
-        let mut bd_table = Table::new();
-        bd_table.load_preset(UTF8_FULL);
-        let mut bd_header = vec![Cell::new(var_name)];
-        for label in &resource_labels {
-            bd_header.push(Cell::new(label));
-        }
-        bd_table.set_header(bd_header);
-
-        for (value, costs) in &breakdown_rows {
-            let mut row = vec![Cell::new(format_number(*value))];
-            for cost in costs {
-                row.push(Cell::new(format!("${cost:.2}")));
-            }
-            bd_table.add_row(row);
-        }
-
+        let bd_table =
+            crate::render::render_sensitivity_breakdown_table(var_name, &resource_labels, &breakdown_rows);
         println!("{bd_table}");
     }
 
@@ -519,32 +363,7 @@ pub fn validate(
             }
         }
     } else {
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
-        table.set_header(vec![
-            Cell::new("Severity"),
-            Cell::new("Resource"),
-            Cell::new("Constraint"),
-            Cell::new("Required"),
-            Cell::new("Limit"),
-            Cell::new("Message"),
-        ]);
-
-        for v in &result.violations {
-            let color = match v.severity {
-                Severity::Error => Color::Red,
-                Severity::Warning => Color::Yellow,
-                Severity::Info => Color::Cyan,
-            };
-            table.add_row(vec![
-                Cell::new(v.severity.to_string()).fg(color),
-                Cell::new(v.resource.to_string()),
-                Cell::new(&v.dimension),
-                Cell::new(format!("{:.0}", v.required)),
-                Cell::new(format!("{:.0}", v.limit)),
-                Cell::new(&v.message),
-            ]);
-        }
+        let table = crate::render::render_validate_table(&result.violations);
 
         println!("\nCapacity Validation");
         println!("{table}");
@@ -973,16 +792,6 @@ fn load_quotas(path: &str) -> Result<Quotas> {
     Ok(quotas)
 }
 
-fn format_number(n: f64) -> String {
-    if n >= 1_000_000.0 {
-        format!("{:.1}M", n / 1_000_000.0)
-    } else if n >= 1_000.0 {
-        format!("{:.1}K", n / 1_000.0)
-    } else {
-        format!("{n:.2}")
-    }
-}
-
 /// Simulate cost over time with varying load patterns.
 ///
 /// Load profile format:
@@ -1011,7 +820,7 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
     // (arch_name, total_monthly, hourly_costs, base_resource_costs)
     // base_resource_costs: Vec<(label, monthly_cost)> evaluated at base_params (for breakdown)
-    let mut arch_results: Vec<(String, f64, Vec<(u32, f64)>, Vec<(String, f64)>)> = Vec::new();
+    let mut arch_results: Vec<crate::render::SimulationArchResult> = Vec::new();
 
     for path in cost_model_paths {
         let arch = load_cost_model(path)?;
@@ -1067,37 +876,8 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
     }
 
     // Print hourly breakdown table
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-
-    let mut header = vec![Cell::new("Hour"), Cell::new("Multiplier")];
-    for (name, _, _, _) in &arch_results {
-        header.push(Cell::new(format!("{name} (rate/mo)")));
-    }
-    table.set_header(header);
-
-    for hour in 0..24 {
-        let mult = profile.multiplier_at(hour);
-        let mut row = vec![
-            Cell::new(format!("{hour:02}:00")),
-            Cell::new(format!("{mult:.2}x")),
-        ];
-        for (_, _, hourly, _) in &arch_results {
-            let cost = hourly
-                .iter()
-                .find(|(h, _)| *h == hour)
-                .map_or(0.0, |(_, c)| *c);
-            row.push(Cell::new(format!("${cost:.2}")));
-        }
-        table.add_row(row);
-    }
-
-    // Total row
-    let mut total_row = vec![Cell::new("MONTHLY TOTAL").fg(Color::Green), Cell::new("")];
-    for (_, total, _, _) in &arch_results {
-        total_row.push(Cell::new(format!("${total:.2}")).fg(Color::Green));
-    }
-    table.add_row(total_row);
+    let table =
+        crate::render::render_simulate_table(&arch_results, |hour| profile.multiplier_at(hour));
 
     println!("\nLoad Simulation ({} days/month)", profile.days_per_month);
     println!("{table}");
@@ -1136,27 +916,8 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
         if !all_labels.is_empty() {
             println!("\nResource Breakdown (base params estimate):");
-            let mut bd_table = Table::new();
-            bd_table.load_preset(UTF8_FULL);
-
-            let mut bd_header = vec![Cell::new("Resource")];
-            for (name, _, _, _) in &arch_results {
-                bd_header.push(Cell::new(name));
-            }
-            bd_table.set_header(bd_header);
-
-            for label in &all_labels {
-                let mut row = vec![Cell::new(label)];
-                for (_, _, _, res_costs) in &arch_results {
-                    let cost = res_costs
-                        .iter()
-                        .find(|(l, _)| l == label)
-                        .map_or_else(|| "-".to_string(), |(_, c)| format!("${c:.2}"));
-                    row.push(Cell::new(cost));
-                }
-                bd_table.add_row(row);
-            }
-
+            let bd_table =
+                crate::render::render_simulate_breakdown_table(&arch_results, &all_labels);
             println!("{bd_table}");
         }
     }
