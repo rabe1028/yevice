@@ -28,6 +28,10 @@ pub struct CfnResource {
     pub resource_type: String,
     pub properties: Value,
     pub condition: Option<String>,
+    /// Logical IDs listed in `DependsOn` (strings or arrays of strings).
+    /// Parsed for future use; not converted to edges (no `DependsOn` `ConnectionType`).
+    #[allow(dead_code)]
+    pub depends_on: Vec<String>,
 }
 
 /// Parse a `CloudFormation` YAML template from a file.
@@ -202,6 +206,15 @@ fn parse_resources(
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        let depends_on = match resource_def.get(Value::String("DependsOn".into())) {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Sequence(seq)) => seq
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            _ => Vec::new(),
+        };
+
         resources.insert(
             name.to_string(),
             CfnResource {
@@ -209,6 +222,7 @@ fn parse_resources(
                 resource_type,
                 properties,
                 condition,
+                depends_on,
             },
         );
     }
@@ -257,6 +271,7 @@ pub fn resolve_template(
                 resource_type: resource.resource_type.clone(),
                 properties: resolved_props,
                 condition: resource.condition.clone(),
+                depends_on: resource.depends_on.clone(),
             },
         );
     }

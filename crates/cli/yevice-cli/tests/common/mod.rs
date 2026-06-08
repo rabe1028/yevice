@@ -1,4 +1,8 @@
 //! Shared helpers for integration tests.
+//!
+//! Included via `mod common;` by several integration-test binaries; not every
+//! binary uses every helper, so suppress dead-code warnings for the unused ones.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

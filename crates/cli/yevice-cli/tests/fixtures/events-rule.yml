@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  AWS::Events::Rule Targets -> Lambda / SQS Invocation edges.
+
+Resources:
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Id: LambdaTarget
+          Arn: !GetAtt HandlerFunction.Arn
+        - Id: QueueTarget
+          Arn: !GetAtt HandlerQueue.Arn
+
+  HandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: event-handler
+      MemorySize: 128
+      Timeout: 30
+      Runtime: python3.12
+
+  HandlerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
