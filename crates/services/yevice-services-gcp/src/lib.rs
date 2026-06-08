@@ -1,9 +1,11 @@
 //! GCP service plugin implementations for yevice.
 
+pub mod plugin;
 pub mod pricing_adapter;
 pub mod services;
 pub mod tf;
 
+pub use plugin::GcpPlugin;
 pub use pricing_adapter::GcpPricingCatalog;
 
 /// Register all GCP services and TF adapters.

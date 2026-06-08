@@ -16,10 +16,13 @@ use yevice_core::evaluate::{self, Params, evaluate_architecture};
 use yevice_core::resource::{Architecture, Provider};
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::types::VariableName;
-use yevice_pricing::{PriceCatalog, PriceRecord, Sku, error::PricingError, gcp_hardcoded_pricing};
-use yevice_service_api::{CfnAdapterRegistry, MultiProviderCatalog, PriceCatalogResolver, ServiceCatalog, TfAdapterRegistry};
-use yevice_services_aws::AwsPricingCatalog;
-use yevice_services_gcp::GcpPricingCatalog;
+use yevice_service_api::{
+    CfnAdapterRegistry, MultiProviderCatalog, ProviderPlugin, Registration, ServiceCatalog,
+    TfAdapterRegistry,
+};
+use yevice_services_aws::AwsPlugin;
+use yevice_services_gcp::GcpPlugin;
+use yevice_wrangler::CloudflarePlugin;
 
 const DEFAULT_ARCHITECTURE_NAME: &str = "default";
 
@@ -40,30 +43,6 @@ enum TfProvider {
 
 struct ParsedInput {
     architecture: Architecture,
-}
-
-/// A no-op pricing catalog for providers whose services compute costs inline
-/// (e.g. Cloudflare).  The `lookup` method is never called for these services,
-/// so it simply returns a `NotFound` error as a safety net.
-struct NoopCatalog;
-
-impl PriceCatalog for NoopCatalog {
-    fn region(&self) -> &'static str {
-        "global"
-    }
-
-    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
-        Err(PricingError::NotFound {
-            service: sku.as_str().to_string(),
-            region: "global".to_string(),
-        })
-    }
-}
-
-impl PriceCatalogResolver for NoopCatalog {
-    fn resolve(&self, _provider: Provider) -> Option<&dyn PriceCatalog> {
-        Some(self as &dyn PriceCatalog)
-    }
 }
 
 fn resolve_cfn_template(
@@ -95,13 +74,28 @@ fn resolve_cfn_template(
     })
 }
 
+/// Returns the list of all provider plugins. Both `build_registries` and
+/// `build_pricing_resolver` iterate over this single source of truth.
+fn provider_plugins() -> Vec<Box<dyn ProviderPlugin>> {
+    vec![
+        Box::new(AwsPlugin),
+        Box::new(GcpPlugin),
+        Box::new(CloudflarePlugin),
+    ]
+}
+
 fn build_registries() -> (ServiceCatalog, CfnAdapterRegistry, TfAdapterRegistry) {
     let mut catalog = ServiceCatalog::new();
     let mut cfn_adapters = CfnAdapterRegistry::new();
     let mut tf_adapters = TfAdapterRegistry::new();
-    yevice_services_aws::register(&mut catalog, &mut cfn_adapters, &mut tf_adapters);
-    yevice_services_gcp::register(&mut catalog, &mut tf_adapters);
-    yevice_wrangler::register(&mut catalog);
+    for plugin in provider_plugins() {
+        let mut reg = Registration {
+            catalog: &mut catalog,
+            cfn_adapters: &mut cfn_adapters,
+            tf_adapters: &mut tf_adapters,
+        };
+        plugin.register(&mut reg);
+    }
     (catalog, cfn_adapters, tf_adapters)
 }
 
@@ -943,9 +937,10 @@ fn detect_tf_provider(resolved: &yevice_tf::ResolvedConfig) -> TfProvider {
 
 /// Build a per-provider pricing resolver from the providers present in `arch`.
 ///
-/// - AWS resources   → [`AwsPricingCatalog::auto`] (respects `list_price`)
-/// - GCP resources   → [`GcpPricingCatalog`] with hardcoded prices
-/// - Cloudflare / Other resources → [`NoopCatalog`] (services price inline)
+/// Iterates over all registered provider plugins and, for each provider that
+/// appears in the architecture, inserts the plugin's pricing catalog into the
+/// resolver. The `Provider::Other` variant has no corresponding plugin and is
+/// handled separately with a [`yevice_pricing::NoopCatalog`].
 fn build_pricing_resolver(
     arch: &Architecture,
     region: &str,
@@ -953,23 +948,18 @@ fn build_pricing_resolver(
 ) -> MultiProviderCatalog {
     let mut resolver = MultiProviderCatalog::new();
 
-    if arch.has_provider(Provider::Aws) {
-        resolver.insert(
-            Provider::Aws,
-            Box::new(AwsPricingCatalog::auto(region).with_list_price(list_price)),
-        );
+    for plugin in provider_plugins() {
+        if arch.has_provider(plugin.provider()) {
+            resolver.insert(plugin.provider(), plugin.pricing_catalog(region, list_price));
+        }
     }
-    if arch.has_provider(Provider::Gcp) {
-        resolver.insert(
-            Provider::Gcp,
-            Box::new(GcpPricingCatalog(gcp_hardcoded_pricing(region))),
-        );
-    }
-    if arch.has_provider(Provider::Cloudflare) {
-        resolver.insert(Provider::Cloudflare, Box::new(NoopCatalog));
-    }
+
+    // Provider::Other has no dedicated plugin; use a no-op catalog.
     if arch.has_provider(Provider::Other) {
-        resolver.insert(Provider::Other, Box::new(NoopCatalog));
+        resolver.insert(
+            Provider::Other,
+            Box::new(yevice_pricing::NoopCatalog),
+        );
     }
 
     resolver

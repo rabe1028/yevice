@@ -2,6 +2,7 @@
 
 pub mod cfn;
 pub mod connection_rules;
+pub mod plugin;
 pub mod pricing_adapter;
 pub mod quotas;
 pub mod services;
@@ -11,6 +12,7 @@ pub use connection_rules::{
     aws_connection_rules, AwsDataFlowRule, AwsEventSourceRule, AwsInvocationRule,
     AwsNotificationRule,
 };
+pub use plugin::AwsPlugin;
 pub use pricing_adapter::AwsPricingCatalog;
 pub use quotas::AwsQuotaProvider;
 
