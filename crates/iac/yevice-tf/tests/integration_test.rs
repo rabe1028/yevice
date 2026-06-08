@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use yevice_core::resource::{Architecture, Provider, Resource};
+use yevice_core::resource::{Architecture, ConnectionType, Provider, Resource};
 use yevice_pricing::gcp_hardcoded_pricing;
 use yevice_service_api::{CfnAdapterRegistry, MultiProviderCatalog, ServiceCatalog, TfAdapterRegistry};
 use yevice_services_aws::{
@@ -362,4 +362,103 @@ fn mixed_provider_cost_model_prices_both_aws_and_gcp_resources() {
 
     // Serialisation round-trip must succeed
     let _json = serde_json::to_string(&cost).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Cross-resource reference (ResourceRef) and connections tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn event_source_mapping_produces_event_source_edge() {
+    // cross_resource.tf has:
+    //   aws_sqs_queue.input_queue
+    //   aws_dynamodb_table.state_table
+    //   aws_lambda_function.processor  (refs state_table via environment)
+    //   aws_lambda_event_source_mapping.sqs_trigger  (sqs → processor)
+    let dir = FixtureDir::new("cross-resource", &["cross_resource.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    // EventSource edge: sqs_queue → lambda
+    let event_source_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::EventSource
+            && c.source.as_str() == "aws_sqs_queue_input_queue"
+            && c.target.as_str() == "aws_lambda_function_processor"
+    });
+    assert!(
+        event_source_edge.is_some(),
+        "expected EventSource edge from aws_sqs_queue_input_queue to aws_lambda_function_processor; connections = {:?}",
+        arch.connections,
+    );
+}
+
+#[test]
+fn lambda_to_dynamodb_produces_data_flow_edge() {
+    // aws_lambda_function.processor references aws_dynamodb_table.state_table
+    // in its environment block (captured as a top-level attr via collect_block_attrs).
+    let dir = FixtureDir::new("cross-resource-df", &["cross_resource.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    // DataFlow edge: lambda → dynamodb (from environment variable reference)
+    let data_flow_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_processor"
+            && c.target.as_str() == "aws_dynamodb_table_state_table"
+    });
+    assert!(
+        data_flow_edge.is_some(),
+        "expected DataFlow edge from aws_lambda_function_processor to aws_dynamodb_table_state_table; connections = {:?}",
+        arch.connections,
+    );
+}
+
+#[test]
+fn connections_have_no_duplicates() {
+    let dir = FixtureDir::new("cross-resource-dedup", &["cross_resource.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    // Verify no (source, target, type) triple appears more than once.
+    let mut seen = std::collections::HashSet::new();
+    for conn in &arch.connections {
+        let key = (
+            conn.source.as_str().to_string(),
+            conn.target.as_str().to_string(),
+            format!("{:?}", conn.connection_type),
+        );
+        assert!(
+            seen.insert(key.clone()),
+            "duplicate connection detected: {key:?}",
+        );
+    }
+}
+
+#[test]
+fn connections_have_no_dangling_endpoints() {
+    let dir = FixtureDir::new("cross-resource-dangle", &["cross_resource.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let node_ids: std::collections::HashSet<&str> =
+        arch.resources.iter().map(|r| r.logical_id.as_str()).collect();
+
+    for conn in &arch.connections {
+        assert!(
+            node_ids.contains(conn.source.as_str()),
+            "dangling source in connection: {conn:?}",
+        );
+        assert!(
+            node_ids.contains(conn.target.as_str()),
+            "dangling target in connection: {conn:?}",
+        );
+    }
 }

@@ -132,6 +132,10 @@ fn resolve_value(
         TfValue::LocalRef(name) => locals
             .get(name)
             .and_then(|next| resolve_value(next, vars, locals, depth + 1)),
-        TfValue::Unknown => None,
+        // ResourceRef is a cross-resource reference; it cannot be resolved to a
+        // concrete scalar value, but it must be preserved in the resource attrs for
+        // connection building. Returning None here causes resolve_resource to leave
+        // the original ResourceRef value untouched.
+        TfValue::ResourceRef { .. } | TfValue::Unknown => None,
     }
 }

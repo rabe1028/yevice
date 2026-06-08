@@ -11,6 +11,12 @@ pub enum TfValue {
     Bool(bool),
     VarRef(String),
     LocalRef(String),
+    /// A cross-resource reference: `<resource_type>.<name>.<attr>`.
+    ResourceRef {
+        resource_type: String,
+        name: String,
+        attr: String,
+    },
     Unknown,
 }
 
@@ -206,14 +212,36 @@ pub fn expr_to_tf_value(expr: &hcl::expr::Expression) -> TfValue {
         Expression::Number(value) => value.as_f64().map_or(TfValue::Unknown, TfValue::Number),
         Expression::Bool(value) => TfValue::Bool(*value),
         Expression::Traversal(traversal) => {
-            if let Expression::Variable(variable) = &traversal.expr
-                && let Some(TraversalOperator::GetAttr(attr)) = traversal.operators.first()
-            {
-                return match variable.as_ref() {
-                    "var" => TfValue::VarRef(attr.as_ref().to_string()),
-                    "local" => TfValue::LocalRef(attr.as_ref().to_string()),
-                    _ => TfValue::Unknown,
-                };
+            if let Expression::Variable(variable) = &traversal.expr {
+                let var_name = variable.as_ref();
+                // Collect only GetAttr segments from the operators list.
+                let attrs: Vec<&str> = traversal
+                    .operators
+                    .iter()
+                    .filter_map(|op| {
+                        if let TraversalOperator::GetAttr(a) = op {
+                            Some(a.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                match (var_name, attrs.as_slice()) {
+                    // var.<name>  →  VarRef
+                    ("var", [name]) => return TfValue::VarRef((*name).to_string()),
+                    // local.<name>  →  LocalRef
+                    ("local", [name]) => return TfValue::LocalRef((*name).to_string()),
+                    // <resource_type>.<name>.<attr...>  →  ResourceRef
+                    (resource_type, [name, rest @ ..]) if !rest.is_empty() => {
+                        return TfValue::ResourceRef {
+                            resource_type: resource_type.to_string(),
+                            name: (*name).to_string(),
+                            attr: rest.join("."),
+                        };
+                    }
+                    _ => {}
+                }
             }
             TfValue::Unknown
         }
