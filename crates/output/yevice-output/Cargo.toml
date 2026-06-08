@@ -1,0 +1,21 @@
+[package]
+name = "yevice-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Architecture diagram renderers (draw.io, Mermaid, JSON) for the yevice cost-model toolkit"
+keywords = ["aws", "cost", "diagram", "drawio", "mermaid"]
+categories = ["development-tools"]
+
+[dependencies]
+yevice-core = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

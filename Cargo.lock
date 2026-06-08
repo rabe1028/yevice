@@ -1096,6 +1096,7 @@ dependencies = [
  "ureq",
  "yevice-cfn",
  "yevice-core",
+ "yevice-output",
  "yevice-pricing",
  "yevice-service-api",
  "yevice-services-aws",
@@ -1112,6 +1113,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "yevice-output"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "yevice-core",
 ]
 
 [[package]]

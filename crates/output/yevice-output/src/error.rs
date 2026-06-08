@@ -1,0 +1,15 @@
+//! Error types for diagram rendering.
+
+use thiserror::Error;
+
+/// Errors that can occur during architecture diagram rendering.
+#[derive(Debug, Error)]
+pub enum RenderError {
+    /// JSON serialization failed.
+    #[error("JSON serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Topology is empty and cannot produce a meaningful diagram.
+    #[error("topology is empty: no nodes to render")]
+    EmptyTopology,
+}

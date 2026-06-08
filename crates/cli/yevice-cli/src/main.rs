@@ -194,6 +194,20 @@ enum Commands {
         #[arg(short, long, default_value = "pricing-data")]
         output_dir: String,
     },
+
+    /// Render an architecture diagram from a generated cost-model JSON file.
+    Diagram {
+        /// Path to cost model file (JSON) produced by `generate`.
+        cost_model: String,
+
+        /// Diagram output format.
+        #[arg(long, default_value = "drawio")]
+        format: String,
+
+        /// Output file path. Writes to stdout if omitted.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -272,5 +286,10 @@ fn main() -> Result<()> {
         Commands::UpdatePricing { output_dir } => {
             commands::update_pricing(&cli.region, &output_dir)
         }
+        Commands::Diagram {
+            cost_model,
+            format,
+            output,
+        } => commands::diagram(&cost_model, &format, output.as_deref()),
     }
 }

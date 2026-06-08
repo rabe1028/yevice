@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 
 use yevice_cfn::convert as cfn_convert;
@@ -1226,6 +1227,34 @@ fn download_pricing(url: &str) -> Result<Vec<u8>> {
         .read_to_vec()
         .context("failed to read response body")?;
     Ok(body)
+}
+
+/// Render an architecture diagram from a generated cost-model JSON file.
+///
+/// - `cost_model_path`: path to a cost-model JSON file produced by `generate`.
+/// - `format`: one of `"drawio"`, `"mermaid"`, or `"json"`.
+/// - `output`: optional file path; if `None` the diagram is written to stdout.
+pub fn diagram(cost_model_path: &str, format: &str, output: Option<&str>) -> Result<()> {
+    let cost = load_cost_model(cost_model_path)?;
+
+    let rendered: String = match format {
+        "drawio" => DrawIoRenderer.render(&cost).context("draw.io rendering failed")?,
+        "mermaid" => MermaidRenderer.render(&cost).context("mermaid rendering failed")?,
+        "json" => JsonRenderer.render(&cost).context("json rendering failed")?,
+        other => bail!(
+            "unknown diagram format '{other}'. Valid choices: drawio, mermaid, json"
+        ),
+    };
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &rendered)
+                .with_context(|| format!("failed to write diagram to {path}"))?;
+        }
+        None => println!("{rendered}"),
+    }
+
+    Ok(())
 }
 
 fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
