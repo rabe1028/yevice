@@ -1,0 +1,49 @@
+# AWS CDP Architecture: 社内データ分析 (応用編)
+# Reference: https://aws.amazon.com/jp/cdp/analytics-report-master/
+# AWS estimated cost: 518.93 USD/month (ap-northeast-1)
+#
+# Architecture:
+#   - Amazon S3        (3TB data lake storage + requests)
+#   - Amazon Redshift  (1x dc2.large, 720h)  + managed storage (1TB)
+#                       + Redshift Spectrum (3TB scanned @ $5/TB)
+#   - Amazon QuickSight Enterprise Edition
+#       - 1 Creator, 30 Viewers ($142.50), SPICE 30GB
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - 社内データ分析(応用編): S3 + Redshift + Spectrum + QuickSight"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-datalake"
+
+  Warehouse:
+    Type: AWS::Redshift::Cluster
+    Properties:
+      NodeType: dc2.large
+      NumberOfNodes: 1
+      ClusterType: single-node
+      DBName: analytics
+      MasterUsername: admin
+      # CDP page uses a 720-hour month for the cluster (default would be 730).
+      Hours: 720
+
+  QuickSightAnalysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      AnalysisId: !Sub "${Env}-analysis"
+      Name: !Sub "${Env}-Analytics"
+      SourceEntity:
+        SourceTemplate:
+          Arn: !Sub "arn:aws:quicksight:ap-northeast-1:${AWS::AccountId}:template/template-arn"
+
+  # QuickSight account-level cost (the Analysis above is free/structural).
+  QuickSightAccount:
+    Type: Yevice::QuickSight
+    Properties: {}

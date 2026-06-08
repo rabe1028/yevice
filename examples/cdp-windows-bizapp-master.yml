@@ -1,0 +1,56 @@
+# AWS CDP Architecture: Windows 業務アプリ移行 (応用編)
+# Reference: https://aws.amazon.com/jp/cdp/windows-bizapp-migration-master/
+# AWS estimated cost: 2059.63 USD/month (ap-northeast-1)
+#
+# = 基本編 (2034.70) + WAF + GuardDuty + CloudTrail + CloudWatch Logs/Alarms.
+# Evaluate with --list-price.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Windows業務アプリ移行(応用編)"
+
+Resources:
+  AppServer1:
+    Type: AWS::EC2::Instance
+    Properties: { InstanceType: m5.large, Platform: windows }
+  AppServer2:
+    Type: AWS::EC2::Instance
+    Properties: { InstanceType: m5.large, Platform: windows }
+  AppVolume1:
+    Type: AWS::EC2::Volume
+    Properties: { VolumeType: gp2, Size: 200 }
+  AppVolume2:
+    Type: AWS::EC2::Volume
+    Properties: { VolumeType: gp2, Size: 200 }
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: { Type: application }
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.r5.large
+      Engine: sqlserver-se
+      AllocatedStorage: 100
+      StorageType: gp2
+      MultiAZ: true
+  Vpn1:
+    Type: AWS::EC2::VPNConnection
+    Properties: { Type: ipsec.1 }
+  Vpn2:
+    Type: AWS::EC2::VPNConnection
+    Properties: { Type: ipsec.1 }
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties: { Scope: REGIONAL }
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    Properties: {}
+  Detector:
+    Type: AWS::GuardDuty::Detector
+    Properties: { Enable: true }
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {}
+  Alarms:
+    Type: AWS::CloudWatch::Alarm
+    # One resource standing in for the architecture's 20 alarms.
+    Properties: { AlarmCount: 20 }

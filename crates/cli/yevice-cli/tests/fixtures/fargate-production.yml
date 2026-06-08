@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Production ECS Fargate architecture with Multi-AZ RDS and ElastiCache"
+
+Resources:
+  ApiService:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      DesiredCount: 4
+
+  BackendService:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      DesiredCount: 2
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+
+  ProdDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.r5.large
+      Engine: mysql
+      AllocatedStorage: 500
+      StorageType: gp2
+      MultiAZ: true
+
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      CacheNodeType: cache.r6g.large
+      NumCacheNodes: 2
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway

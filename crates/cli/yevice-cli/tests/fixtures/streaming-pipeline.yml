@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Architecture: Kinesis Data Stream -> Lambda -> S3 streaming ingest
+  - Provisioned Kinesis stream with 2 shards
+  - Lambda processor (512 MB, 60s timeout)
+  - S3 output bucket
+  - CloudWatch Logs log group
+
+Resources:
+  InputStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 2
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: streaming-processor
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 512
+      Timeout: 60
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: streaming-output
+
+  ProcessorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/streaming-processor
+      RetentionInDays: 7

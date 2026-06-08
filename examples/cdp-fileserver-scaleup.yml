@@ -1,0 +1,35 @@
+# AWS CDP Architecture: Windows ファイルサーバー (入門編)
+# Reference: https://aws.amazon.com/jp/cdp/fileserver-scaleup/
+# AWS estimated cost: 472.67 USD/month (ap-northeast-1)
+#
+# Architecture: EC2 (m6a.large, Windows) + EBS gp3 root + EBS st1 data +
+#               snapshots + Site-to-Site VPN + internet data transfer.
+# Evaluate with --list-price.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Windowsファイルサーバー(入門編)"
+
+Resources:
+  FileServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: m6a.large
+      Platform: windows
+      ImageId: windows-server-2022
+
+  RootVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      VolumeType: gp3
+      Size: 30
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      VolumeType: st1
+      Size: 2048
+
+  Vpn:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1

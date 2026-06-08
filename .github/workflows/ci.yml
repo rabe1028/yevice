@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --tests
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-targets
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
+
+  taplo:
+    name: TOML format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: uncenter/setup-taplo@v1
+      - run: taplo fmt --check
+
+  msrv:
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove rust-toolchain.toml to honor MSRV
+        run: rm -f rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  doc:
+    name: Doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  machete:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bnjbvr/cargo-machete@main
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          "name": coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - run: cargo cyclonedx --format json --override-filename yevice-sbom
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          "name": sbom-cyclonedx
+          path: '**/*-sbom.cdx.json'
+          if-no-files-found: error

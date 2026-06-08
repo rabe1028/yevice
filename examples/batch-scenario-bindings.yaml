@@ -1,0 +1,16 @@
+bindings:
+  # Step Functions -> Batch Job (3 transitions per execution)
+  - target: ProcessingJob_executions
+    source: BatchWorkflow_transitions
+    batch_size: 3
+    description: "3 transitions per workflow = 1 batch job"
+
+  # Batch Job -> S3 PUT (1 execution = 1 file)
+  - target: OutputBucket_put_requests
+    source: ProcessingJob_executions
+    description: "1 batch job = 1 S3 PUT"
+
+  # S3 storage = executions * avg_object_size_gb * retention_days / 30
+  - target: OutputBucket_storage_gb
+    expr: "ProcessingJob_executions * OutputBucket_avg_object_size_gb * OutputBucket_retention_days / 30"
+    description: "Average S3 storage from file size and retention"

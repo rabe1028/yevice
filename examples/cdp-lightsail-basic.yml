@@ -1,0 +1,25 @@
+# AWS CDP Architecture: Website (入門編 - Lightsail)
+# Reference: https://aws.amazon.com/jp/cdp/migrate-lightsail/
+# AWS estimated cost: 3.43 USD/month
+#
+# Architecture:
+#   - Amazon Lightsail (1 instance: nano_2_0 bundle)
+#     - 512MB RAM, 1 vCPU, 20GB SSD
+#     - 1TB data transfer included
+#   - No additional disk needed (20GB included in bundle)
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Website (入門編): Simple website on Amazon Lightsail"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  WebsiteInstance:
+    Type: AWS::Lightsail::Instance
+    Properties:
+      InstanceName: !Sub "${Env}-website"
+      BlueprintId: linux
+      BundleId: nano_2_0

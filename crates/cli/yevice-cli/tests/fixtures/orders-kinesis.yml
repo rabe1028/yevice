@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues: ["dev", "stg", "prd"]
+  Module:
+    Type: String
+
+Mappings:
+  StageMap:
+    dev:
+      ShardCount: 1
+    stg:
+      ShardCount: 1
+    prd:
+      ShardCount: 2
+
+Resources:
+  OrderStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${AppName}-${Stage}-${Module}-stream"
+      RetentionPeriodHours: 24
+      ShardCount: !FindInMap [StageMap, !Ref Stage, ShardCount]
+      StreamModeDetails:
+        StreamMode: "PROVISIONED"
+
+Outputs:
+  StreamArn:
+    Value: !GetAtt OrderStream.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-OrderStreamArn

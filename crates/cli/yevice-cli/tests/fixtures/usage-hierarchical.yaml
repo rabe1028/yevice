@@ -1,0 +1,81 @@
+# Hierarchical usage parameters (grouped by logical resource ID)
+
+# DynamoDB tables
+OrderTable:
+  write_request_units: 500000
+  read_request_units: 2000000
+  storage_gb: 30
+CustomerTable:
+  write_request_units: 100000
+  read_request_units: 500000
+  storage_gb: 10
+ConfigTable:
+  write_request_units: 10000
+  read_request_units: 50000
+  storage_gb: 1
+
+# SQS queues
+OrderQueueFIFO:
+  requests: 500000
+OrderDeadLetterQueueFIFO:
+  requests: 1000
+ProcessingQueue:
+  requests: 200000
+ProcessingDeadLetterQueue:
+  requests: 500
+
+# S3 buckets
+ProductAssetBucket:
+  storage_gb: 5000
+  put_requests: 1000000
+  get_requests: 5000000
+TempBucket:
+  storage_gb: 50
+  put_requests: 100000
+  get_requests: 200000
+
+# Kinesis
+OrderStream:
+  put_records: 50000000
+
+# OpenSearch Serverless
+CatalogCollection:
+  indexing_ocu: 2
+  search_ocu: 2
+  storage_gb: 100
+
+# Ingest pipeline
+OrderIngestFunction:
+  requests: 5000000
+  avg_duration_ms: 200
+OrderIngestFunctionLogGroup:
+  ingestion_gb: 10
+  storage_gb: 2
+FailedOrderQueue:
+  requests: 10000
+FailedOrderDLQ:
+  requests: 100
+OrderBackupFunction:
+  requests: 10000
+  avg_duration_ms: 500
+OrderBackupFunctionLogGroup:
+  ingestion_gb: 0.5
+  storage_gb: 0.1
+DeadLetterBackupBucket:
+  storage_gb: 1
+  put_requests: 10000
+  get_requests: 1000
+
+# Indexing pipeline
+CatalogIndexingFunction:
+  requests: 2000000
+  avg_duration_ms: 300
+CatalogIndexingFunctionLogGroup:
+  ingestion_gb: 5
+  storage_gb: 1
+OrderReprocessFunction:
+  requests: 50000
+  avg_duration_ms: 1000
+OrderReprocessFunctionLogGroup:
+  ingestion_gb: 1
+  storage_gb: 0.5

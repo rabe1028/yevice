@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Architecture B: ECS Fargate + RDS + S3"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+  InstanceType:
+    Type: String
+    Default: db.t3.small
+
+Resources:
+  AppService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${Env}-app"
+      DesiredCount: 2
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref InstanceType
+      Engine: postgres
+      AllocatedStorage: 50
+
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-assets"

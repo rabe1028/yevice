@@ -1,0 +1,61 @@
+# ---- DynamoDB tables (shared-dynamodb) ----
+OrderTable_write_request_units: 500000
+OrderTable_read_request_units: 2000000
+OrderTable_storage_gb: 30
+CustomerTable_write_request_units: 100000
+CustomerTable_read_request_units: 500000
+CustomerTable_storage_gb: 10
+ConfigTable_write_request_units: 10000
+ConfigTable_read_request_units: 50000
+ConfigTable_storage_gb: 1
+
+# ---- SQS queues (shared-sqs) ----
+OrderQueueFIFO_requests: 500000
+OrderDeadLetterQueueFIFO_requests: 1000
+ProcessingQueue_requests: 200000
+ProcessingDeadLetterQueue_requests: 500
+
+# ---- S3 buckets (shared-s3) ----
+ProductAssetBucket_storage_gb: 5000
+ProductAssetBucket_put_requests: 1000000
+ProductAssetBucket_get_requests: 5000000
+TempBucket_storage_gb: 50
+TempBucket_put_requests: 100000
+TempBucket_get_requests: 200000
+
+# ---- Kinesis (orders-kinesis) ----
+OrderStream_put_records: 50000000
+
+# ---- OpenSearch Serverless (catalog-aoss) ----
+CatalogCollection_indexing_ocu: 2
+CatalogCollection_search_ocu: 2
+CatalogCollection_storage_gb: 100
+
+# ---- Ingest pipeline (orders-ingest.sam) ----
+OrderIngestFunction_requests: 5000000
+OrderIngestFunction_avg_duration_ms: 200
+OrderIngestFunction_data_transfer_out_gb: 0
+OrderIngestFunctionLogGroup_ingestion_gb: 10
+OrderIngestFunctionLogGroup_storage_gb: 2
+FailedOrderQueue_requests: 10000
+FailedOrderDLQ_requests: 100
+OrderBackupFunction_requests: 10000
+OrderBackupFunction_avg_duration_ms: 500
+OrderBackupFunction_data_transfer_out_gb: 0
+OrderBackupFunctionLogGroup_ingestion_gb: 0.5
+OrderBackupFunctionLogGroup_storage_gb: 0.1
+DeadLetterBackupBucket_storage_gb: 1
+DeadLetterBackupBucket_put_requests: 10000
+DeadLetterBackupBucket_get_requests: 1000
+
+# ---- Indexing pipeline (catalog-indexing.sam) ----
+CatalogIndexingFunction_requests: 2000000
+CatalogIndexingFunction_avg_duration_ms: 300
+CatalogIndexingFunction_data_transfer_out_gb: 0
+CatalogIndexingFunctionLogGroup_ingestion_gb: 5
+CatalogIndexingFunctionLogGroup_storage_gb: 1
+OrderReprocessFunction_requests: 50000
+OrderReprocessFunction_avg_duration_ms: 1000
+OrderReprocessFunction_data_transfer_out_gb: 0
+OrderReprocessFunctionLogGroup_ingestion_gb: 1
+OrderReprocessFunctionLogGroup_storage_gb: 0.5

@@ -1,0 +1,26 @@
+name: Mutation Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * 0'   # 毎週日曜 18:00 UTC = 月曜 03:00 JST
+
+jobs:
+  mutants:
+    name: cargo-mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - run: cargo mutants --workspace --no-shuffle -j 2 --output mutants-out
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants-out/

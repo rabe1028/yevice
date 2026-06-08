@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Basic ECS Fargate web application with ALB, RDS, and ElastiCache"
+
+Resources:
+  WebService:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      DesiredCount: 2
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+
+  AppDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.medium
+      Engine: mysql
+      AllocatedStorage: 100
+      StorageType: gp2
+      MultiAZ: false
+
+  SessionCache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      CacheNodeType: cache.t3.medium
+      NumCacheNodes: 2

@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  - Intelligent-Tiering transition
+  - Lifecycle rules
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues: ["dev", "stg", "prd"]
+  Module:
+    Type: String
+
+Resources:
+  ProductAssetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Stage}-${Module}-product-asset"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub ${AppName}-${Stage}-${Module}-product-asset-intelligentTiering
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+
+  TempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Stage}-${Module}-temp"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 7
+
+Outputs:
+  ProductAssetBucketName:
+    Value: !Ref ProductAssetBucket
+    Export:
+      Name: !Sub "${AppName}-${Stage}-${Module}-ProductAssetBucketName"
+  ProductAssetBucketArn:
+    Value: !GetAtt ProductAssetBucket.Arn
+    Export:
+      Name: !Sub "${AppName}-${Stage}-${Module}-ProductAssetBucketArn"

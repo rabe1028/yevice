@@ -1,0 +1,17 @@
+# Architecture A: Lambda + DynamoDB + S3
+ApiFunction:
+  requests: 5000000
+  avg_duration_ms: 200
+DataTable:
+  write_request_units: 1000000
+  read_request_units: 5000000
+  storage_gb: 50
+AssetsBucket:
+  storage_gb: 100
+  put_requests: 100000
+  get_requests: 1000000
+
+# Architecture B: ECS Fargate + RDS + S3
+AppService:
+  vcpu: 0.5
+  memory_gb: 1.0

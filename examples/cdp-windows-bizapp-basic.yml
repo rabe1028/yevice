@@ -1,0 +1,43 @@
+# AWS CDP Architecture: Windows 業務アプリ移行 (入門編)
+# Reference: https://aws.amazon.com/jp/cdp/windows-bizapp-migration-basic/
+# AWS estimated cost: 1027.68 USD/month (ap-northeast-1)
+#
+# Architecture: EC2 (m5.large, Windows) + EBS gp2 + snapshot + ALB +
+#               RDS for SQL Server (db.r5.large, single-AZ) + Site-to-Site VPN.
+# Evaluate with --list-price.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Windows業務アプリ移行(入門編)"
+
+Resources:
+  AppServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: m5.large
+      Platform: windows
+      ImageId: windows-server-2022
+
+  AppVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      VolumeType: gp2
+      Size: 200
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.r5.large
+      Engine: sqlserver-se
+      AllocatedStorage: 100
+      StorageType: gp2
+      MultiAZ: false
+
+  Vpn:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1

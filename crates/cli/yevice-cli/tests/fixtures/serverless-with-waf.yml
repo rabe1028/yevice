@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Serverless REST API with WAF protection
+  - API Gateway REST API
+  - WAF WebACL with 2 managed rules
+  - One Lambda function
+  - One DynamoDB table (on-demand)
+  - One CloudWatch Log Group
+
+Resources:
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: WafProtectedApi
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: api-web-acl
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: api-web-acl
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: common-rule-set
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: bad-inputs-rule-set
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: api-function
+      MemorySize: 256
+      Timeout: 15
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/lambda-role"
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200 });
+
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: app-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  FunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/api-function
+      RetentionInDays: 30

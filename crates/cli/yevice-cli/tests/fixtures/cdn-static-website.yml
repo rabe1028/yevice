@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Architecture: CloudFront CDN + S3 static website hosting
+  - CloudFront Distribution as CDN
+  - S3 bucket for primary website assets
+  - S3 bucket for www redirect / logs
+
+Resources:
+  ContentCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - DomainName: !GetAtt AssetsBucket.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: cdn-static-assets
+
+  WwwBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: cdn-www-redirect

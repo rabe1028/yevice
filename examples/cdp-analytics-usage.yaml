@@ -1,0 +1,27 @@
+# AWS CDP: 社内データ分析 (入門編)
+# Reference: https://aws.amazon.com/jp/cdp/analytics-report-basic/
+# AWS estimated: 40.25 USD/month
+#   - S3:        0.25 USD (10GB storage; requests negligible)
+#   - QuickSight 40.00 USD (Creator 24 + Viewer 16 + SPICE 0)
+#
+# QuickSight billing is account-level, so all of it lands on the single
+# cost-anchor resource (AWS::QuickSight::Analysis); the Dashboard is structural.
+#
+# Viewers: AWS's breakdown is 4 viewers, non-uniform (2 x 10 + 2 x 20 sessions)
+# with a $5/user/month cap → 2x$3 + 2x$5 = $16.00. yevice models viewers as
+# users x min(sessions x $0.30, $5). The single-group, cost-equivalent input
+# (4 users x ~13.333 sessions = $4.00/user) reproduces the same $16.00 total.
+
+DataBucket:
+  storage_gb: 10
+  put_requests: 300
+  get_requests: 300
+
+QuickSightAccount:
+  creators: 1
+  viewer_users: 4
+  sessions_per_user: 13.333333
+  spice_gb: 10
+
+# The AWS::QuickSight::Analysis / ::Dashboard resources are structural ($0);
+# the account cost above is billed once on the Yevice::QuickSight marker.

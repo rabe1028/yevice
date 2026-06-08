@@ -1,0 +1,8 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: data-stream-ondemand
+      StreamModeDetails:
+        StreamMode: ON_DEMAND

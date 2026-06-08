@@ -1,0 +1,24 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+
+# actrun (local GitHub Actions runner) run artifacts
+/_build/
+
+# cargo-mutants (mutation testing) artifacts
+/mutants.out/
+/mutants.out.old/
+/mutants-run.log
+
+# Downloaded AWS Bulk-API pricing data (regenerate with `yevice update-pricing`)
+/pricing-data/
+.claude/settings.local.json
+.idea/
+.vscode/
+.direnv/
+.envrc
+*.env
+.mise.local.toml

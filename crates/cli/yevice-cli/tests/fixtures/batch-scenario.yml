@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Step Functions -> AWS Batch (Fargate) -> S3 output"
+
+Resources:
+  BatchWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: batch-workflow
+
+  ProcessingJob:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      PlatformCapabilities:
+        - FARGATE
+      ContainerProperties:
+        ResourceRequirements:
+          - Type: VCPU
+            Value: "4"
+          - Type: MEMORY
+            Value: "30720"
+        EphemeralStorage:
+          SizeInGiB: 200
+        Volumes:
+          - Name: data-volume
+            EbsVolume:
+              SizeInGiB: 512
+              VolumeType: gp3
+              Iops: 5000
+              Throughput: 1000
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: batch-output
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 7

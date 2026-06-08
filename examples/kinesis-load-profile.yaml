@@ -1,0 +1,38 @@
+# Load simulation profile: typical web application traffic pattern
+# Peak at 10:00-12:00 and 19:00-21:00 (JST), low at night
+
+base_params:
+  # Monthly totals at peak rate (these get scaled by hourly multiplier)
+  DataStream:
+    put_records: 100000000   # 100M records/month at peak rate
+    ingestion_gb: 500        # 500 GB/month at peak rate
+    retrieval_gb: 500        # 500 GB/month at peak rate
+
+hourly_pattern:
+  - hour: 0
+    multiplier: 0.1    # 深夜: 10%
+  - hour: 6
+    multiplier: 0.3    # 早朝: 30%
+  - hour: 8
+    multiplier: 0.7    # 通勤: 70%
+  - hour: 10
+    multiplier: 1.0    # 午前ピーク: 100%
+  - hour: 12
+    multiplier: 0.8    # 昼休み: 80%
+  - hour: 14
+    multiplier: 0.9    # 午後: 90%
+  - hour: 17
+    multiplier: 0.6    # 退勤: 60%
+  - hour: 19
+    multiplier: 1.2    # 夜ピーク: 120%
+  - hour: 21
+    multiplier: 0.5    # 夜: 50%
+  - hour: 23
+    multiplier: 0.2    # 深夜: 20%
+
+scaled_variables:
+  - DataStream_put_records
+  - DataStream_ingestion_gb
+  - DataStream_retrieval_gb
+
+days_per_month: 30

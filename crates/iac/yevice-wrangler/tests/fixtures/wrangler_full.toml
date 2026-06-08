@@ -1,0 +1,41 @@
+name = "my-app"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+usage_model = "standard"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "abc123"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "def456"
+
+[[r2_buckets]]
+binding = "UPLOADS"
+bucket_name = "my-uploads"
+
+[[d1_databases]]
+binding = "DB"
+database_id = "my-database-id"
+
+[queues]
+
+[[queues.producers]]
+binding = "JOB_QUEUE"
+queue = "job-queue"
+
+[[queues.consumers]]
+queue = "job-queue"
+max_batch_size = 10
+
+[durable_objects]
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "ChatRoom"
+
+[[durable_objects.bindings]]
+name = "USER"
+class_name = "UserSession"

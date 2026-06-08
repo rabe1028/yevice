@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  Pattern: DynamoDB Stream -> Lambda -> OpenSearch Serverless
+  - EventSourceMapping with FilterCriteria
+  - Cross-stack import of DynamoDB stream ARN and AOSS endpoint
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues: ["dev", "stg", "prd"]
+  Module:
+    Type: String
+
+Mappings:
+  StageMap:
+    dev:
+      LogLevel: DEBUG
+    stg:
+      LogLevel: INFO
+    prd:
+      LogLevel: INFO
+
+Resources:
+  # ---- DynamoDB Stream -> Lambda -> AOSS ----
+  CatalogIndexingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-${Module}-indexing
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 128
+      Timeout: 900
+      Environment:
+        Variables:
+          LOG_LEVEL: !FindInMap [StageMap, !Ref Stage, LogLevel]
+          OPENSEARCH_ENDPOINT:
+            Fn::ImportValue: !Sub ${AppName}-${Stage}-catalog-aoss-CollectionEndpoint
+          DYNAMO_DB_TABLE_NAME_PREFIX: !Sub ${AppName}-${Stage}-
+
+  CatalogIndexingFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AppName}-${Stage}-${Module}/indexing/
+      RetentionInDays: 7
+
+  # DynamoDB Stream -> Lambda (INSERT events only)
+  CatalogIndexingEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      EventSourceArn:
+        Fn::ImportValue: !Sub ${AppName}-${Stage}-shared-dynamodb-OrderTableStreamArn
+      FunctionName: !GetAtt CatalogIndexingFunction.Arn
+      BatchSize: 50
+      MaximumBatchingWindowInSeconds: 10
+      StartingPosition: LATEST
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["INSERT"]}'
+
+  # ---- SQS-triggered Lambda for reprocessing ----
+  OrderReprocessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-${Module}-reprocess
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 256
+      Timeout: 900
+      Environment:
+        Variables:
+          LOG_LEVEL: !FindInMap [StageMap, !Ref Stage, LogLevel]
+          PROCESSING_QUEUE_ARN:
+            Fn::ImportValue: !Sub ${AppName}-${Stage}-shared-sqs-ProcessingQueueArn
+
+  OrderReprocessFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AppName}-${Stage}-${Module}/reprocess/
+      RetentionInDays: 7
+
+  # SQS -> Lambda
+  OrderReprocessEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn:
+        Fn::ImportValue: !Sub ${AppName}-${Stage}-shared-sqs-ProcessingQueueArn
+      FunctionName: !GetAtt OrderReprocessFunction.Arn

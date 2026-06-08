@@ -1,0 +1,11 @@
+# Root metrics only. Derived values are computed by bindings.
+BatchWorkflow:
+  transitions: 3000  # 1000 executions x 3 transitions
+
+ProcessingJob:
+  avg_duration_sec: 220
+
+OutputBucket:
+  avg_object_size_gb: 0.7   # 700MB per file
+  retention_days: 7          # S3 lifecycle expiration
+  get_requests: 1000

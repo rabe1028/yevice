@@ -1,0 +1,44 @@
+# AWS CDP: 社内知識を活用した生成AIチャットボット — generate with --list-price
+# AWS estimated: 941.99 USD/month
+#   Bedrock in 11M / out 4.4M tokens ... $99.00
+#   Kendra Developer Edition ........... $831.76
+#   Transcribe 300 min ................. $7.20
+#   (CloudFront/S3/APIGW/Cognito/Lambda/DynamoDB ~ $4)
+# NOTE: yevice DynamoDB on-demand WRU rate ($0.715/M) is ~half AWS's $1.4269/M
+#       (pre-existing yevice value), so DynamoDB lands ~$0.7 under the CDP line.
+
+ChatAgent:
+  input_ktokens: 11000
+  output_ktokens: 4400
+
+KnowledgeIndex:
+  documents_scanned: 5000
+  connector_scan_hours: 30
+
+Transcriber:
+  minutes: 300
+
+Distribution:
+  data_transfer_gb: 1
+  http_requests: 30000
+
+ContentBucket:
+  storage_gb: 0.01
+  put_requests: 0
+  get_requests: 1000
+
+ChatApi:
+  api_requests: 15000
+
+UserPool:
+  mau: 50
+
+ChatFunction:
+  requests: 37500
+  avg_duration_ms: 1000
+  data_transfer_out_gb: 0
+
+SessionTable:
+  write_request_units: 1000000
+  read_request_units: 200000
+  storage_gb: 5

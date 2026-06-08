@@ -1,0 +1,9 @@
+# AWS CDP: Website (入門編 - Lightsail)
+# AWS estimated: 3.43 USD/month
+#
+# Assumptions:
+#   - 1 Lightsail instance (nano_2_0 bundle: 512MB RAM, 1 vCPU, 20GB SSD, 1TB transfer)
+#   - No additional disk
+
+WebsiteInstance:
+  disk_size_gb: 0

@@ -1,0 +1,19 @@
+# AWS CDP: Windows ファイルサーバー (入門編)  — generate with --list-price
+# AWS estimated: 472.67 USD/month
+#   EC2 m6a.large Windows 730h ......... $148.62
+#   EBS gp3 30GB ....................... $2.88
+#   EBS st1 2048GB ..................... $110.59
+#   EBS snapshot 3072GB ................ $152.745  (yevice $0.05/GB -> $153.60; ~$0.85 over)
+#   Internet data transfer 200GB ....... $22.80
+#   Site-to-Site VPN 730h .............. $35.04
+
+FileServer:
+  data_transfer_out_gb: 200
+
+RootVolume:
+  snapshot_gb: 0
+
+DataVolume:
+  snapshot_gb: 3072
+
+Vpn: {}

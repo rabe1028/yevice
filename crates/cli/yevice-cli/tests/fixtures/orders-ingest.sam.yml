@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  Pattern: Kinesis -> Lambda -> DynamoDB + SQS DLQ
+  - AWS::Serverless::Function (SAM)
+  - Fn::ImportValue with !Sub for cross-stack refs
+  - !FindInMap for env-dependent config
+  - Dead letter queue pattern
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues: ["dev", "stg", "prd"]
+  Module:
+    Type: String
+  Version:
+    Type: String
+    Default: "1.0.0"
+
+Mappings:
+  StageMap:
+    dev:
+      LogLevel: DEBUG
+      MemorySize: 128
+    stg:
+      LogLevel: INFO
+      MemorySize: 256
+    prd:
+      LogLevel: INFO
+      MemorySize: 256
+
+Resources:
+  # ---- Main Ingest Function: Kinesis -> Lambda -> DynamoDB ----
+  OrderIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-${Module}-ingest
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: !FindInMap [StageMap, !Ref Stage, MemorySize]
+      Timeout: 900
+      Environment:
+        Variables:
+          LOG_LEVEL: !FindInMap [StageMap, !Ref Stage, LogLevel]
+          STREAM_ARN:
+            Fn::ImportValue: !Sub ${AppName}-${Stage}-${Module}-kinesis-OrderStreamArn
+          CUSTOMER_TABLE_ARN:
+            Fn::ImportValue: !Sub ${AppName}-${Stage}-shared-dynamodb-CustomerTableArn
+
+  OrderIngestFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AppName}-${Stage}-${Module}/ingest/
+      RetentionInDays: 7
+
+  # Kinesis -> Lambda event source mapping
+  OrderIngestEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 4
+      BisectBatchOnFunctionError: true
+      ParallelizationFactor: 10
+      MaximumRetryAttempts: 3
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt FailedOrderQueue.Arn
+      Enabled: true
+      EventSourceArn:
+        Fn::ImportValue: !Sub ${AppName}-${Stage}-${Module}-kinesis-OrderStreamArn
+      FunctionName: !GetAtt OrderIngestFunction.Arn
+      StartingPosition: LATEST
+
+  # ---- Dead Letter Backup: SQS -> Lambda -> S3 ----
+  FailedOrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AppName}-${Stage}-${Module}-failed-order
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 910
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FailedOrderDLQ.Arn
+        maxReceiveCount: 5
+
+  FailedOrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AppName}-${Stage}-${Module}-failed-order-dlq
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 910
+
+  OrderBackupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-${Module}-backup-failed-order
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 128
+      Timeout: 120
+      Environment:
+        Variables:
+          DEAD_LETTER_BACKUP_BUCKET: !Ref DeadLetterBackupBucket
+          LOG_LEVEL: !FindInMap [StageMap, !Ref Stage, LogLevel]
+
+  OrderBackupFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AppName}-${Stage}-${Module}/backup/
+      RetentionInDays: 7
+
+  BackupEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt FailedOrderQueue.Arn
+      FunctionName: !GetAtt OrderBackupFunction.Arn
+
+  DeadLetterBackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Stage}-${Module}-failed-order-backup"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 180

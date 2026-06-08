@@ -1,0 +1,29 @@
+[package]
+name = "yevice-wrangler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Cloudflare Wrangler config parser for the yevice cost-model toolkit"
+keywords = ["cloudflare", "wrangler", "cost", "pricing", "workers"]
+categories = ["development-tools"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+yevice-core = { workspace = true }
+yevice-pricing = { workspace = true }
+yevice-service-api = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+# AWS CDP: 社内データ分析 (応用編)
+# Reference: https://aws.amazon.com/jp/cdp/analytics-report-master/
+# AWS estimated: 518.93 USD/month
+#   - S3 storage 3TB ............................. $76.80
+#   - S3 PUT / GET requests ...................... $0.22
+#   - Redshift 1x dc2.large @ 720h ............... $226.08
+#   - Redshift managed storage 1TB @ $0.0261/GB .. $26.73
+#   - Redshift Spectrum 3TB @ $5/TB .............. $15.00
+#   - QuickSight Creator 1 ....................... $24.00
+#   - QuickSight Viewer 30 users ($4.75/user) .... $142.50
+#   - QuickSight SPICE 30GB (20GB over free) ..... $7.60
+#                                       TOTAL = $518.93
+#
+# Redshift uses 720 run-hours (CDP page convention; 730 = full month).
+
+DataLakeBucket:
+  storage_gb: 3072
+  put_requests: 44681
+  get_requests: 45000
+
+# Warehouse run-hours (720) come from the template's `Hours` property.
+Warehouse:
+  storage_gb: 1024
+  spectrum_tb: 3
+
+QuickSightAccount:
+  creators: 1
+  viewer_users: 30
+  sessions_per_user: 15.833333
+  spice_gb: 30

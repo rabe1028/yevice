@@ -1,0 +1,54 @@
+# AWS CDP: コンテナウェブサービス (ECS/Fargate)
+# Reference: https://aws.amazon.com/jp/cdp/ec-container/
+# AWS estimated: 1,236.69 USD/month (ap-northeast-1, 2024-03)
+#
+# IMPORTANT: generate with `--list-price` to match AWS's published figure
+#            (AWS's estimate ignores the promotional Free Tier).
+#
+# Per-component breakdown (verbatim from the CDP page):
+#   ECR storage 2GB ............................. $0.20
+#   Fargate vCPU (2 x 730h x 2 tasks) ........... $147.63
+#   Fargate memory (8GB x 730h x 2 tasks) ....... $64.59
+#   CloudWatch Logs ingestion 30GB .............. $22.80
+#   CloudWatch Logs storage 30GB ................ $0.99
+#   Container Insights metrics (19) ............. $5.70
+#   Container Insights logs ..................... $0.18
+#   CloudFront data out 1TB ..................... $116.74
+#   CloudFront HTTPS requests 10M ............... $12.00
+#   ALB hours (730h) ............................ $17.74
+#   ALB LCU (0.5 x 730h) ........................ $2.92
+#   RDS db.m6i.large Multi-AZ instance .......... $343.10
+#   RDS storage 100GB gp2 Multi-AZ (x2) ......... $27.60
+#   ElastiCache cache.r7g.large x 2 nodes ....... $383.98
+#   NAT Gateway x 2 (730h each) ................. $90.52
+#                                       TOTAL = $1,236.69
+
+AppRegistry:
+  storage_gb: 2
+
+FargateService:
+  vcpu: 2.0
+  memory_gb: 8.0
+  data_transfer_out_gb: 0.0
+
+FargateLogs:
+  ingestion_gb: 30
+  storage_gb: 30
+
+# ECS cluster with Container Insights enabled (19 custom metrics + ~0.225GB logs)
+EcsCluster:
+  custom_metrics: 19
+  log_gb: 0.225
+
+Alb:
+  lcu: 0.5
+
+CloudFrontDistribution:
+  data_transfer_gb: 1024
+  http_requests: 10000000
+
+NatGateway:
+  data_processed_gb: 0.0
+
+NatGateway2:
+  data_processed_gb: 0.0

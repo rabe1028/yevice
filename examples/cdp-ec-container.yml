@@ -1,0 +1,309 @@
+# AWS CDP Architecture: Container Web Service (ECS/Fargate)
+# Reference: https://aws.amazon.com/jp/cdp/ec-container/
+# AWS estimated cost: 1,236.69 USD/month
+#
+# Architecture:
+#   - Amazon ECR (2GB storage)
+#   - Amazon ECS + AWS Fargate (2 vCPU + 8GB RAM x 2 tasks, always on)
+#   - Amazon CloudWatch Logs (30GB ingestion + 30GB storage)
+#   - Amazon CloudWatch Container Insights (19 custom metrics)
+#   - Amazon CloudFront (1TB data transfer out)
+#   - AWS ACM (free)
+#   - Elastic Load Balancing (ALB)
+#   - Amazon RDS for MySQL (db.m6i.large, Multi-AZ, 100GB gp2)
+#   - Amazon ElastiCache for Redis (cache.r7g.large x 2 nodes)
+#   - NAT Gateway x 2 (one per AZ)
+#
+# NOTE: Specs match the AWS CDP reference exactly. Evaluate with `--list-price`
+#       at `generate` time to reproduce the published 1,236.69 USD/month
+#       (AWS's estimate uses list prices, i.e. no promotional Free Tier).
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Container Web Service: ECS Fargate + ALB + RDS Multi-AZ + ElastiCache + CloudFront"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  # --- Container Registry ---
+  AppRegistry:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Env}-app"
+
+  # --- ECS Fargate Service ---
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: ap-northeast-1a
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-northeast-1b
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: ap-northeast-1a
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: ap-northeast-1b
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      InternetGatewayName: !Sub "${Env}-igw"
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt Eip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  Eip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt Eip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  Eip2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ECS Task Execution Role
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Env}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # --- ECS Fargate Cluster & Service ---
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${Env}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  FargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      ServiceName: !Sub "${Env}-fargate-service"
+      LaunchType: FARGATE
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      TaskDefinition: !Ref FargateTaskDef
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 80
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  FargateTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Env}-fargate-task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: "2"
+      Memory: "8"
+      ExecutionRoleArn: !GetAtt Ec2Role.Arn
+      TaskRoleArn: !GetAtt Ec2Role.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub "${AppRegistry.RepositoryUri}:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FargateLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # --- CloudWatch Logs ---
+  FargateLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${Env}-fargate"
+      RetentionInDays: 14
+
+  # --- Application Load Balancer ---
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${Env}-alb"
+      Scheme: internet-facing
+      LoadBalancerType: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${Env}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref Vpc
+      TargetType: ip
+
+  # --- CloudFront Distribution ---
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - DomainName: !GetAtt Alb.DNSName
+            Id: AlbOrigin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: AlbOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  # --- RDS MySQL Multi-AZ ---
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${Env} DB subnet group"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.m6i.large
+      Engine: mysql
+      AllocatedStorage: 100
+      StorageType: gp2
+      MultiAZ: true
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${Env} RDS security group"
+      VpcId: !Ref Vpc
+
+  # --- ElastiCache Redis ---
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub "${Env} cache subnet group"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  CacheCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: cache.r7g.large
+      Engine: redis
+      NumCacheNodes: 2
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RdsSecurityGroup

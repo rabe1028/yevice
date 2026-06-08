@@ -1,0 +1,44 @@
+# AWS CDP Architecture: 社内データ分析 (基本編)
+# Reference: https://aws.amazon.com/jp/cdp/analytics-report-advanced/
+# AWS estimated cost: 73.85 USD/month (ap-northeast-1)
+#
+# Architecture:
+#   - Amazon S3        (30GB storage, 900 PUT + 900 GET requests/month)
+#   - Amazon Athena    (300GB scanned/month @ $5/TB)
+#   - Amazon QuickSight Enterprise Edition
+#       - 1 Creator (monthly plan $24)
+#       - 10 Viewers (on-demand sessions, $0.30/session capped $5/user) = $40
+#       - SPICE 30GB (10GB included with Creator + 20GB extra @ $0.38)
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - 社内データ分析(基本編): S3 + Athena + QuickSight"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-analytics-data"
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${Env}-workgroup"
+
+  QuickSightAnalysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      AnalysisId: !Sub "${Env}-analysis"
+      Name: !Sub "${Env}-Analytics"
+      SourceEntity:
+        SourceTemplate:
+          Arn: !Sub "arn:aws:quicksight:ap-northeast-1:${AWS::AccountId}:template/template-arn"
+
+  # QuickSight account-level cost (the Analysis above is free/structural).
+  QuickSightAccount:
+    Type: Yevice::QuickSight
+    Properties: {}

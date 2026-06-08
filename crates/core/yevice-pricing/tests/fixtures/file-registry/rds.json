@@ -1,0 +1,105 @@
+{
+  "offerCode": "AmazonRDS",
+  "products": {
+    "RDS-MYSQL": {
+      "sku": "RDS-MYSQL",
+      "productFamily": "Database Instance",
+      "attributes": {
+        "instanceType": "db.t3.small",
+        "databaseEngine": "MySQL"
+      }
+    },
+    "RDS-POSTGRES": {
+      "sku": "RDS-POSTGRES",
+      "productFamily": "Database Instance",
+      "attributes": {
+        "instanceType": "db.t3.medium",
+        "databaseEngine": "PostgreSQL"
+      }
+    },
+    "RDS-AURORA-MYSQL": {
+      "sku": "RDS-AURORA-MYSQL",
+      "productFamily": "Database Instance",
+      "attributes": {
+        "instanceType": "db.r5.large",
+        "databaseEngine": "Aurora MySQL"
+      }
+    },
+    "RDS-AURORA-POSTGRESQL": {
+      "sku": "RDS-AURORA-POSTGRESQL",
+      "productFamily": "Database Instance",
+      "attributes": {
+        "instanceType": "db.r5.xlarge",
+        "databaseEngine": "Aurora PostgreSQL"
+      }
+    }
+  },
+  "terms": {
+    "OnDemand": {
+      "RDS-MYSQL": {
+        "RDS-MYSQL.JRTCKXETXF": {
+          "sku": "RDS-MYSQL",
+          "priceDimensions": {
+            "RDS-MYSQL-DIM": {
+              "description": "MySQL hourly",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Hrs",
+              "pricePerUnit": {
+                "USD": "0.111"
+              }
+            }
+          }
+        }
+      },
+      "RDS-POSTGRES": {
+        "RDS-POSTGRES.JRTCKXETXF": {
+          "sku": "RDS-POSTGRES",
+          "priceDimensions": {
+            "RDS-POSTGRES-DIM": {
+              "description": "PostgreSQL hourly",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Hrs",
+              "pricePerUnit": {
+                "USD": "0.222"
+              }
+            }
+          }
+        }
+      },
+      "RDS-AURORA-MYSQL": {
+        "RDS-AURORA-MYSQL.JRTCKXETXF": {
+          "sku": "RDS-AURORA-MYSQL",
+          "priceDimensions": {
+            "RDS-AURORA-MYSQL-DIM": {
+              "description": "Aurora MySQL hourly",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Hrs",
+              "pricePerUnit": {
+                "USD": "0.333"
+              }
+            }
+          }
+        }
+      },
+      "RDS-AURORA-POSTGRESQL": {
+        "RDS-AURORA-POSTGRESQL.JRTCKXETXF": {
+          "sku": "RDS-AURORA-POSTGRESQL",
+          "priceDimensions": {
+            "RDS-AURORA-POSTGRESQL-DIM": {
+              "description": "Aurora PostgreSQL hourly",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Hrs",
+              "pricePerUnit": {
+                "USD": "0.444"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

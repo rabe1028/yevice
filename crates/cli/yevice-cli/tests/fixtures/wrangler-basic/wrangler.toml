@@ -1,0 +1,14 @@
+name = "edge-worker"
+usage_model = "bundled"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "kv-123"
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "edge-assets"
+
+[[queues.producers]]
+binding = "JOBS"
+queue = "jobs"

@@ -1,0 +1,22 @@
+# AWS CDP: Windows ファイルサーバー (基本編)
+# Reference: https://aws.amazon.com/jp/cdp/fileserver-fsx/
+# AWS estimated: 1048.87 USD/month  (generate with --list-price)
+#   - FSx SSD storage 2048GB @ $0.276/GB ........ $565.25
+#   - FSx throughput 32 MBps @ $5.175/MBps ...... $165.60
+#   - FSx backup 3072GB @ $0.05/GB .............. $153.60
+#   - Managed Microsoft AD (Standard) 730h ...... $106.58
+#   - Site-to-Site VPN 730h ..................... $35.04
+#   - Internet data transfer 200GB @ $0.114/GB .. $22.80
+#                                      TOTAL = $1048.87
+
+FileSystem:
+  storage_capacity_gb: 2048
+  throughput_capacity_mbps: 32
+  backup_gb: 3072
+
+ManagedAd:
+  domain_controllers: 2
+
+DataTransfer:
+  internet_egress_gb: 200
+  inter_region_gb: 0

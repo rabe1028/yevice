@@ -1,0 +1,23 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Development environment ECS Fargate architecture (smaller sizes)"
+
+Resources:
+  DevService:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      DesiredCount: 1
+
+  DevLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+
+  DevDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      AllocatedStorage: 20
+      StorageType: gp2
+      MultiAZ: false

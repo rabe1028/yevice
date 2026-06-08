@@ -1,0 +1,26 @@
+# AWS CDP: 社内データ分析 (基本編)
+# Reference: https://aws.amazon.com/jp/cdp/analytics-report-advanced/
+# AWS estimated: 73.85 USD/month
+#   - S3 storage 30GB ............................ $0.75
+#   - Athena scan 300GB @ $5/TB .................. $1.50
+#   - QuickSight Creator 1 ....................... $24.00
+#   - QuickSight Viewer 10 users (avg $4/user) ... $40.00
+#   - QuickSight SPICE 30GB (20GB over free) ..... $7.60
+#                                       TOTAL = $73.85
+#
+# Viewer: page aggregates "10 users = $40" ($0.30/session, $5/user cap).
+# Modelled as 10 users x ~13.333 sessions/user = $4.00/user (under the cap).
+
+DataBucket:
+  storage_gb: 30
+  put_requests: 900
+  get_requests: 900
+
+AthenaWorkGroup:
+  scan_gb: 300
+
+QuickSightAccount:
+  creators: 1
+  viewer_users: 10
+  sessions_per_user: 13.333333
+  spice_gb: 30

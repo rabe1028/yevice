@@ -1,0 +1,11 @@
+# Cross-stack exports (simulated values for static analysis)
+acme-prd-orders-kinesis-OrderStreamArn: "arn:aws:kinesis:ap-northeast-1:123456789012:stream/orders"
+acme-dev-orders-kinesis-OrderStreamArn: "arn:aws:kinesis:ap-northeast-1:123456789012:stream/orders-dev"
+acme-prd-shared-dynamodb-CustomerTableArn: "arn:aws:dynamodb:ap-northeast-1:123456789012:table/Customer"
+acme-dev-shared-dynamodb-CustomerTableArn: "arn:aws:dynamodb:ap-northeast-1:123456789012:table/Customer-dev"
+acme-prd-shared-dynamodb-OrderTableStreamArn: "arn:aws:dynamodb:ap-northeast-1:123456789012:table/Order/stream/2024"
+acme-dev-shared-dynamodb-OrderTableStreamArn: "arn:aws:dynamodb:ap-northeast-1:123456789012:table/Order/stream/2024-dev"
+acme-prd-catalog-aoss-CollectionEndpoint: "https://abc123.ap-northeast-1.aoss.amazonaws.com"
+acme-dev-catalog-aoss-CollectionEndpoint: "https://abc123-dev.ap-northeast-1.aoss.amazonaws.com"
+acme-prd-shared-sqs-ProcessingQueueArn: "arn:aws:sqs:ap-northeast-1:123456789012:processing-queue"
+acme-dev-shared-sqs-ProcessingQueueArn: "arn:aws:sqs:ap-northeast-1:123456789012:processing-queue-dev"

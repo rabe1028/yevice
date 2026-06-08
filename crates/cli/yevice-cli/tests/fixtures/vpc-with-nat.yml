@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Architecture: VPC with NAT Gateway for private subnet internet access
+  - NAT Gateway for private subnet egress
+  - Lambda function (256 MB, 30s timeout) running in private subnet
+  - CloudWatch Logs log group for Lambda
+
+Resources:
+  EgressNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: subnet-12345678
+      AllocationId: eipalloc-12345678
+
+  AppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: vpc-app-function
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 256
+      Timeout: 30
+
+  AppLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/vpc-app-function
+      RetentionInDays: 14

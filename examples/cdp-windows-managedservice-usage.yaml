@@ -1,0 +1,17 @@
+# AWS CDP: Windows ファイルサーバー (応用編)  — generate with --list-price
+# AWS estimated: 1402.57 USD/month
+FileSystem:
+  storage_capacity_gb: 2048
+  throughput_capacity_mbps: 32
+  backup_gb: 0
+ManagedAdTokyo:
+  domain_controllers: 2
+ManagedAdOsaka:
+  domain_controllers: 2
+DataTransfer:
+  internet_egress_gb: 200
+  inter_region_gb: 1024
+BackupTokyo:
+  backup_gb: 3072
+BackupOsaka:
+  backup_gb: 3072

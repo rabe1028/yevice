@@ -1,0 +1,25 @@
+repos:
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.19.0
+    hooks:
+      - id: typos
+  - repo: local
+    hooks:
+      - id: taplo-fmt
+        name: taplo fmt --check
+        entry: taplo fmt --check
+        language: system
+        types: [toml]
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo fmt --all -- --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --tests -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

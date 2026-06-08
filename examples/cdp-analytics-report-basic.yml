@@ -1,0 +1,48 @@
+# AWS CDP Architecture: Analytics Report (入門編)
+# Reference: https://aws.amazon.com/jp/cdp/analytics-report-basic/
+# AWS estimated cost: 40.25 USD/month
+#
+# Architecture:
+#   - Amazon S3 (10GB storage, 300 PUT + 300 GET requests/month)
+#   - Amazon QuickSight Enterprise Edition
+#     - 1 Creator (monthly plan: $24/user)
+#     - 4 Viewers (on-demand sessions: 2 users x 10 sessions + 2 users x 20 sessions)
+#     - SPICE capacity: 10GB (included with Creator)
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Analytics Report (入門編): Simple analytics with QuickSight + S3"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-analytics-data"
+
+  QuickSightAnalysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      AnalysisId: !Sub "${Env}-analysis"
+      Name: !Sub "${Env}-Analytics"
+      SourceEntity:
+        SourceTemplate:
+          Arn: !Sub "arn:aws:quicksight:ap-northeast-1:${AWS::AccountId}:template/template-arn"
+
+  QuickSightDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      DashboardId: !Sub "${Env}-dashboard"
+      Name: !Sub "${Env}-Dashboard"
+      SourceEntity:
+        SourceAnalysis:
+          Arn: !Sub "arn:aws:quicksight:ap-northeast-1:${AWS::AccountId}:analysis/${Env}-analysis"
+
+  # QuickSight account-level cost (creator/viewer subscriptions + SPICE).
+  # The Analysis/Dashboard above are free; this marker carries the cost once.
+  QuickSightAccount:
+    Type: Yevice::QuickSight
+    Properties: {}

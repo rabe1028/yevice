@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Async API architecture with SQS FIFO decoupling.
+  - ApiQueue: FIFO queue for ordered API request processing
+  - WorkerFunction: Lambda worker that processes API requests
+  - ResultTopic: SNS topic for publishing results
+  - WorkerLogs: CloudWatch Logs for worker function
+
+Resources:
+  ApiQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 86400
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      MemorySize: 512
+      Timeout: 120
+      Runtime: python3.11
+
+  ResultTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: async-api-results
+
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7

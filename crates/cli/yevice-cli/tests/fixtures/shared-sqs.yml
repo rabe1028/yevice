@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  - FIFO queues for ordered processing
+  - Standard queues with RedrivePolicy
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues: ["dev", "stg", "prd"]
+  Module:
+    Type: String
+
+Resources:
+  OrderQueueFIFO:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AppName}-${Stage}-${Module}-order-queue.fifo
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 1000
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDeadLetterQueueFIFO.Arn
+        maxReceiveCount: 5
+
+  OrderDeadLetterQueueFIFO:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AppName}-${Stage}-${Module}-order-dlq.fifo
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 1000
+      FifoQueue: true
+
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AppName}-${Stage}-${Module}-processing-queue
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 1000
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  ProcessingDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AppName}-${Stage}-${Module}-processing-dlq
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 1000
+
+Outputs:
+  OrderQueueFIFOArn:
+    Value: !GetAtt OrderQueueFIFO.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-OrderQueueFIFOArn
+  ProcessingQueueArn:
+    Value: !GetAtt ProcessingQueue.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ProcessingQueueArn

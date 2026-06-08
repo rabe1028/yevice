@@ -1,0 +1,87 @@
+[workspace]
+members = [
+  "crates/core/yevice-core",
+  "crates/core/yevice-service-api",
+  "crates/core/yevice-pricing",
+  "crates/iac/yevice-cfn",
+  "crates/iac/yevice-tf",
+  "crates/iac/yevice-wrangler",
+  "crates/services/yevice-services-aws",
+  "crates/services/yevice-services-gcp",
+  "crates/cli/yevice-cli",
+]
+resolver = "2"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow these pedantic lints that are too noisy
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+wildcard_imports = "allow"
+unreadable_literal = "allow"
+float_cmp = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+# CLI commands take many flag args; builder-style methods naturally return Self.
+too_many_arguments = "allow"
+return_self_not_must_use = "allow"
+# Expr::div / Expr::ceil are explicit constructors, not std::ops trait impls.
+should_implement_trait = "allow"
+# Pricing registry intentionally groups instance types with the same price.
+match_same_arms = "allow"
+# Internal HashMaps don't need to be generic over BuildHasher.
+implicit_hasher = "allow"
+# Complex tuple types in simulate/profile aggregations are clearer inline.
+type_complexity = "allow"
+# `match` over a single pattern documents intent better than `if let`.
+single_match_else = "allow"
+# `if let Some` is often clearer than `let...else; return`.
+manual_let_else = "allow"
+# Helper functions sometimes return Result for symmetry / future failure modes.
+unnecessary_wraps = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Ryo Abe"]
+repository = "https://github.com/rabe1028/yevice"
+homepage = "https://github.com/rabe1028/yevice"
+readme = "README.md"
+rust-version = "1.85"
+
+[workspace.dependencies]
+yevice-core = { path = "crates/core/yevice-core", version = "0.1.0" }
+yevice-service-api = { path = "crates/core/yevice-service-api", version = "0.1.0" }
+yevice-pricing = { path = "crates/core/yevice-pricing", version = "0.1.0" }
+yevice-cfn = { path = "crates/iac/yevice-cfn", version = "0.1.0" }
+yevice-tf = { path = "crates/iac/yevice-tf", version = "0.1.0" }
+yevice-wrangler = { path = "crates/iac/yevice-wrangler", version = "0.1.0" }
+yevice-services-aws = { path = "crates/services/yevice-services-aws", version = "0.1.0" }
+yevice-services-gcp = { path = "crates/services/yevice-services-gcp", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+ureq = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

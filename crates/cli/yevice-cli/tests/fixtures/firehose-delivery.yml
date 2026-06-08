@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Architecture: Kinesis Firehose log delivery to S3
+  - Kinesis Firehose delivery stream
+  - S3 destination bucket
+  - Lambda transformer function (256 MB, 60s timeout)
+  - CloudWatch Logs log group for transformer
+
+Resources:
+  LogDelivery:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: log-delivery
+      DeliveryStreamType: DirectPut
+
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: firehose-log-bucket
+      VersioningConfiguration:
+        Status: Enabled
+
+  TransformerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: firehose-transformer
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 256
+      Timeout: 60
+
+  TransformerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/firehose-transformer
+      RetentionInDays: 7

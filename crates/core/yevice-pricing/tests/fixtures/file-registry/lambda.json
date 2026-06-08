@@ -1,0 +1,55 @@
+{
+  "offerCode": "AWSLambda",
+  "products": {
+    "LAMBDA-REQUESTS": {
+      "sku": "LAMBDA-REQUESTS",
+      "productFamily": "Serverless",
+      "attributes": {
+        "group": "AWS-Lambda-Requests"
+      }
+    },
+    "LAMBDA-DURATION": {
+      "sku": "LAMBDA-DURATION",
+      "productFamily": "Serverless",
+      "attributes": {
+        "group": "AWS-Lambda-Duration"
+      }
+    }
+  },
+  "terms": {
+    "OnDemand": {
+      "LAMBDA-REQUESTS": {
+        "LAMBDA-REQUESTS.JRTCKXETXF": {
+          "sku": "LAMBDA-REQUESTS",
+          "priceDimensions": {
+            "LAMBDA-REQUESTS-DIM": {
+              "description": "Requests",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Requests",
+              "pricePerUnit": {
+                "USD": "0.0000009"
+              }
+            }
+          }
+        }
+      },
+      "LAMBDA-DURATION": {
+        "LAMBDA-DURATION.JRTCKXETXF": {
+          "sku": "LAMBDA-DURATION",
+          "priceDimensions": {
+            "LAMBDA-DURATION-DIM": {
+              "description": "Duration",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "GB-Second",
+              "pricePerUnit": {
+                "USD": "0.0000999"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

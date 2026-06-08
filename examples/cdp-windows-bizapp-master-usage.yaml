@@ -1,0 +1,24 @@
+# AWS CDP: Windows 業務アプリ移行 (応用編)  — generate with --list-price
+# AWS estimated: 2059.63 USD/month
+#   (base 基本編 = 2034.70) + WAF 9.60 + GuardDuty 11.80 + CloudWatch Logs 1.53
+#   + CloudWatch alarms 2.00 + CloudTrail 0
+AppServer1: { data_transfer_out_gb: 0 }
+AppServer2: { data_transfer_out_gb: 0 }
+AppVolume1: { snapshot_gb: 200 }
+AppVolume2: { snapshot_gb: 200 }
+Alb: { lcu: 0.5 }
+Vpn1: {}
+Vpn2: {}
+Trail:
+  data_events_100k: 0
+  management_event_copies_100k: 0  # single trail → management events free
+WebAcl:
+  rule_count: 4
+  requests: 1000000
+Detector:
+  cloudtrail_events_millions: 2
+  flowlog_gb: 2
+LogGroup:
+  ingestion_gb: 2
+  storage_gb: 0
+# Alarms: count is set in the template (AlarmCount: 20); no usage input needed.

@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  SQS -> Lambda fan-out architecture with DLQ pattern.
+  - InputQueue: Standard SQS queue for incoming messages
+  - InputDLQ: Dead-letter queue for failed messages
+  - ProcessorFunction: Lambda consumer of InputQueue
+  - NotificationTopic: SNS topic for fan-out notifications
+  - ProcessorLogs: CloudWatch Logs for processor function
+
+Resources:
+  InputQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InputDLQ.Arn
+        maxReceiveCount: 3
+
+  InputDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 1209600
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      MemorySize: 256
+      Timeout: 60
+      Runtime: python3.11
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: fanout-notifications
+
+  ProcessorLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14

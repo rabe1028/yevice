@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Serverless REST API backend architecture
+  - API Gateway REST API
+  - Two Lambda functions (read and write)
+  - Two DynamoDB tables (on-demand)
+  - Two CloudWatch Log Groups
+
+Resources:
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ServerlessRestApi
+
+  GetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: get-function
+      MemorySize: 256
+      Timeout: 10
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/lambda-role"
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200 });
+
+  WriteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: write-function
+      MemorySize: 512
+      Timeout: 30
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/lambda-role"
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200 });
+
+  UserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: user-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: session-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  FunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/get-function
+      RetentionInDays: 30
+
+  WriteFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/write-function
+      RetentionInDays: 30

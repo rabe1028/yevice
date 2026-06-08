@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  - PAY_PER_REQUEST billing
+  - StreamSpecification for event-driven Lambda triggers
+  - GSI for query patterns
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+    AllowedValues: ["dev", "stg", "prd"]
+  Module:
+    Type: String
+
+Resources:
+  # Table with DynamoDB Streams -> triggers Lambda downstream
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-${Module}-Order"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "ID"
+          AttributeType: "S"
+        - AttributeName: "CustomerKey"
+          AttributeType: "S"
+        - AttributeName: "OrderTimestamp"
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: "ID"
+          KeyType: "HASH"
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerOrderTimestampIndex
+          KeySchema:
+            - AttributeName: CustomerKey
+              KeyType: HASH
+            - AttributeName: OrderTimestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Sub ${AppName}-${Stage}
+
+  # Customer profile table
+  CustomerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-${Module}-Customer"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "Key"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "Key"
+          KeyType: "HASH"
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Config table with TTL
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-${Module}-Config"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: "ProjectID"
+          AttributeType: "S"
+        - AttributeName: "VersionID"
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: "ProjectID"
+          KeyType: "HASH"
+        - AttributeName: "VersionID"
+          KeyType: "RANGE"
+      TimeToLiveSpecification:
+        AttributeName: "ExpiredAt"
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+Outputs:
+  OrderTableArn:
+    Value: !GetAtt OrderTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderTableArn"
+  OrderTableStreamArn:
+    Value: !GetAtt OrderTable.StreamArn
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderTableStreamArn"
+  CustomerTableArn:
+    Value: !GetAtt CustomerTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerTableArn"
+  ConfigTableArn:
+    Value: !GetAtt ConfigTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigTableArn"

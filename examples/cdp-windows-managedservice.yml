@@ -1,0 +1,52 @@
+# AWS CDP Architecture: Windows ファイルサーバー (応用編)
+# Reference: https://aws.amazon.com/jp/cdp/windows-managedservice/
+# AWS estimated cost: 1402.57 USD/month (ap-northeast-1, multi-region)
+#
+# Architecture: FSx for Windows (multi-AZ) + Managed AD (2 regions) +
+#               Site-to-Site VPN + cross-region data transfer + AWS Backup (2 regions).
+# Evaluate with --list-price.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Windowsファイルサーバー(応用編)"
+
+Resources:
+  FileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: WINDOWS
+      StorageType: SSD
+      StorageCapacity: 2048
+      WindowsConfiguration:
+        ThroughputCapacity: 32
+        DeploymentType: MULTI_AZ_1
+
+  ManagedAdTokyo:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: tokyo.example.com
+      Edition: Standard
+
+  ManagedAdOsaka:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: osaka.example.com
+      Edition: Standard
+
+  Vpn:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+
+  DataTransfer:
+    Type: Yevice::DataTransfer
+    Properties: {}
+
+  BackupTokyo:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: tokyo-vault
+
+  BackupOsaka:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: osaka-vault

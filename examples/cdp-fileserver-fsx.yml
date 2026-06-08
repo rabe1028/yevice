@@ -1,0 +1,47 @@
+# AWS CDP Architecture: Windows ファイルサーバー (基本編)
+# Reference: https://aws.amazon.com/jp/cdp/fileserver-fsx/
+# AWS estimated cost: 1048.87 USD/month (ap-northeast-1)
+#
+# Architecture:
+#   - Amazon FSx for Windows File Server (2048GB SSD, 32 MBps throughput, 3TB backups)
+#   - AWS Directory Service (Managed Microsoft AD, Standard)
+#   - Site-to-Site VPN
+#   - Internet data transfer (200GB out)
+#
+# Evaluate with --list-price to match AWS's published figure (no Free Tier).
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - Windowsファイルサーバー(基本編): FSx for Windows + Managed AD + VPN"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  FileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: WINDOWS
+      StorageType: SSD
+      StorageCapacity: 2048
+      WindowsConfiguration:
+        ThroughputCapacity: 32
+        DeploymentType: MULTI_AZ_1
+
+  ManagedAd:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: !Sub "${Env}.example.com"
+      Edition: Standard
+
+  Vpn:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: cgw-placeholder
+      VpnGatewayId: vgw-placeholder
+
+  DataTransfer:
+    Type: Yevice::DataTransfer
+    Properties: {}

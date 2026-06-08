@@ -1,0 +1,45 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Serverless HTTP API architecture (cheaper than REST API)
+  - API Gateway HTTP API (V2)
+  - One Lambda function
+  - One DynamoDB table (on-demand)
+  - One CloudWatch Log Group
+
+Resources:
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: ServerlessHttpApi
+      ProtocolType: HTTP
+
+  HandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: handler-function
+      MemorySize: 128
+      Timeout: 5
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/lambda-role"
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200 });
+
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: data-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  HandlerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/handler-function
+      RetentionInDays: 14

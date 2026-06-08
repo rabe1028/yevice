@@ -1,0 +1,20 @@
+# Local-runner configuration for mizchi/actrun.
+# Validates the GitHub Actions workflow in .github/workflows/ci.yml without
+# pushing to GitHub.
+#
+# Run:
+#   actrun workflow run .github/workflows/ci.yml --dry-run    # parse + plan
+#   actrun workflow run .github/workflows/ci.yml              # execute
+
+workspace_mode = "local"
+trust_actions = true
+
+# Skip actions that have no useful effect when running locally:
+# - actions/checkout: the repo is already checked out
+# - Swatinem/rust-cache: GitHub-side cache only
+local_skip_actions = ["actions/checkout", "Swatinem/rust-cache"]
+
+# The toolchain action would install Rust via rustup. Locally rustc/cargo are
+# already on PATH, so just print versions instead.
+[override."dtolnay/rust-toolchain"]
+run = "rustc --version && cargo --version"

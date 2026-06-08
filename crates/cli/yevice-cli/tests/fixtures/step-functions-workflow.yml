@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Step Functions Standard workflow orchestrating Lambda functions.
+  - OrderWorkflow: Standard state machine for order processing
+  - ValidateFunction: Lambda for order validation step
+  - ProcessFunction: Lambda for order processing step
+  - ValidateLogs: CloudWatch Logs for validation function
+  - ProcessLogs: CloudWatch Logs for processing function
+
+Resources:
+  OrderWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      Type: STANDARD
+
+  ValidateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      MemorySize: 256
+      Timeout: 10
+      Runtime: python3.11
+
+  ProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      MemorySize: 512
+      Timeout: 30
+      Runtime: python3.11
+
+  ValidateLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  ProcessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14

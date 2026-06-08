@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  - SEARCH collection for product catalog
+  - Conditional index retention based on env
+
+Parameters:
+  AppName:
+    Type: String
+  Stage:
+    Type: String
+  Module:
+    Type: String
+
+Mappings:
+  StageMap:
+    dev:
+      StandbyReplicas: "ENABLED"
+      EnableIndexRetention: false
+    stg:
+      StandbyReplicas: "ENABLED"
+      EnableIndexRetention: true
+    prd:
+      StandbyReplicas: "ENABLED"
+      EnableIndexRetention: true
+
+Conditions:
+  EnableIndexRetention: !Equals
+    - !FindInMap [StageMap, !Ref Stage, EnableIndexRetention]
+    - "true"
+
+Resources:
+  CatalogCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Sub "${AppName}-${Stage}-${Module}-catalog"
+      Type: SEARCH
+      StandbyReplicas: !FindInMap [StageMap, !Ref Stage, StandbyReplicas]
+
+  NetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${AppName}-${Stage}-${Module}-catalog"
+      Type: network
+
+  EncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${AppName}-${Stage}-${Module}-catalog"
+      Type: encryption
+
+Outputs:
+  CollectionEndpoint:
+    Value: !GetAtt CatalogCollection.CollectionEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-CollectionEndpoint

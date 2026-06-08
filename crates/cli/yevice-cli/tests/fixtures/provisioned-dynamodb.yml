@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  High-throughput app with provisioned DynamoDB capacity
+  - One Lambda function (high memory)
+  - Two DynamoDB tables with provisioned throughput
+  - One CloudWatch Log Group
+
+Resources:
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: api-function-provisioned
+      MemorySize: 1024
+      Timeout: 30
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/lambda-role"
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200 });
+
+  HotTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: hot-table
+      ProvisionedThroughput:
+        WriteCapacityUnits: 100
+        ReadCapacityUnits: 500
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  ColdTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: cold-table
+      ProvisionedThroughput:
+        WriteCapacityUnits: 5
+        ReadCapacityUnits: 25
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  FunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/api-function-provisioned
+      RetentionInDays: 30

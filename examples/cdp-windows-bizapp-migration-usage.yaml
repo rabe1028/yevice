@@ -1,0 +1,23 @@
+# AWS CDP: Windows 業務アプリ移行 (基本編)  — generate with --list-price
+# AWS estimated: 2034.70 USD/month
+#   2x EC2 m5.large Windows 730h ....... $315.36
+#   2x EBS gp2 200GB ................... $48.00
+#   EBS snapshots 2x 200GB ............. $20.00
+#   ALB hours + 0.5 LCU ............... $20.66
+#   RDS SQL Server db.r5.large Multi-AZ  $1533.00
+#   RDS storage gp2 100GB Multi-AZ (x2)  $27.60
+#   2x Site-to-Site VPN 730h .......... $70.08
+#                            TOTAL = $2034.70
+
+AppServer1:
+  data_transfer_out_gb: 0
+AppServer2:
+  data_transfer_out_gb: 0
+AppVolume1:
+  snapshot_gb: 200
+AppVolume2:
+  snapshot_gb: 200
+Alb:
+  lcu: 0.5
+Vpn1: {}
+Vpn2: {}

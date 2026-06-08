@@ -1,0 +1,60 @@
+# AWS CDP Architecture: 社内知識を活用した生成AIチャットボット
+# Reference: https://aws.amazon.com/jp/cdp/ai-chatapp/
+# AWS estimated cost: 941.99 USD/month (ap-northeast-1)
+#
+# Architecture: Bedrock (Claude 3 Sonnet) + Kendra (Developer Edition) +
+#               Transcribe + CloudFront + S3 + API Gateway + Cognito +
+#               Lambda + DynamoDB.
+# Evaluate with --list-price.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS CDP - 社内知識を活用した生成AIチャットボット"
+
+Resources:
+  ChatAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: chat-agent
+
+  KnowledgeIndex:
+    Type: AWS::Kendra::Index
+    Properties:
+      Name: knowledge
+      Edition: DEVELOPER_EDITION
+
+  Transcriber:
+    Type: AWS::Transcribe::Vocabulary
+    Properties:
+      VocabularyName: transcriber
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: chat-content
+
+  ChatApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: chat-api
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: chat-users
+
+  ChatFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      MemorySize: 1024
+
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST

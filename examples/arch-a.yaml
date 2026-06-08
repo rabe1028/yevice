@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Architecture A: Lambda + DynamoDB + S3"
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+
+Resources:
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Env}-api-handler"
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 30
+
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Env}-data"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-assets"
