@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
+use yevice_solver::{EnumerationSolver, Solver, SolverError};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 
@@ -578,6 +580,112 @@ pub fn validate(
 
     if result.has_errors() {
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Find the optimal decision-variable assignment that minimizes (or maximizes)
+/// the total cost of a cost model.
+///
+/// # Arguments
+///
+/// * `cost_model_path` – path to a JSON cost model produced by `generate`.
+/// * `params_path` – optional path to a usage-params YAML; values are treated
+///   as fixed (non-decision) variables.
+/// * `decisions` – each element is `"NAME=v1,v2,..."` specifying one decision
+///   variable and its candidate domain.
+pub fn optimize(
+    cost_model_path: &str,
+    params_path: Option<&str>,
+    decisions: &[String],
+) -> Result<()> {
+    let arch = load_cost_model(cost_model_path)?;
+    let objective = arch.total_expr();
+
+    let fixed_params = match params_path {
+        Some(p) => load_params(p)?,
+        None => Params::new(),
+    };
+
+    // Parse --decision NAME=v1,v2,...
+    let mut decision_variables: Vec<DecisionVariable> = Vec::new();
+    for spec in decisions {
+        let (name_part, values_part) = spec
+            .split_once('=')
+            .with_context(|| format!("invalid --decision value '{spec}': expected NAME=v1,v2,..."))?;
+        let name = VariableName::new(name_part.trim());
+        let domain: Vec<f64> = values_part
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<f64>()
+                    .with_context(|| {
+                        format!(
+                            "invalid domain value '{s}' for decision variable '{name_part}'"
+                        )
+                    })
+            })
+            .collect::<Result<_>>()?;
+        if domain.is_empty() {
+            bail!("decision variable '{name_part}' has an empty domain");
+        }
+        decision_variables.push(DecisionVariable { name, domain });
+    }
+
+    // Every variable in the objective must be bound — either fixed via --params
+    // or chosen as a --decision. Otherwise the objective cannot be evaluated and
+    // the solver would (misleadingly) report INFEASIBLE. Surface it as a clear
+    // error instead, listing exactly what is missing.
+    let mut bound: std::collections::HashSet<VariableName> = fixed_params.keys().cloned().collect();
+    for dv in &decision_variables {
+        bound.insert(dv.name.clone());
+    }
+    let unbound: Vec<String> = objective
+        .variables()
+        .into_iter()
+        .filter(|v| !bound.contains(v))
+        .map(|v| v.to_string())
+        .collect();
+    if !unbound.is_empty() {
+        bail!(
+            "cannot optimize: {} objective variable(s) are unbound; provide them via --params \
+             or as a --decision: {}",
+            unbound.len(),
+            unbound.join(", ")
+        );
+    }
+
+    let problem = OptimizationProblem {
+        objective,
+        direction: ObjectiveDirection::Minimize,
+        decision_variables,
+        constraints: vec![],
+        fixed_params: fixed_params.into_iter().collect(),
+    };
+
+    let sol = match EnumerationSolver.solve(&problem) {
+        Ok(s) => s,
+        Err(SolverError::TooManyCombinations { count, limit }) => {
+            bail!(
+                "too many combinations to enumerate ({count} > {limit}). \
+                 Reduce the domain sizes passed to --decision."
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    println!("\nOptimization Result ({}):", arch.name);
+    if sol.feasible {
+        // Print each decision variable's chosen value.
+        for dv in &problem.decision_variables {
+            if let Some(&val) = sol.assignments.get(&dv.name) {
+                println!("  {} = {val}", dv.name);
+            }
+        }
+        println!("  objective (total monthly cost) = ${:.4}", sol.objective_value);
+    } else {
+        println!("  Result: INFEASIBLE — no combination satisfied all constraints.");
     }
 
     Ok(())

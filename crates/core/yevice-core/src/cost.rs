@@ -26,12 +26,31 @@ pub struct ResourceCost {
     pub required_variables: Vec<VariableInfo>,
 }
 
+/// Indicates whether a variable is a usage (observed) input or a decision
+/// variable that the optimizer may choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VariableKind {
+    /// Observed usage input supplied by the user (default).
+    #[default]
+    Usage,
+    /// Decision variable: the optimizer selects its value from a domain.
+    Decision,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_usage(k: &VariableKind) -> bool {
+    *k == VariableKind::Usage
+}
+
 /// Metadata about a variable used in a cost expression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableInfo {
     pub name: VariableName,
     pub description: String,
     pub unit: String,
+    /// Whether this variable is a usage input or a decision variable.
+    #[serde(default, skip_serializing_if = "is_usage")]
+    pub kind: VariableKind,
 }
 
 impl VariableInfo {
@@ -40,6 +59,7 @@ impl VariableInfo {
             name: id.var(suffix),
             description: description.into(),
             unit: unit.into(),
+            kind: VariableKind::Usage,
         }
     }
 }

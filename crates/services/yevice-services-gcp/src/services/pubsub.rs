@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo},
+    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
@@ -63,6 +63,7 @@ impl Service for GcpPubSubService {
                 name: id.var("data_gb"),
                 description: "Message data volume per month".into(),
                 unit: "GB".into(),
+                kind: VariableKind::Usage,
             }],
         })
     }

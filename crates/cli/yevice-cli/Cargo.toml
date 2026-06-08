@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 yevice-core = { workspace = true }
+yevice-solver = { workspace = true }
 yevice-output = { workspace = true }
 yevice-cfn = { workspace = true }
 yevice-pricing = { workspace = true }

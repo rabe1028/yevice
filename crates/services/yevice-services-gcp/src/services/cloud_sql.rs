@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    cost::{CostComponent, Expr, ResourceCost, VariableInfo},
+    cost::{CostComponent, Expr, ResourceCost, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
@@ -90,6 +90,7 @@ impl Service for GcpCloudSqlService {
                 name: id.var("storage_gb"),
                 description: "Allocated storage".into(),
                 unit: "GB".into(),
+                kind: VariableKind::Usage,
             }],
         })
     }

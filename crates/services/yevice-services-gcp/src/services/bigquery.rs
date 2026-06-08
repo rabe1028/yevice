@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo},
+    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
@@ -78,11 +78,13 @@ impl Service for GcpBigQueryService {
                     name: id.var("storage_gb"),
                     description: "Active storage per month".into(),
                     unit: "GB".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("query_gb_scanned"),
                     description: "Data scanned by queries per month".into(),
                     unit: "GB".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })

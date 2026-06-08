@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo},
+    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
@@ -112,11 +112,13 @@ impl Service for GcpCloudFunctionService {
                     name: id.var("monthly_invocations"),
                     description: "Function invocations per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("avg_duration_ms"),
                     description: "Average execution duration".into(),
                     unit: "ms".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })

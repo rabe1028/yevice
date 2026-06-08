@@ -1101,6 +1101,7 @@ dependencies = [
  "yevice-service-api",
  "yevice-services-aws",
  "yevice-services-gcp",
+ "yevice-solver",
  "yevice-tf",
  "yevice-wrangler",
 ]
@@ -1169,6 +1170,14 @@ dependencies = [
  "yevice-core",
  "yevice-pricing",
  "yevice-service-api",
+]
+
+[[package]]
+name = "yevice-solver"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "yevice-core",
 ]
 
 [[package]]

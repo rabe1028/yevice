@@ -9,6 +9,7 @@ members = [
   "crates/services/yevice-services-aws",
   "crates/services/yevice-services-gcp",
   "crates/output/yevice-output",
+  "crates/solver/yevice-solver",
   "crates/cli/yevice-cli",
 ]
 resolver = "2"
@@ -71,6 +72,7 @@ yevice-wrangler = { path = "crates/iac/yevice-wrangler", version = "0.1.0" }
 yevice-services-aws = { path = "crates/services/yevice-services-aws", version = "0.1.0" }
 yevice-services-gcp = { path = "crates/services/yevice-services-gcp", version = "0.1.0" }
 yevice-output = { path = "crates/output/yevice-output", version = "0.1.0" }
+yevice-solver = { path = "crates/solver/yevice-solver", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

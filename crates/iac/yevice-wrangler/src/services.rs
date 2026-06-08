@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo},
+    cost::{CostComponent, Expr, ResourceCost, Tier, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
@@ -127,11 +127,13 @@ impl Service for CloudflareWorkerService {
                     name: id.var("monthly_requests"),
                     description: "HTTP requests per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("avg_cpu_ms"),
                     description: "Average CPU time per request".into(),
                     unit: "ms".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })
@@ -215,11 +217,13 @@ impl Service for CloudflareKvService {
                     name: id.var("monthly_reads"),
                     description: "KV read operations per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("monthly_writes"),
                     description: "KV write operations per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })
@@ -325,16 +329,19 @@ impl Service for CloudflareR2Service {
                     name: id.var("storage_gb"),
                     description: "Data stored per month".into(),
                     unit: "GB".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("class_a_ops"),
                     description: "Class A operations (writes, lists) per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("class_b_ops"),
                     description: "Class B operations (reads) per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })
@@ -418,11 +425,13 @@ impl Service for CloudflareD1Service {
                     name: id.var("monthly_rows_read"),
                     description: "Database rows read per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("monthly_rows_written"),
                     description: "Database rows written per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })
@@ -489,6 +498,7 @@ impl Service for CloudflareQueueService {
                 name: id.var("monthly_messages"),
                 description: "Messages published per month".into(),
                 unit: "count".into(),
+                kind: VariableKind::Usage,
             }],
         })
     }
@@ -593,16 +603,19 @@ impl Service for CloudflareDurableObjectService {
                     name: id.var("monthly_requests"),
                     description: "Requests to Durable Object per month".into(),
                     unit: "count".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("monthly_gb_seconds"),
                     description: "Compute duration in GB-seconds per month".into(),
                     unit: "GB-seconds".into(),
+                    kind: VariableKind::Usage,
                 },
                 VariableInfo {
                     name: id.var("storage_gb"),
                     description: "Persistent storage used".into(),
                     unit: "GB".into(),
+                    kind: VariableKind::Usage,
                 },
             ],
         })

@@ -208,6 +208,21 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+
+    /// Find the optimal variable assignment that minimizes (or maximizes) total cost.
+    Optimize {
+        /// Path to cost model file (JSON) produced by `generate`.
+        cost_model: String,
+
+        /// Path to usage parameters file (YAML/JSON) for fixed (non-decision) variables.
+        #[arg(short, long)]
+        params: Option<String>,
+
+        /// Decision variable with its candidate domain: NAME=v1,v2,...
+        /// May be repeated for multiple decision variables.
+        #[arg(long = "decision", value_name = "NAME=v1,v2,...")]
+        decision: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -291,5 +306,10 @@ fn main() -> Result<()> {
             format,
             output,
         } => commands::diagram(&cost_model, &format, output.as_deref()),
+        Commands::Optimize {
+            cost_model,
+            params,
+            decision,
+        } => commands::optimize(&cost_model, params.as_deref(), &decision),
     }
 }
