@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Remove rust-toolchain.toml to honor MSRV
         run: rm -f rust-toolchain.toml
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.100
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
