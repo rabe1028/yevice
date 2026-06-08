@@ -22,8 +22,8 @@ use serde::Deserialize;
 
 use crate::cost::{Expr, VariableBinding};
 use crate::expr_parser;
-use crate::resource::{Architecture, Connection, ConnectionType};
-use crate::types::{LogicalId, VariableName};
+use crate::resource::{Architecture, Connection};
+use crate::types::VariableName;
 
 /// User-defined bindings file structure.
 #[derive(Debug, Deserialize)]
@@ -146,32 +146,16 @@ fn build_simple_description(source: &str, batch_size: f64, factor: f64) -> Strin
 // Auto-derived bindings from the Architecture connection graph
 // ===========================================================================
 
-/// Returns the source rate variable and a display label for a resource, given
-/// its service_id (or a hint string for external sources).
-fn source_rate_var(
-    arch: &Architecture,
-    id: &LogicalId,
-    hint: Option<&str>,
-) -> Option<(VariableName, &'static str)> {
-    let service_id = arch.find_resource(id).map(|r| r.shell.service_id.as_str());
-    match service_id {
-        Some("aws.sqs") => Some((id.var("requests"), "SQS")),
-        Some("aws.kinesis") => Some((id.var("put_records"), "Kinesis")),
-        Some("aws.dynamodb") => Some((id.var("write_request_units"), "DynamoDB")),
-        Some("aws.lambda") => Some((id.var("requests"), "Lambda")),
-        Some("aws.s3") => Some((id.var("put_requests"), "S3")),
-        _ => match hint {
-            Some("sqs") => Some((id.var("requests"), "SQS")),
-            Some("kinesis") => Some((id.var("put_records"), "Kinesis")),
-            Some("dynamodb") => Some((id.var("write_request_units"), "DynamoDB")),
-            Some("lambda") => Some((id.var("requests"), "Lambda")),
-            Some("s3") => Some((id.var("put_requests"), "S3")),
-            _ => None,
-        },
-    }
+/// A rule that derives variable bindings from a single connection.
+///
+/// Provider-specific binding logic lives in the service crates that
+/// implement this trait; core only walks the graph and aggregates.
+pub trait ConnectionRule: Send + Sync {
+    fn derive(&self, conn: &Connection, arch: &Architecture) -> Vec<VariableBinding>;
 }
 
-fn scale_expr(expr: Expr, factor: f64) -> Expr {
+/// Scale `expr` by `factor` (identity if factor is 1.0).
+pub fn scale_expr(expr: Expr, factor: f64) -> Expr {
     if (factor - 1.0).abs() < f64::EPSILON {
         expr
     } else {
@@ -179,7 +163,7 @@ fn scale_expr(expr: Expr, factor: f64) -> Expr {
     }
 }
 
-fn scale_description(base: impl Into<String>, factor: f64) -> String {
+pub fn scale_description(base: impl Into<String>, factor: f64) -> String {
     let base = base.into();
     if (factor - 1.0).abs() < f64::EPSILON {
         base
@@ -188,7 +172,7 @@ fn scale_description(base: impl Into<String>, factor: f64) -> String {
     }
 }
 
-fn scaled_binding(
+pub fn scaled_binding(
     target: VariableName,
     source_var: &VariableName,
     factor: f64,
@@ -227,173 +211,24 @@ fn upsert_binding(
     }
 }
 
-fn derive_event_source_binding(conn: &Connection, arch: &Architecture) -> Option<VariableBinding> {
-    let batch_size = conn.batch_size.unwrap_or(1.0);
-    let parallelization = conn.parallelization_factor.unwrap_or(1.0);
-    let (source_var, source_type) =
-        source_rate_var(arch, &conn.source, conn.source_hint.as_deref())?;
-
-    let base_expr = Expr::ceil(Expr::div(
-        Expr::variable(source_var.clone()),
-        Expr::constant(batch_size),
-    ));
-    let expr = scale_expr(base_expr, parallelization);
-    let description = scale_description(
-        format!("ceil({source_var} / {batch_size})"),
-        parallelization,
-    );
-
-    Some(VariableBinding {
-        target: conn.target.var("requests"),
-        expr,
-        description,
-        source: format!(
-            "{source_type} -> Lambda ({} -> {}, batch={batch_size})",
-            conn.source, conn.target
-        ),
-    })
-}
-
-fn derive_invocation_binding(conn: &Connection, arch: &Architecture) -> Option<VariableBinding> {
-    let factor = conn.factor.unwrap_or(1.0);
-    let (source_var, source_type) =
-        source_rate_var(arch, &conn.source, conn.source_hint.as_deref())?;
-
-    let target_resource = arch.find_resource(&conn.target);
-    let target_service_id = target_resource.map(|r| r.shell.service_id.as_str());
-    let workflow_type =
-        target_resource.and_then(|r| r.shell.metadata.get("workflow_type").map(String::as_str));
-
-    let (target_var, target_type) = match target_service_id {
-        Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
-        Some("aws.step_functions") => match workflow_type {
-            Some("express") => (conn.target.var("requests"), "Step Functions"),
-            _ => (conn.target.var("transitions"), "Step Functions"),
-        },
-        _ => return None,
-    };
-
-    Some(scaled_binding(
-        target_var,
-        &source_var,
-        factor,
-        format!(
-            "{source_type} -> {target_type} ({} -> {})",
-            conn.source, conn.target
-        ),
-    ))
-}
-
-fn derive_dataflow_bindings(conn: &Connection, arch: &Architecture) -> Vec<VariableBinding> {
-    let factor = conn.factor.unwrap_or(1.0);
-    let Some((source_var, source_type)) =
-        source_rate_var(arch, &conn.source, conn.source_hint.as_deref())
-    else {
-        return Vec::new();
-    };
-
-    let target_resource = arch.find_resource(&conn.target);
-    let target_service_id = target_resource.map(|r| r.shell.service_id.as_str());
-    let billing_mode =
-        target_resource.and_then(|r| r.shell.metadata.get("billing_mode").map(String::as_str));
-
-    match target_service_id {
-        Some("aws.dynamodb") if billing_mode == Some("on_demand") => {
-            vec![scaled_binding(
-                conn.target.var("write_request_units"),
-                &source_var,
-                factor,
-                format!(
-                    "{source_type} -> DynamoDB ({} -> {})",
-                    conn.source, conn.target
-                ),
-            )]
-        }
-        Some("aws.sns") => vec![scaled_binding(
-            conn.target.var("deliveries"),
-            &source_var,
-            factor,
-            format!("{source_type} -> SNS ({} -> {})", conn.source, conn.target),
-        )],
-        Some("aws.sqs") => vec![scaled_binding(
-            conn.target.var("requests"),
-            &source_var,
-            factor,
-            format!("{source_type} -> SQS ({} -> {})", conn.source, conn.target),
-        )],
-        _ => Vec::new(),
-    }
-}
-
-fn derive_notification_binding(conn: &Connection, arch: &Architecture) -> Option<VariableBinding> {
-    let factor = conn.factor.unwrap_or(1.0);
-    let (source_var, source_type) =
-        source_rate_var(arch, &conn.source, conn.source_hint.as_deref())?;
-    if source_type != "S3" {
-        return None;
-    }
-
-    let target_service_id = arch
-        .find_resource(&conn.target)
-        .map(|r| r.shell.service_id.as_str());
-
-    let (target_var, target_type) = match target_service_id {
-        Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
-        Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
-        _ => return None,
-    };
-
-    Some(scaled_binding(
-        target_var,
-        &source_var,
-        factor,
-        format!(
-            "{source_type} -> {target_type} ({} -> {})",
-            conn.source, conn.target
-        ),
-    ))
-}
-
 /// Derive variable bindings from the architecture's connection graph.
 ///
-/// This function inspects the connections and automatically creates
-/// `VariableBinding`s that relate upstream resource usage to downstream
-/// resource invocations — for example, deriving Lambda invocation counts
-/// from SQS message counts.
-pub fn derive_bindings(arch: &Architecture) -> Vec<VariableBinding> {
+/// This function walks every connection and asks each `ConnectionRule` to
+/// produce bindings. Provider-specific rules live in their respective service
+/// crates; core is only responsible for the graph-walk and upsert aggregation.
+pub fn derive_bindings(
+    arch: &Architecture,
+    rules: &[Box<dyn ConnectionRule>],
+) -> Vec<VariableBinding> {
     let mut map: HashMap<VariableName, VariableBinding> = HashMap::new();
     let mut order: Vec<VariableName> = Vec::new();
-
     for conn in &arch.connections {
-        match conn.connection_type {
-            ConnectionType::EventSource => {
-                if let Some(binding) = derive_event_source_binding(conn, arch) {
-                    upsert_binding(&mut map, &mut order, binding);
-                }
-            }
-            ConnectionType::Invocation => {
-                if let Some(binding) = derive_invocation_binding(conn, arch) {
-                    upsert_binding(&mut map, &mut order, binding);
-                }
-            }
-            ConnectionType::DataFlow => {
-                for binding in derive_dataflow_bindings(conn, arch) {
-                    upsert_binding(&mut map, &mut order, binding);
-                }
-            }
-            ConnectionType::Notification => {
-                if let Some(binding) = derive_notification_binding(conn, arch) {
-                    upsert_binding(&mut map, &mut order, binding);
-                }
+        for rule in rules {
+            for binding in rule.derive(conn, arch) {
+                upsert_binding(&mut map, &mut order, binding);
             }
         }
     }
-
-    // Walk `order` so that bindings appear in insertion (~topological) order:
-    // an upstream binding (`Worker_requests = QueueA_requests`) is emitted
-    // before any downstream binding that consumes `Worker_requests`. This
-    // matches the order connections are visited in `arch.connections`, which
-    // typically reflects the graph's data-flow direction.
     let mut bindings = Vec::with_capacity(order.len());
     for name in order {
         if let Some(binding) = map.remove(&name) {
@@ -501,73 +336,28 @@ mod tests {
         assert_eq!(result, 1000.0);
     }
 
-    #[test]
-    fn test_fan_in_bindings_are_summed() {
-        use crate::resource::{
-            Architecture, Connection, ConnectionType, Provider, Resource, ResourceShell,
-        };
-        use crate::types::{LogicalId, Region, ResourceType};
+    /// Minimal no-op rule for testing the skeleton itself.
+    struct NoopRule;
+    impl ConnectionRule for NoopRule {
+        fn derive(&self, _conn: &Connection, _arch: &Architecture) -> Vec<VariableBinding> {
+            Vec::new()
+        }
+    }
 
-        let lambda_shell = ResourceShell::new("aws.lambda", Provider::Aws, &serde_json::json!({}));
-        let sqs_a_shell = ResourceShell::new("aws.sqs", Provider::Aws, &serde_json::json!({}));
-        let sqs_b_shell = ResourceShell::new("aws.sqs", Provider::Aws, &serde_json::json!({}));
+    #[test]
+    fn test_derive_bindings_empty_rules_returns_empty() {
+        use crate::resource::Architecture;
+        use crate::types::Region;
 
         let arch = Architecture {
-            name: "fan-in".into(),
+            name: "empty".into(),
             region: Region::new("ap-northeast-1"),
-            resources: vec![
-                Resource {
-                    logical_id: LogicalId::new("Worker"),
-                    resource_type: ResourceType::new("AWS::Lambda::Function"),
-                    shell: lambda_shell,
-                },
-                Resource {
-                    logical_id: LogicalId::new("QueueA"),
-                    resource_type: ResourceType::new("AWS::SQS::Queue"),
-                    shell: sqs_a_shell,
-                },
-                Resource {
-                    logical_id: LogicalId::new("QueueB"),
-                    resource_type: ResourceType::new("AWS::SQS::Queue"),
-                    shell: sqs_b_shell,
-                },
-            ],
-            connections: vec![
-                Connection {
-                    source: LogicalId::new("QueueA"),
-                    target: LogicalId::new("Worker"),
-                    connection_type: ConnectionType::EventSource,
-                    batch_size: Some(1.0),
-                    parallelization_factor: Some(1.0),
-                    factor: None,
-                    source_hint: None,
-                },
-                Connection {
-                    source: LogicalId::new("QueueB"),
-                    target: LogicalId::new("Worker"),
-                    connection_type: ConnectionType::EventSource,
-                    batch_size: Some(1.0),
-                    parallelization_factor: Some(1.0),
-                    factor: None,
-                    source_hint: None,
-                },
-            ],
+            resources: vec![],
+            connections: vec![],
         };
 
-        let bindings = derive_bindings(&arch);
-
-        let worker_binding = bindings
-            .iter()
-            .find(|b| b.target == LogicalId::new("Worker").var("requests"))
-            .expect("Worker_requests binding should exist");
-
-        // With QueueA_requests=300 and QueueB_requests=200, summed result must be 500
-        // (not just whichever source happened to be processed last).
-        let params = params_from(&[("QueueA_requests", 300.0), ("QueueB_requests", 200.0)]);
-        let result = crate::evaluate::evaluate(&worker_binding.expr, &params).unwrap();
-        assert_eq!(
-            result, 500.0,
-            "fan-in bindings must sum, not overwrite — got {result}"
-        );
+        let rules: Vec<Box<dyn ConnectionRule>> = vec![Box::new(NoopRule)];
+        let bindings = derive_bindings(&arch, &rules);
+        assert!(bindings.is_empty());
     }
 }

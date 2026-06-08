@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    capacity::{CapacityModel, Constraint, QuotaType, RegionQuotas, Severity},
+    capacity::{CapacityModel, Constraint, QuotaType, Quotas, Severity},
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
@@ -8,6 +8,12 @@ use yevice_core::{
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
+
+use crate::quotas::{
+    DEFAULT_KINESIS_MAX_MB_PER_SEC_PER_SHARD, DEFAULT_KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD,
+    DEFAULT_KINESIS_MAX_SHARDS_PER_STREAM, KINESIS_MAX_MB_PER_SEC_PER_SHARD,
+    KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD, KINESIS_MAX_SHARDS_PER_STREAM,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KinesisStreamMode {
@@ -155,19 +161,29 @@ impl Service for KinesisService {
         &self,
         id: &LogicalId,
         spec: &KinesisSpec,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Option<CapacityModel> {
         let KinesisStreamMode::Provisioned { shard_count } = &spec.stream_mode else {
             return None;
         };
         let shard_count = (*shard_count)?;
 
+        let max_mb_per_sec_per_shard = quotas
+            .get(KINESIS_MAX_MB_PER_SEC_PER_SHARD)
+            .unwrap_or(DEFAULT_KINESIS_MAX_MB_PER_SEC_PER_SHARD);
+        let max_records_per_sec_per_shard = quotas
+            .get(KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD)
+            .unwrap_or(DEFAULT_KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD);
+        let max_shards_per_stream = quotas
+            .get(KINESIS_MAX_SHARDS_PER_STREAM)
+            .unwrap_or(DEFAULT_KINESIS_MAX_SHARDS_PER_STREAM);
+
         let mut constraints = vec![
             Constraint {
                 dimension: "shard_throughput".into(),
                 required: Expr::ceil(Expr::div(
                     Expr::variable(id.var("peak_ingestion_mb_per_sec")),
-                    Expr::constant(quotas.kinesis_max_mb_per_sec_per_shard),
+                    Expr::constant(max_mb_per_sec_per_shard),
                 )),
                 limit: shard_count,
                 quota_type: QuotaType::Soft,
@@ -179,7 +195,7 @@ impl Service for KinesisService {
                 dimension: "shard_record_rate".into(),
                 required: Expr::ceil(Expr::div(
                     Expr::variable(id.var("peak_records_per_sec")),
-                    Expr::constant(quotas.kinesis_max_records_per_sec_per_shard),
+                    Expr::constant(max_records_per_sec_per_shard),
                 )),
                 limit: shard_count,
                 quota_type: QuotaType::Soft,
@@ -189,11 +205,11 @@ impl Service for KinesisService {
             },
         ];
 
-        if shard_count > quotas.kinesis_max_shards_per_stream * 0.8 {
+        if shard_count > max_shards_per_stream * 0.8 {
             constraints.push(Constraint {
                 dimension: "shard_quota".into(),
                 required: Expr::constant(shard_count),
-                limit: quotas.kinesis_max_shards_per_stream,
+                limit: max_shards_per_stream,
                 quota_type: QuotaType::Soft,
                 severity: Severity::Warning,
                 message_template: "Shard count {required} is above 80% of stream quota {limit}"

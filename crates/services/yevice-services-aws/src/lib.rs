@@ -1,18 +1,31 @@
 //! AWS service plugin implementations for yevice.
 
 pub mod cfn;
+pub mod connection_rules;
 pub mod pricing_adapter;
+pub mod quotas;
 pub mod services;
 pub mod tf;
 
+pub use connection_rules::{
+    aws_connection_rules, AwsDataFlowRule, AwsEventSourceRule, AwsInvocationRule,
+    AwsNotificationRule,
+};
 pub use pricing_adapter::AwsPricingCatalog;
+pub use quotas::AwsQuotaProvider;
 
-/// Register all AWS services, CFN adapters, and TF adapters.
+/// Register all AWS services, CFN adapters, TF adapters, and connection rules.
 pub fn register(
     catalog: &mut yevice_service_api::ServiceCatalog,
     cfn: &mut yevice_service_api::CfnAdapterRegistry,
     tf: &mut yevice_service_api::TfAdapterRegistry,
 ) {
+    // Connection rules (binding derivation)
+    catalog.register_connection_rules(aws_connection_rules());
+
+    // Quota provider
+    catalog.register_quota_provider(Box::new(AwsQuotaProvider));
+
     // Services
     catalog.register(services::lambda::LambdaService);
     catalog.register(services::dynamodb::DynamoDbService);

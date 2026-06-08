@@ -7,7 +7,7 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 use yevice_cfn::convert as cfn_convert;
 use yevice_cfn::parser;
 use yevice_core::bindings::{BindingsFile, derive_bindings, to_variable_bindings};
-use yevice_core::capacity::{self, RegionQuotas, Severity};
+use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
 use yevice_core::resource::Architecture;
@@ -474,7 +474,7 @@ pub fn validate(
 
     let quotas = match quotas_path {
         Some(p) => load_quotas(p).context("failed to load quotas file")?,
-        None => RegionQuotas::default(),
+        None => catalog.default_quotas(region),
     };
 
     let capacity_models = catalog.build_capacity_models(&architecture, &quotas);
@@ -483,7 +483,7 @@ pub fn validate(
     // `Worker_requests` from `Queue_requests`) with any user-supplied bindings.
     // Without the architecture-derived ones, downstream user bindings that
     // depend on auto-derived variables would never resolve.
-    let mut all_bindings = derive_bindings(&architecture);
+    let mut all_bindings = derive_bindings(&architecture, catalog.connection_rules());
     if format == InputFormat::Cfn
         && let Some(path) = bindings_path
     {
@@ -845,10 +845,10 @@ fn select_pricing_catalog(
     }
 }
 
-fn load_quotas(path: &str) -> Result<RegionQuotas> {
+fn load_quotas(path: &str) -> Result<Quotas> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-    let quotas: RegionQuotas =
+    let quotas: Quotas =
         serde_yaml_ng::from_str(&content).context("failed to parse quotas file")?;
     Ok(quotas)
 }

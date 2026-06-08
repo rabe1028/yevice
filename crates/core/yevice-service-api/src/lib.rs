@@ -10,3 +10,4 @@ pub use iac::{
     TfAdapterRegistry,
 };
 pub use service::{AnyService, Service, ServiceAdapter};
+pub use yevice_core::bindings::ConnectionRule;

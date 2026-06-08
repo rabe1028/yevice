@@ -1,8 +1,8 @@
 //! `ServiceCatalog` — the central registry for all service plugins.
 
 use yevice_core::{
-    bindings::derive_bindings,
-    capacity::{CapacityModel, RegionQuotas},
+    bindings::{derive_bindings, ConnectionRule},
+    capacity::{CapacityModel, QuotaProvider, Quotas},
     cost::ArchitectureCost,
     resource::Architecture,
     types::ArchitectureName,
@@ -21,6 +21,8 @@ use crate::{
 #[derive(Default)]
 pub struct ServiceCatalog {
     services: std::collections::HashMap<String, Box<dyn AnyService>>,
+    connection_rules: Vec<Box<dyn ConnectionRule>>,
+    quota_providers: Vec<Box<dyn QuotaProvider>>,
 }
 
 impl ServiceCatalog {
@@ -32,6 +34,36 @@ impl ServiceCatalog {
     pub fn register<S: Service + 'static>(&mut self, service: S) {
         self.services
             .insert(service.id().to_string(), Box::new(ServiceAdapter(service)));
+    }
+
+    /// Register a single connection rule.
+    pub fn register_connection_rule(&mut self, rule: Box<dyn ConnectionRule>) {
+        self.connection_rules.push(rule);
+    }
+
+    /// Register multiple connection rules at once.
+    pub fn register_connection_rules(&mut self, rules: Vec<Box<dyn ConnectionRule>>) {
+        self.connection_rules.extend(rules);
+    }
+
+    /// Return a slice of all registered connection rules.
+    pub fn connection_rules(&self) -> &[Box<dyn ConnectionRule>] {
+        &self.connection_rules
+    }
+
+    /// Register a quota provider.
+    pub fn register_quota_provider(&mut self, p: Box<dyn QuotaProvider>) {
+        self.quota_providers.push(p);
+    }
+
+    /// Merge default quotas from all registered providers for the given region.
+    /// Later-registered providers win on key conflicts.
+    pub fn default_quotas(&self, region: &str) -> Quotas {
+        let mut merged = Quotas::default();
+        for provider in &self.quota_providers {
+            merged.merge_from(provider.default_quotas(region));
+        }
+        merged
     }
 
     /// Build a cost model for the given architecture.
@@ -79,7 +111,7 @@ impl ServiceCatalog {
             }
         }
 
-        let bindings = derive_bindings(arch);
+        let bindings = derive_bindings(arch, &self.connection_rules);
 
         Ok(ArchitectureCost {
             name: ArchitectureName::new(&arch.name),
@@ -94,7 +126,7 @@ impl ServiceCatalog {
     pub fn build_capacity_models(
         &self,
         arch: &Architecture,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Vec<CapacityModel> {
         let mut models = Vec::new();
         for resource in &arch.resources {
