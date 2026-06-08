@@ -108,7 +108,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           "name": coverage-lcov
           path: lcov.info
@@ -126,7 +126,7 @@ jobs:
           tool: cargo-cyclonedx
       - run: cargo cyclonedx --format json --override-filename yevice-sbom
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           "name": sbom-cyclonedx
           path: '**/yevice-sbom.json'
