@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use yevice_core::{
-    resource::{Architecture, Connection, Provider, Resource, ResourceShell},
+    resource::{Architecture, Connection, ConnectionType, Provider, Resource, ResourceShell},
     types::{LogicalId, Region, ResourceType},
 };
 
@@ -342,11 +342,135 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
         }
     }
 
+    // Build the set of all resource logical IDs for dangling-edge prevention.
+    let resource_ids: std::collections::HashSet<&LogicalId> =
+        resources.iter().map(|r| &r.logical_id).collect();
+
+    let worker_id = LogicalId::new(worker_name);
+    let mut connections = Vec::<Connection>::new();
+
+    // KV namespace bindings: Worker → KV (DataFlow)
+    for kv in &raw.kv_namespaces {
+        let kv_id = LogicalId::new(format!("{}_kv_{}", worker_name, kv.binding.to_lowercase()));
+        if resource_ids.contains(&kv_id) {
+            connections.push(Connection {
+                source: worker_id.clone(),
+                target: kv_id,
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: None,
+                source_hint: None,
+            });
+        }
+    }
+
+    // R2 bucket bindings: Worker → R2 (DataFlow)
+    for r2 in &raw.r2_buckets {
+        let bucket = r2.bucket_name.as_deref().unwrap_or(&r2.binding);
+        let r2_id = LogicalId::new(format!("{}_r2_{}", worker_name, bucket.to_lowercase()));
+        if resource_ids.contains(&r2_id) {
+            connections.push(Connection {
+                source: worker_id.clone(),
+                target: r2_id,
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: None,
+                source_hint: None,
+            });
+        }
+    }
+
+    // D1 database bindings: Worker → D1 (DataFlow)
+    for d1 in &raw.d1_databases {
+        let d1_id = LogicalId::new(format!("{}_d1_{}", worker_name, d1.binding.to_lowercase()));
+        if resource_ids.contains(&d1_id) {
+            connections.push(Connection {
+                source: worker_id.clone(),
+                target: d1_id,
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: None,
+                source_hint: None,
+            });
+        }
+    }
+
+    // Queue connections
+    if let Some(queues) = &raw.queues {
+        // Queue producers: Worker → Queue (DataFlow)
+        for producer in &queues.producers {
+            let queue_id = LogicalId::new(format!(
+                "{}_queue_{}",
+                worker_name,
+                producer.queue.to_lowercase().replace('-', "_")
+            ));
+            if resource_ids.contains(&queue_id) {
+                connections.push(Connection {
+                    source: worker_id.clone(),
+                    target: queue_id,
+                    connection_type: ConnectionType::DataFlow,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: None,
+                    source_hint: None,
+                });
+            }
+        }
+
+        // Queue consumers: Queue → Worker (EventSource)
+        for consumer in &queues.consumers {
+            let queue_id = LogicalId::new(format!(
+                "{}_queue_{}",
+                worker_name,
+                consumer.queue.to_lowercase().replace('-', "_")
+            ));
+            if resource_ids.contains(&queue_id) {
+                connections.push(Connection {
+                    source: queue_id,
+                    target: worker_id.clone(),
+                    connection_type: ConnectionType::EventSource,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: None,
+                    source_hint: None,
+                });
+            }
+        }
+    }
+
+    // Durable Object bindings: Worker → DO (DataFlow)
+    if let Some(dos) = &raw.durable_objects {
+        let mut seen_classes = std::collections::HashSet::new();
+        for binding in &dos.bindings {
+            if seen_classes.insert(&binding.class_name) {
+                let do_id = LogicalId::new(format!(
+                    "{}_do_{}",
+                    worker_name,
+                    binding.class_name.to_lowercase()
+                ));
+                if resource_ids.contains(&do_id) {
+                    connections.push(Connection {
+                        source: worker_id.clone(),
+                        target: do_id,
+                        connection_type: ConnectionType::DataFlow,
+                        batch_size: None,
+                        parallelization_factor: None,
+                        factor: None,
+                        source_hint: None,
+                    });
+                }
+            }
+        }
+    }
+
     Architecture {
         name: worker_name.to_string(),
         region: Region::new("global"),
         resources,
-        connections: Vec::<Connection>::new(),
+        connections,
     }
 }
 
@@ -382,5 +506,159 @@ mod tests {
         assert_eq!(architecture.name, "edge-worker");
         assert_eq!(architecture.region, "global");
         assert_eq!(architecture.resources.len(), 3);
+    }
+
+    #[test]
+    fn connections_kv_r2_d1_are_worker_to_resource_dataflow() {
+        let content = r#"
+name = "my-worker"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "kv-id"
+
+[[r2_buckets]]
+binding = "UPLOADS"
+bucket_name = "my-bucket"
+
+[[d1_databases]]
+binding = "DB"
+database_id = "db-id"
+"#;
+        let arch = parse_wrangler_str(content, "fallback").unwrap();
+
+        let worker_id = LogicalId::new("my-worker");
+        let kv_id = LogicalId::new("my-worker_kv_cache");
+        let r2_id = LogicalId::new("my-worker_r2_my-bucket");
+        let d1_id = LogicalId::new("my-worker_d1_db");
+
+        assert_eq!(arch.connections.len(), 3);
+
+        let has_conn = |source: &LogicalId, target: &LogicalId, ctype: &ConnectionType| {
+            arch.connections.iter().any(|c| {
+                &c.source == source && &c.target == target && &c.connection_type == ctype
+            })
+        };
+
+        assert!(has_conn(&worker_id, &kv_id, &ConnectionType::DataFlow));
+        assert!(has_conn(&worker_id, &r2_id, &ConnectionType::DataFlow));
+        assert!(has_conn(&worker_id, &d1_id, &ConnectionType::DataFlow));
+    }
+
+    #[test]
+    fn connections_queue_producer_is_dataflow_consumer_is_eventsource() {
+        let content = r#"
+name = "my-worker"
+
+[queues]
+
+[[queues.producers]]
+binding = "P"
+queue = "my-queue"
+
+[[queues.consumers]]
+queue = "my-queue"
+"#;
+        let arch = parse_wrangler_str(content, "fallback").unwrap();
+
+        let worker_id = LogicalId::new("my-worker");
+        let queue_id = LogicalId::new("my-worker_queue_my_queue");
+
+        // One queue resource (deduplicated), two connections: producer DataFlow + consumer EventSource
+        assert_eq!(arch.connections.len(), 2);
+
+        let producer_conn = arch
+            .connections
+            .iter()
+            .find(|c| c.connection_type == ConnectionType::DataFlow);
+        let consumer_conn = arch
+            .connections
+            .iter()
+            .find(|c| c.connection_type == ConnectionType::EventSource);
+
+        let producer_conn = producer_conn.expect("producer DataFlow connection present");
+        assert_eq!(producer_conn.source, worker_id);
+        assert_eq!(producer_conn.target, queue_id);
+
+        let consumer_conn = consumer_conn.expect("consumer EventSource connection present");
+        assert_eq!(consumer_conn.source, queue_id);
+        assert_eq!(consumer_conn.target, worker_id);
+    }
+
+    #[test]
+    fn connections_durable_object_is_worker_to_do_dataflow() {
+        let content = r#"
+name = "my-worker"
+
+[durable_objects]
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "ChatRoom"
+"#;
+        let arch = parse_wrangler_str(content, "fallback").unwrap();
+
+        let worker_id = LogicalId::new("my-worker");
+        let do_id = LogicalId::new("my-worker_do_chatroom");
+
+        assert_eq!(arch.connections.len(), 1);
+        let conn = &arch.connections[0];
+        assert_eq!(conn.source, worker_id);
+        assert_eq!(conn.target, do_id);
+        assert_eq!(conn.connection_type, ConnectionType::DataFlow);
+    }
+
+    #[test]
+    fn connections_no_dangling_edges_for_missing_resources() {
+        // Construct a RawWrangler directly with a queue consumer that has no
+        // corresponding producer, so the queue resource IS added by the consumer
+        // path. This test confirms edges are only created when the target resource
+        // exists in the architecture.
+        let raw = RawWrangler {
+            name: Some("w".to_string()),
+            kv_namespaces: vec![RawKvNamespace {
+                binding: "MY_KV".to_string(),
+                id: String::new(),
+            }],
+            ..RawWrangler::default()
+        };
+        let arch = build_architecture(&raw, "w");
+
+        // Worker + KV = 2 resources, 1 DataFlow connection
+        assert_eq!(arch.resources.len(), 2);
+        assert_eq!(arch.connections.len(), 1);
+        assert_eq!(arch.connections[0].connection_type, ConnectionType::DataFlow);
+        assert_eq!(arch.connections[0].source, LogicalId::new("w"));
+        assert_eq!(arch.connections[0].target, LogicalId::new("w_kv_my_kv"));
+    }
+
+    #[test]
+    fn full_fixture_has_expected_connection_count() {
+        // wrangler_full.toml: 2 KV + 1 R2 + 1 D1 + 1 Queue (producer+consumer) + 2 DO
+        // Expected connections:
+        //   2 KV DataFlow + 1 R2 DataFlow + 1 D1 DataFlow
+        //   + 1 Queue producer DataFlow + 1 Queue consumer EventSource
+        //   + 2 DO DataFlow  = 8 connections
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("wrangler_full.toml");
+        let arch = crate::parser::parse_wrangler(&path).unwrap();
+
+        assert_eq!(arch.connections.len(), 8);
+
+        let event_sources: Vec<_> = arch
+            .connections
+            .iter()
+            .filter(|c| c.connection_type == ConnectionType::EventSource)
+            .collect();
+        assert_eq!(event_sources.len(), 1, "one queue consumer EventSource");
+
+        let data_flows: Vec<_> = arch
+            .connections
+            .iter()
+            .filter(|c| c.connection_type == ConnectionType::DataFlow)
+            .collect();
+        assert_eq!(data_flows.len(), 7, "seven DataFlow edges");
     }
 }
