@@ -22,10 +22,8 @@ ignored = ["hcl-rs"]
 [dependencies]
 yevice-core = { workspace = true }
 yevice-service-api = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 hcl-rs = "0.19"
 
 [dev-dependencies]
