@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::expr::{Expr, Tier};
+use crate::topology::Topology;
 use crate::types::{ArchitectureName, LogicalId, Region, ResourceType, VariableName};
 
 /// A named sub-component of a resource's cost.
@@ -71,6 +72,10 @@ pub struct ArchitectureCost {
     pub bindings: Vec<VariableBinding>,
     /// Region.
     pub region: Region,
+    /// Architecture topology (all nodes + connections), persisted so diagram
+    /// and optimization consumers need not re-parse the source IaC.
+    #[serde(default)]
+    pub topology: Topology,
 }
 
 impl ArchitectureCost {
@@ -94,5 +99,25 @@ impl ArchitectureCost {
     /// Collects all variable bindings.
     pub fn all_bindings(&self) -> &[VariableBinding] {
         &self.bindings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn architecture_cost_without_topology_field_deserializes() {
+        // JSON that was produced before the `topology` field existed.
+        // Deserializing it must succeed and yield an empty (default) topology.
+        let json = r#"{
+            "name": "arch",
+            "resources": [],
+            "region": "ap-northeast-1"
+        }"#;
+
+        let cost: ArchitectureCost = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cost.name, ArchitectureName::new("arch"));
+        assert!(cost.topology.is_empty());
     }
 }

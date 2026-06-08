@@ -105,7 +105,7 @@ impl Resource {
 // ---- Connection (graph edges) ----
 
 /// A connection between two resources in the architecture.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
     pub source: LogicalId,
     pub target: LogicalId,
@@ -119,7 +119,7 @@ pub struct Connection {
     pub source_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConnectionType {
     /// Event source mapping (SQS/Kinesis/DDB Stream → Lambda).
     EventSource,
@@ -155,6 +155,26 @@ impl Architecture {
         self.resources
             .iter()
             .any(|resource| resource.provider() == provider)
+    }
+
+    /// Build the output-agnostic topology view: every resource as a node
+    /// plus all connections. Includes non-costed / `other` resources.
+    pub fn topology(&self) -> crate::topology::Topology {
+        crate::topology::Topology {
+            nodes: self
+                .resources
+                .iter()
+                .map(|r| crate::topology::TopologyNode {
+                    logical_id: r.logical_id.clone(),
+                    resource_type: r.resource_type.clone(),
+                    provider: r.shell.provider,
+                    service_id: r.shell.service_id.clone(),
+                    label: None,
+                    group: None,
+                })
+                .collect(),
+            connections: self.connections.clone(),
+        }
     }
 }
 

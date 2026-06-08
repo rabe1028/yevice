@@ -7,4 +7,7 @@ pub mod expr;
 pub mod expr_parser;
 pub mod resource;
 pub mod schema;
+pub mod topology;
 pub mod types;
+
+pub use topology::{Topology, TopologyNode};

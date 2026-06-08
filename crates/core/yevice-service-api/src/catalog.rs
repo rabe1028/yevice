@@ -86,6 +86,7 @@ impl ServiceCatalog {
             resources: resource_costs,
             bindings,
             region: arch.region.clone(),
+            topology: arch.topology(),
         })
     }
 
