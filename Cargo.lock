@@ -1165,10 +1165,8 @@ name = "yevice-tf"
 version = "0.1.0"
 dependencies = [
  "hcl-rs",
- "serde",
  "serde_json",
  "thiserror",
- "tracing",
  "yevice-core",
  "yevice-pricing",
  "yevice-service-api",

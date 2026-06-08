@@ -614,7 +614,7 @@ impl PricingRegistry {
     }
 
     /// `QuickSight` pricing for ap-northeast-1 (Japan).
-    /// Reference: https://aws.amazon.com/jp/quicksight/pricing/
+    /// Reference: <https://aws.amazon.com/jp/quicksight/pricing/>
     pub fn quicksight_price(&self) -> QuickSightPrice {
         QuickSightPrice {
             // Creator: $24/user/month (monthly), $18/user/month (annual)

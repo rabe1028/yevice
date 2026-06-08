@@ -7,7 +7,7 @@ simulate load profiles against that model.
 
 ## Requirements
 
-- Rust **1.85+** (workspace uses edition 2024). Install via
+- Rust **1.88+** (workspace uses edition 2024). Install via
   [rustup](https://rustup.rs/) — `stable` is sufficient.
 - A C linker (`cc` / `clang`) available on `PATH` — required by Cargo for the
   final link step.

@@ -58,7 +58,7 @@ authors = ["Ryo Abe"]
 repository = "https://github.com/rabe1028/yevice"
 homepage = "https://github.com/rabe1028/yevice"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 yevice-core = { path = "crates/core/yevice-core", version = "0.1.0" }

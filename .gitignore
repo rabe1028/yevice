@@ -22,3 +22,6 @@
 .envrc
 *.env
 .mise.local.toml
+
+# cargo-cyclonedx SBOM output
+**/yevice-sbom.json
