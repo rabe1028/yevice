@@ -17,3 +17,9 @@ pub use optimize::{
     DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
 };
 pub use topology::{Topology, TopologyNode};
+
+/// Approximate number of hours in a calendar month (365 * 24 / 12).
+///
+/// Used by service implementations that price resources in hourly rates
+/// and need to convert to a monthly cost.
+pub const HOURS_PER_MONTH: f64 = 730.0;

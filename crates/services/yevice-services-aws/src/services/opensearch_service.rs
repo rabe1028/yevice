@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
@@ -16,8 +17,6 @@ pub struct OpenSearchServiceSpec {
 }
 
 pub struct OpenSearchServiceService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for OpenSearchServiceService {
     type Spec = OpenSearchServiceSpec;
@@ -102,5 +101,3 @@ impl Service for OpenSearchServiceService {
         })
     }
 }
-
-const _: f64 = HOURS_PER_MONTH;

@@ -2,14 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, Expr, ResourceCost, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
 use yevice_pricing::{PriceCatalog, Sku};
 use yevice_service_api::{CostError, service::Service};
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcpCloudSqlSpec {

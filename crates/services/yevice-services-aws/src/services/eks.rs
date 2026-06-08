@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost},
     expr::Expr,
     resource::Provider,
@@ -12,8 +13,6 @@ use yevice_service_api::{Service, error::CostError};
 pub struct EksClusterSpec {}
 
 pub struct EksService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for EksService {
     type Spec = EksClusterSpec;
@@ -49,5 +48,3 @@ impl Service for EksService {
         })
     }
 }
-
-const _: f64 = HOURS_PER_MONTH;

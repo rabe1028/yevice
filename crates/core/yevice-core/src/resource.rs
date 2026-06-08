@@ -51,15 +51,36 @@ pub struct ResourceShell {
 impl ResourceShell {
     /// Create a new shell by serializing a typed spec.
     ///
-    /// Panics if `spec` cannot be serialized to JSON (which should never happen
-    /// for serde-annotated types).
+    /// # Panics
+    ///
+    /// Panics if `spec` cannot be serialized to a JSON value.  This should
+    /// never happen for types that derive [`serde::Serialize`] without custom
+    /// error paths.  For code that needs to handle serialization failures
+    /// gracefully, prefer [`ResourceShell::try_new`].
     pub fn new<T: Serialize>(service_id: impl Into<String>, provider: Provider, spec: &T) -> Self {
-        Self {
+        Self::try_new(service_id, provider, spec).expect("spec serialization failed")
+    }
+
+    /// Fallible variant of [`ResourceShell::new`].
+    ///
+    /// Returns `Err` if `spec` cannot be serialized to a JSON value instead of
+    /// panicking.  Prefer this constructor in new code where the caller can
+    /// propagate errors.
+    ///
+    /// `new` is the panic version intended for contexts where `spec` is
+    /// guaranteed to be serde-serialisable (e.g. a statically-known type).
+    /// `try_new` is the fallible version recommended for new code.
+    pub fn try_new<T: Serialize>(
+        service_id: impl Into<String>,
+        provider: Provider,
+        spec: &T,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
             service_id: service_id.into(),
             provider,
-            spec_data: serde_json::to_value(spec).expect("spec serialization failed"),
+            spec_data: serde_json::to_value(spec)?,
             metadata: HashMap::new(),
-        }
+        })
     }
 
     /// Create a shell for an unsupported / no-cost resource.
@@ -273,5 +294,31 @@ mod tests {
             shell.metadata.get("billing_mode").map(String::as_str),
             Some("on_demand")
         );
+    }
+
+    #[test]
+    fn try_new_returns_ok_and_matches_new() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct MySpec {
+            vcpu: f64,
+            memory_mb: f64,
+        }
+
+        let spec = MySpec {
+            vcpu: 2.0,
+            memory_mb: 512.0,
+        };
+
+        let via_try_new =
+            ResourceShell::try_new("aws.ec2", Provider::Aws, &spec).expect("try_new failed");
+        let via_new = ResourceShell::new("aws.ec2", Provider::Aws, &spec);
+
+        // Both shells should expose the same service_id, provider, and decoded spec.
+        assert_eq!(via_try_new.service_id, via_new.service_id);
+        assert_eq!(via_try_new.provider, via_new.provider);
+
+        let decoded_try: MySpec = via_try_new.decode().expect("decode try_new");
+        let decoded_new: MySpec = via_new.decode().expect("decode new");
+        assert_eq!(decoded_try, decoded_new);
     }
 }

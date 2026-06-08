@@ -1,6 +1,7 @@
 //! AWS service plugin implementations for yevice.
 
 pub mod cfn;
+pub mod common;
 pub mod connection_rules;
 pub mod plugin;
 pub mod pricing_adapter;

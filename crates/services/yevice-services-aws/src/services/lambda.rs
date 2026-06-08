@@ -9,6 +9,7 @@ use yevice_core::{
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
 
+use crate::common::egress_cost_expr;
 use crate::quotas::{DEFAULT_LAMBDA_CONCURRENT_EXECUTIONS, LAMBDA_CONCURRENT_EXECUTIONS};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,25 +35,6 @@ const SKU_FREE_REQUESTS: Sku = Sku::new("aws.lambda.free_tier_requests");
 const SKU_FREE_GB_SEC: Sku = Sku::new("aws.lambda.free_tier_gb_seconds");
 
 pub struct LambdaService;
-
-pub fn egress_cost_expr(
-    id: &LogicalId,
-    pricing: &dyn PriceCatalog,
-) -> Result<(Expr, VariableInfo), CostError> {
-    let egress_record = pricing.lookup(&Sku::new("aws.data_transfer.egress_tiers"))?;
-    let egress_tiers = egress_record.as_tiered().map_err(CostError::Pricing)?;
-    let expr = Expr::tiered(
-        egress_tiers.to_vec(),
-        Expr::variable(id.var("data_transfer_out_gb")),
-    );
-    let info = VariableInfo::new(
-        id,
-        "data_transfer_out_gb",
-        "Data transfer out per month",
-        "GB",
-    );
-    Ok((expr, info))
-}
 
 impl Service for LambdaService {
     type Spec = LambdaSpec;

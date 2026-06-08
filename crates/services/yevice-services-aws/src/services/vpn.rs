@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost},
     expr::Expr,
     resource::Provider,
@@ -7,8 +8,6 @@ use yevice_core::{
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 /// Site-to-Site VPN connection (`AWS::EC2::VPNConnection`).
 ///

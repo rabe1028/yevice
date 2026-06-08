@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     capacity::{CapacityModel, Constraint, QuotaType, Quotas, Severity},
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::{Expr, Tier},
@@ -31,8 +32,6 @@ pub struct DynamoDbSpec {
 }
 
 pub struct DynamoDbService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for DynamoDbService {
     type Spec = DynamoDbSpec;

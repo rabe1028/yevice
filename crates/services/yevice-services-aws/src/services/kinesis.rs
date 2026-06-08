@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     capacity::{CapacityModel, Constraint, QuotaType, Quotas, Severity},
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
@@ -37,8 +38,6 @@ impl Default for KinesisSpec {
 }
 
 pub struct KinesisService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for KinesisService {
     type Spec = KinesisSpec;
