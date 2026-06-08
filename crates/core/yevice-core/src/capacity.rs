@@ -69,10 +69,21 @@ pub struct Violation {
     pub message: String,
 }
 
+/// A constraint that was skipped because its required expression could not be
+/// evaluated (e.g. a variable was not provided in the current params).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedConstraint {
+    pub resource: LogicalId,
+    pub dimension: String,
+    pub reason: String,
+}
+
 /// Result of capacity validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
     pub violations: Vec<Violation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedConstraint>,
 }
 
 impl ValidationResult {
@@ -95,12 +106,21 @@ pub fn validate_capacity(
     params: &crate::evaluate::Params,
 ) -> ValidationResult {
     let mut violations = Vec::new();
+    let mut skipped = Vec::new();
 
     for model in models {
         for constraint in &model.constraints {
             // Skip when a required variable was not provided.
-            let Ok(required) = crate::evaluate::evaluate(&constraint.required, params) else {
-                continue;
+            let required = match crate::evaluate::evaluate(&constraint.required, params) {
+                Ok(v) => v,
+                Err(e) => {
+                    skipped.push(SkippedConstraint {
+                        resource: model.logical_id.clone(),
+                        dimension: constraint.dimension.clone(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
             };
 
             if required > constraint.limit {
@@ -129,7 +149,7 @@ pub fn validate_capacity(
         Severity::Info => 2,
     });
 
-    ValidationResult { violations }
+    ValidationResult { violations, skipped }
 }
 
 // ---- Provider-agnostic Quotas ----

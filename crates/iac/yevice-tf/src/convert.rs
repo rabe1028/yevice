@@ -26,10 +26,20 @@ pub fn build_architecture(
         .map(|resource| {
             let logical_id = format!("{}_{}", resource.resource_type, resource.name);
             let raw = tf_resource_to_raw(resource, &logical_id);
-            let shell = adapters
-                .lookup(&resource.resource_type)
-                .and_then(|adapter| adapter.convert(&raw).ok())
-                .unwrap_or_else(|| ResourceShell::other(&resource.resource_type));
+            let shell = match adapters.lookup(&resource.resource_type) {
+                None => ResourceShell::other(&resource.resource_type),
+                Some(adapter) => match adapter.convert(&raw) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            resource_type = %resource.resource_type,
+                            error = %e,
+                            "adapter failed to convert; treating as unsupported"
+                        );
+                        ResourceShell::other(&resource.resource_type)
+                    }
+                },
+            };
             Resource {
                 logical_id: LogicalId::new(&logical_id),
                 resource_type: ResourceType::new(&resource.resource_type),
@@ -85,6 +95,9 @@ fn tf_value_to_json(value: &TfValue) -> Option<JsonValue> {
         TfValue::String(s) => Some(JsonValue::String(s.clone())),
         TfValue::Number(n) => serde_json::Number::from_f64(*n).map(JsonValue::Number),
         TfValue::Bool(b) => Some(JsonValue::Bool(*b)),
-        TfValue::VarRef(_) | TfValue::LocalRef(_) | TfValue::Unknown => None,
+        TfValue::VarRef(_) | TfValue::LocalRef(_) | TfValue::Unknown => {
+            tracing::debug!(value = ?value, "unresolved TfValue reference dropped during conversion");
+            None
+        }
     }
 }

@@ -61,10 +61,27 @@ pub struct BulkPriceDimension {
 
 impl BulkPriceDimension {
     pub fn usd_price(&self) -> f64 {
-        self.price_per_unit
-            .get("USD")
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0)
+        match self.price_per_unit.get("USD") {
+            None => {
+                tracing::warn!(
+                    description = %self.description,
+                    "no USD price for pricing dimension; defaulting to 0.0"
+                );
+                0.0
+            }
+            Some(s) => match s.parse::<f64>() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        description = %self.description,
+                        raw = %s,
+                        error = %e,
+                        "failed to parse USD price; defaulting to 0.0"
+                    );
+                    0.0
+                }
+            },
+        }
     }
 }
 
@@ -100,7 +117,15 @@ pub fn parse_bulk_pricing(json_data: &[u8]) -> Result<Vec<PricingEntry>, Pricing
         if let Some(offers) = term_map {
             for offer in offers.values() {
                 for dim in offer.price_dimensions.values() {
-                    let begin: f64 = dim.begin_range.parse().unwrap_or(0.0);
+                    let begin: f64 = dim.begin_range.parse().unwrap_or_else(|e| {
+                        tracing::warn!(
+                            description = %dim.description,
+                            raw = %dim.begin_range,
+                            error = %e,
+                            "failed to parse beginRange; defaulting to 0.0"
+                        );
+                        0.0
+                    });
                     let end: Option<f64> = if dim.end_range == "Inf" {
                         None
                     } else {

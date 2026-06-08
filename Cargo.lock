@@ -1077,6 +1077,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "thiserror",
+ "tracing",
  "yevice-core",
  "yevice-service-api",
 ]
@@ -1167,6 +1168,7 @@ dependencies = [
  "hcl-rs",
  "serde_json",
  "thiserror",
+ "tracing",
  "yevice-core",
  "yevice-pricing",
  "yevice-service-api",

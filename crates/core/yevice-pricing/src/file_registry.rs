@@ -288,6 +288,13 @@ fn load_service(data_dir: &Path, name: &str) -> Option<Vec<PricingEntry>> {
                 None
             }
         },
-        Err(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(service = name, "pricing file not found; skipping");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(service = name, error = %e, "failed to read pricing file");
+            None
+        }
     }
 }

@@ -25,10 +25,20 @@ pub fn build_architecture(
             let properties = yaml_to_json(&cfn.properties);
             let raw =
                 RawCfnResource::new(logical_id.as_str(), cfn.resource_type.as_str(), properties);
-            let shell = adapters
-                .lookup(&cfn.resource_type)
-                .and_then(|adapter| adapter.convert(&raw).ok())
-                .unwrap_or_else(|| ResourceShell::other(&cfn.resource_type));
+            let shell = match adapters.lookup(&cfn.resource_type) {
+                None => ResourceShell::other(&cfn.resource_type),
+                Some(adapter) => match adapter.convert(&raw) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            resource_type = %cfn.resource_type,
+                            error = %e,
+                            "adapter failed to convert; treating as unsupported"
+                        );
+                        ResourceShell::other(&cfn.resource_type)
+                    }
+                },
+            };
             Resource {
                 logical_id: LogicalId::new(logical_id),
                 resource_type: ResourceType::new(&cfn.resource_type),

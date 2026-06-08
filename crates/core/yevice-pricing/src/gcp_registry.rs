@@ -93,11 +93,14 @@ fn regional_sql(region: &str) -> RegionalSqlPrice {
             ram_gb_hour: 0.0103,
             ssd_gb_month: 0.221,
         },
-        _ => RegionalSqlPrice {
-            vcpu_hour: 0.0559,
-            ram_gb_hour: 0.0095,
-            ssd_gb_month: 0.221,
-        },
+        _ => {
+            tracing::warn!(region = %region, "unknown GCP region; falling back to default pricing");
+            RegionalSqlPrice {
+                vcpu_hour: 0.0559,
+                ram_gb_hour: 0.0095,
+                ssd_gb_month: 0.221,
+            }
+        }
     }
 }
 
@@ -149,13 +152,16 @@ fn regional_storage(region: &str) -> RegionalStoragePrice {
             coldline_gb_month: 0.007,
             archive_gb_month: 0.0028,
         },
-        _ => RegionalStoragePrice {
-            standard_gb_month: 0.023,
-            bigquery_active_gb_month: 0.023,
-            nearline_gb_month: 0.016,
-            coldline_gb_month: 0.006,
-            archive_gb_month: 0.0025,
-        },
+        _ => {
+            tracing::warn!(region = %region, "unknown GCP region; falling back to default pricing");
+            RegionalStoragePrice {
+                standard_gb_month: 0.023,
+                bigquery_active_gb_month: 0.023,
+                nearline_gb_month: 0.016,
+                coldline_gb_month: 0.006,
+                archive_gb_month: 0.0025,
+            }
+        }
     }
 }
 

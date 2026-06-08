@@ -92,7 +92,18 @@ impl<S: Service + 'static> AnyService for ServiceAdapter<S> {
         shell: &ResourceShell,
         quotas: &Quotas,
     ) -> Option<CapacityModel> {
-        let spec: S::Spec = shell.decode().ok()?;
+        let spec: S::Spec = match shell.decode() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    service_id = self.0.id(),
+                    resource = %id,
+                    error = %e,
+                    "failed to decode spec for capacity; skipping"
+                );
+                return None;
+            }
+        };
         self.0.build_capacity(id, &spec, quotas)
     }
 }

@@ -501,7 +501,17 @@ pub fn validate(
         let json = serde_json::to_string_pretty(&result).context("failed to serialize")?;
         println!("{json}");
     } else if result.violations.is_empty() {
-        println!("All capacity constraints satisfied.");
+        if result.skipped.is_empty() {
+            println!("All capacity constraints satisfied.");
+        } else {
+            println!(
+                "No constraint violations found, but {} constraint(s) could not be evaluated (missing variables):",
+                result.skipped.len()
+            );
+            for s in &result.skipped {
+                println!("  - {} / {}: {}", s.resource, s.dimension, s.reason);
+            }
+        }
     } else {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
@@ -544,6 +554,16 @@ pub fn validate(
             .filter(|v| v.severity == Severity::Warning)
             .count();
         println!("\n{errors} error(s), {warnings} warning(s)");
+
+        if !result.skipped.is_empty() {
+            println!(
+                "Note: {} constraint(s) were not evaluated (missing variables):",
+                result.skipped.len()
+            );
+            for s in &result.skipped {
+                println!("  - {} / {}: {}", s.resource, s.dimension, s.reason);
+            }
+        }
     }
 
     if result.has_errors() {
@@ -1086,14 +1106,19 @@ fn load_simulation_profile(path: &str) -> Result<SimulationProfile> {
         match v {
             serde_yaml_ng::Value::Mapping(sub_map) => {
                 for (sub_k, sub_v) in sub_map {
-                    if let Some(sub_key) = sub_k.as_str() {
-                        let val = extract_f64(&sub_v);
-                        base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
-                    }
+                    let Some(sub_key) = sub_k.as_str() else {
+                        tracing::warn!(key = ?sub_k, "non-string key in profile base_params mapping; skipping");
+                        continue;
+                    };
+                    let val = extract_f64(&sub_v)
+                        .with_context(|| format!("profile base_param '{k}_{sub_key}': invalid value"))?;
+                    base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
                 }
             }
             _ => {
-                base_params.insert(VariableName::new(k), extract_f64(&v));
+                let val = extract_f64(&v)
+                    .with_context(|| format!("profile base_param '{k}': invalid value"))?;
+                base_params.insert(VariableName::new(k), val);
             }
         }
     }
@@ -1238,16 +1263,19 @@ fn load_params(path: &str) -> Result<Params> {
             serde_yaml_ng::Value::Mapping(sub_map) => {
                 for (sub_k, sub_v) in sub_map {
                     let Some(sub_key) = sub_k.as_str() else {
+                        tracing::warn!(key = ?sub_k, "non-string key in params mapping; skipping");
                         continue;
                     };
-                    let val = extract_f64(&sub_v);
+                    let val = extract_f64(&sub_v)
+                        .with_context(|| format!("param '{k}_{sub_key}': invalid value"))?;
                     let full_name = format!("{k}_{sub_key}");
                     params.insert(VariableName::new(full_name), val);
                 }
             }
             // Flat: key is the full variable name
             _ => {
-                let val = extract_f64(&v);
+                let val = extract_f64(&v)
+                    .with_context(|| format!("param '{k}': invalid value"))?;
                 params.insert(VariableName::new(k), val);
             }
         }
@@ -1256,11 +1284,15 @@ fn load_params(path: &str) -> Result<Params> {
     Ok(params)
 }
 
-fn extract_f64(v: &serde_yaml_ng::Value) -> f64 {
+fn extract_f64(v: &serde_yaml_ng::Value) -> anyhow::Result<f64> {
     match v {
-        serde_yaml_ng::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        serde_yaml_ng::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
-        _ => 0.0,
+        serde_yaml_ng::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("cannot interpret number {v:?} as f64")),
+        serde_yaml_ng::Value::String(s) => s
+            .parse::<f64>()
+            .with_context(|| format!("cannot interpret string {v:?} as f64")),
+        _ => anyhow::bail!("cannot interpret value {v:?} as a number"),
     }
 }
 

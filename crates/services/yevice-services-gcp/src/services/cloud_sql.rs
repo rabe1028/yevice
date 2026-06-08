@@ -135,6 +135,9 @@ pub(crate) fn parse_sql_tier(tier: &str) -> (f64, f64) {
                 (1.0, 3.75)
             }
         }
-        _ => (1.0, 3.75),
+        _ => {
+            tracing::warn!(tier = %tier, "unknown Cloud SQL tier; using default vCPU/RAM");
+            (1.0, 3.75)
+        }
     }
 }
