@@ -1,6 +1,8 @@
 //! Adapts `GcpPricing` from `yevice-pricing` to the generic `PriceCatalog` trait.
 
+use yevice_core::resource::Provider;
 use yevice_pricing::{GcpPricing, PriceCatalog, PriceRecord, Sku, error::PricingError};
+use yevice_service_api::PriceCatalogResolver;
 
 /// Wraps `GcpPricing` and exposes it as a `PriceCatalog`.
 pub struct GcpPricingCatalog(pub GcpPricing);
@@ -54,5 +56,11 @@ impl PriceCatalog for GcpPricingCatalog {
                 region: self.0.region.clone(),
             }),
         }
+    }
+}
+
+impl PriceCatalogResolver for GcpPricingCatalog {
+    fn resolve(&self, provider: Provider) -> Option<&dyn PriceCatalog> {
+        (provider == Provider::Gcp).then_some(self as &dyn PriceCatalog)
     }
 }

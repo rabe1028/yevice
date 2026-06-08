@@ -7,10 +7,10 @@ use yevice_core::{
     resource::Architecture,
     types::ArchitectureName,
 };
-use yevice_pricing::catalog::PriceCatalog;
 
 use crate::{
     error::CostError,
+    pricing_resolver::PriceCatalogResolver,
     service::{AnyService, Service, ServiceAdapter},
 };
 
@@ -70,10 +70,14 @@ impl ServiceCatalog {
     ///
     /// Resources whose service_id has no registered service are silently
     /// skipped (or cause an error if `strict` is `true`).
+    ///
+    /// The `pricing` resolver is called per-resource with the resource's
+    /// provider. If no catalog is registered for that provider the resource is
+    /// skipped (or an error is returned when `strict` is `true`).
     pub fn build_cost_model(
         &self,
         arch: &Architecture,
-        pricing: &dyn PriceCatalog,
+        pricing: &dyn PriceCatalogResolver,
         strict: bool,
     ) -> Result<ArchitectureCost, CostError> {
         let mut resource_costs = Vec::new();
@@ -91,11 +95,23 @@ impl ServiceCatalog {
                 continue;
             };
 
+            let Some(catalog) = pricing.resolve(resource.shell.provider) else {
+                if strict {
+                    return Err(CostError::NoPricingCatalog(resource.shell.provider));
+                }
+                tracing::warn!(
+                    resource = %resource.logical_id,
+                    provider = ?resource.shell.provider,
+                    "no pricing catalog for provider; skipping"
+                );
+                continue;
+            };
+
             match service.build_cost(
                 &resource.logical_id,
                 &resource.resource_type,
                 &resource.shell,
-                pricing,
+                catalog,
             ) {
                 Ok(cost) => resource_costs.push(cost),
                 Err(e) => {

@@ -10,11 +10,11 @@ use yevice_core::bindings::{BindingsFile, derive_bindings, to_variable_bindings}
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
-use yevice_core::resource::Architecture;
+use yevice_core::resource::{Architecture, Provider};
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::types::VariableName;
-use yevice_pricing::{PriceCatalog, gcp_hardcoded_pricing};
-use yevice_service_api::{CfnAdapterRegistry, ServiceCatalog, TfAdapterRegistry};
+use yevice_pricing::{PriceCatalog, PriceRecord, Sku, error::PricingError, gcp_hardcoded_pricing};
+use yevice_service_api::{CfnAdapterRegistry, MultiProviderCatalog, PriceCatalogResolver, ServiceCatalog, TfAdapterRegistry};
 use yevice_services_aws::AwsPricingCatalog;
 use yevice_services_gcp::GcpPricingCatalog;
 
@@ -37,20 +37,29 @@ enum TfProvider {
 
 struct ParsedInput {
     architecture: Architecture,
-    tf_provider: Option<TfProvider>,
 }
 
-enum PricingCatalogSelection {
-    Aws(AwsPricingCatalog),
-    Gcp(GcpPricingCatalog),
+/// A no-op pricing catalog for providers whose services compute costs inline
+/// (e.g. Cloudflare).  The `lookup` method is never called for these services,
+/// so it simply returns a `NotFound` error as a safety net.
+struct NoopCatalog;
+
+impl PriceCatalog for NoopCatalog {
+    fn region(&self) -> &'static str {
+        "global"
+    }
+
+    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+        Err(PricingError::NotFound {
+            service: sku.as_str().to_string(),
+            region: "global".to_string(),
+        })
+    }
 }
 
-impl PricingCatalogSelection {
-    fn as_catalog(&self) -> &dyn PriceCatalog {
-        match self {
-            Self::Aws(catalog) => catalog,
-            Self::Gcp(catalog) => catalog,
-        }
+impl PriceCatalogResolver for NoopCatalog {
+    fn resolve(&self, _provider: Provider) -> Option<&dyn PriceCatalog> {
+        Some(self as &dyn PriceCatalog)
     }
 }
 
@@ -119,9 +128,9 @@ pub fn generate(
         &cfn_adapters,
         &tf_adapters,
     )?;
-    let pricing = select_pricing_catalog(format, parsed_input.tf_provider, region, list_price)?;
+    let pricing = build_pricing_resolver(&parsed_input.architecture, region, list_price);
     let mut cost_model = catalog
-        .build_cost_model(&parsed_input.architecture, pricing.as_catalog(), strict)
+        .build_cost_model(&parsed_input.architecture, &pricing, strict)
         .context("failed to build cost model")?;
 
     if format == InputFormat::Cfn
@@ -690,22 +699,15 @@ fn build_architecture_from_input(
                 &resolved_template,
                 cfn_adapters,
             );
-            Ok(ParsedInput {
-                architecture,
-                tf_provider: None,
-            })
+            Ok(ParsedInput { architecture })
         }
         InputFormat::Tf => {
             let resolved = resolve_tf_input(Path::new(template_path))?;
             let tf_provider = detect_tf_provider(&resolved);
-            match tf_provider {
-                TfProvider::Mixed => {
-                    bail!("mixed Terraform providers are not supported in a single input")
-                }
-                TfProvider::Unknown => bail!(
+            if tf_provider == TfProvider::Unknown {
+                bail!(
                     "unable to detect a supported Terraform provider from {template_path}. Expected resources with aws_ or google_ prefixes."
-                ),
-                TfProvider::Aws | TfProvider::Gcp => {}
+                );
             }
 
             let architecture = yevice_tf::build_architecture(
@@ -714,10 +716,7 @@ fn build_architecture_from_input(
                 &resolved,
                 tf_adapters,
             );
-            Ok(ParsedInput {
-                architecture,
-                tf_provider: Some(tf_provider),
-            })
+            Ok(ParsedInput { architecture })
         }
         InputFormat::Wrangler => {
             let wrangler_path = resolve_wrangler_input_path(Path::new(template_path))?;
@@ -735,10 +734,7 @@ fn build_architecture_from_input(
                 architecture.name = name_override.to_string();
             }
 
-            Ok(ParsedInput {
-                architecture,
-                tf_provider: None,
-            })
+            Ok(ParsedInput { architecture })
         }
     }
 }
@@ -836,33 +832,38 @@ fn detect_tf_provider(resolved: &yevice_tf::ResolvedConfig) -> TfProvider {
     }
 }
 
-fn select_pricing_catalog(
-    format: InputFormat,
-    tf_provider: Option<TfProvider>,
+/// Build a per-provider pricing resolver from the providers present in `arch`.
+///
+/// - AWS resources   → [`AwsPricingCatalog::auto`] (respects `list_price`)
+/// - GCP resources   → [`GcpPricingCatalog`] with hardcoded prices
+/// - Cloudflare / Other resources → [`NoopCatalog`] (services price inline)
+fn build_pricing_resolver(
+    arch: &Architecture,
     region: &str,
     list_price: bool,
-) -> Result<PricingCatalogSelection> {
-    // Note: `list_price` only affects AWS pricing. GCP free tiers are encoded
-    // as code constants and are not currently toggleable.
-    match format {
-        InputFormat::Cfn | InputFormat::Wrangler => Ok(PricingCatalogSelection::Aws(
-            AwsPricingCatalog::auto(region).with_list_price(list_price),
-        )),
-        InputFormat::Tf => match tf_provider.context("Terraform provider was not detected")? {
-            TfProvider::Aws => Ok(PricingCatalogSelection::Aws(
-                AwsPricingCatalog::auto(region).with_list_price(list_price),
-            )),
-            TfProvider::Gcp => Ok(PricingCatalogSelection::Gcp(GcpPricingCatalog(
-                gcp_hardcoded_pricing(region),
-            ))),
-            TfProvider::Mixed => {
-                bail!("mixed Terraform providers are not supported in a single input")
-            }
-            TfProvider::Unknown => bail!(
-                "unable to select pricing for Terraform input without an aws_ or google_ resource"
-            ),
-        },
+) -> MultiProviderCatalog {
+    let mut resolver = MultiProviderCatalog::new();
+
+    if arch.has_provider(Provider::Aws) {
+        resolver.insert(
+            Provider::Aws,
+            Box::new(AwsPricingCatalog::auto(region).with_list_price(list_price)),
+        );
     }
+    if arch.has_provider(Provider::Gcp) {
+        resolver.insert(
+            Provider::Gcp,
+            Box::new(GcpPricingCatalog(gcp_hardcoded_pricing(region))),
+        );
+    }
+    if arch.has_provider(Provider::Cloudflare) {
+        resolver.insert(Provider::Cloudflare, Box::new(NoopCatalog));
+    }
+    if arch.has_provider(Provider::Other) {
+        resolver.insert(Provider::Other, Box::new(NoopCatalog));
+    }
+
+    resolver
 }
 
 fn load_quotas(path: &str) -> Result<Quotas> {

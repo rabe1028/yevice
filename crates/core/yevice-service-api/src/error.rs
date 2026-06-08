@@ -1,4 +1,5 @@
 use thiserror::Error;
+use yevice_core::resource::Provider;
 use yevice_pricing::error::PricingError;
 
 #[derive(Debug, Error)]
@@ -14,4 +15,7 @@ pub enum CostError {
 
     #[error("unsupported resource: '{0}'")]
     UnsupportedResource(String),
+
+    #[error("no pricing catalog registered for provider {0:?}")]
+    NoPricingCatalog(Provider),
 }

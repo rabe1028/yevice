@@ -5,9 +5,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use yevice_core::resource::{Architecture, Resource};
+use yevice_core::resource::{Architecture, Provider, Resource};
 use yevice_pricing::gcp_hardcoded_pricing;
-use yevice_service_api::{CfnAdapterRegistry, ServiceCatalog, TfAdapterRegistry};
+use yevice_service_api::{CfnAdapterRegistry, MultiProviderCatalog, ServiceCatalog, TfAdapterRegistry};
 use yevice_services_aws::{
     AwsPricingCatalog,
     services::{
@@ -301,5 +301,65 @@ fn gcp_cost_model_builds_from_tf_fixture() {
         !cost.resources.is_empty(),
         "expected at least one GCP cost resource"
     );
+    let _json = serde_json::to_string(&cost).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-provider test — AWS + GCP resources in one architecture
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mixed_provider_cost_model_prices_both_aws_and_gcp_resources() {
+    // Combine both fixture files: simple_lambda.tf (AWS) + gcp_simple.tf (GCP)
+    let dir = FixtureDir::new("mixed-cost", &["simple_lambda.tf", "gcp_simple.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (catalog, tf) = aws_and_gcp_registries();
+    // Use "ap-northeast-1" as the region; the GCP fixture is region-agnostic
+    // for cost model purposes since we override it with a hardcoded catalog.
+    let arch = convert::build_architecture("mixed-test", "ap-northeast-1", &resolved, &tf);
+
+    assert!(arch.has_provider(Provider::Aws), "expected AWS resources");
+    assert!(arch.has_provider(Provider::Gcp), "expected GCP resources");
+
+    let pricing = MultiProviderCatalog::new()
+        .with(
+            Provider::Aws,
+            Box::new(AwsPricingCatalog::new("ap-northeast-1")),
+        )
+        .with(
+            Provider::Gcp,
+            Box::new(GcpPricingCatalog(gcp_hardcoded_pricing("asia-northeast1"))),
+        );
+
+    let cost = catalog
+        .build_cost_model(&arch, &pricing, true)
+        .expect("mixed-provider cost model should succeed");
+
+    let aws_resources: Vec<_> = cost
+        .resources
+        .iter()
+        .filter(|r| r.label.as_str().contains("lambda") || r.label.as_str().contains("Lambda"))
+        .collect();
+    let gcp_resources: Vec<_> = cost
+        .resources
+        .iter()
+        .filter(|r| {
+            r.label.as_str().contains("Cloud")
+                || r.label.as_str().contains("BigQuery")
+                || r.label.as_str().contains("Pub/Sub")
+        })
+        .collect();
+
+    assert!(
+        !aws_resources.is_empty(),
+        "expected at least one AWS resource cost"
+    );
+    assert!(
+        !gcp_resources.is_empty(),
+        "expected at least one GCP resource cost"
+    );
+
+    // Serialisation round-trip must succeed
     let _json = serde_json::to_string(&cost).unwrap();
 }

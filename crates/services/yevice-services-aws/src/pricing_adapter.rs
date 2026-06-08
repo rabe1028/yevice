@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use yevice_core::resource::Provider;
 use yevice_pricing::{
     catalog::{PriceCatalog, PriceRecord, Sku},
     error::PricingError,
@@ -16,6 +17,7 @@ use yevice_pricing::{
     provider::PricingProvider,
     registry::PricingRegistry,
 };
+use yevice_service_api::PriceCatalogResolver;
 
 pub struct AwsPricingCatalog {
     /// Always populated; used as the fallback or as the sole source.
@@ -725,5 +727,11 @@ impl PriceCatalog for AwsPricingCatalog {
             }
             (_, record) => Ok(record),
         }
+    }
+}
+
+impl PriceCatalogResolver for AwsPricingCatalog {
+    fn resolve(&self, provider: Provider) -> Option<&dyn PriceCatalog> {
+        (provider == Provider::Aws).then_some(self as &dyn PriceCatalog)
     }
 }
