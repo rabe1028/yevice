@@ -1,0 +1,326 @@
+//! Introspection layer for the `Expr` AST.
+//!
+//! Provides methods to extract variable sets and affine (linear) forms from a
+//! cost expression. This is the foundation for future LP/MILP solvers that need
+//! to query the structure of an expression without evaluating it.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::expr::Expr;
+use crate::types::VariableName;
+
+/// Affine form of an expression: `sum(coeff_i * var_i) + constant`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearForm {
+    pub coefficients: BTreeMap<VariableName, f64>,
+    pub constant: f64,
+}
+
+impl LinearForm {
+    /// Scale every coefficient and the constant term by `factor`.
+    fn scale(mut self, factor: f64) -> Self {
+        for v in self.coefficients.values_mut() {
+            *v *= factor;
+        }
+        self.constant *= factor;
+        self
+    }
+
+    /// Add another `LinearForm` into `self` (merge coefficients and constants).
+    fn add_assign(&mut self, other: Self) {
+        for (var, coeff) in other.coefficients {
+            *self.coefficients.entry(var).or_insert(0.0) += coeff;
+        }
+        self.constant += other.constant;
+    }
+}
+
+impl Expr {
+    /// All distinct variable names referenced anywhere in the expression.
+    pub fn variables(&self) -> BTreeSet<VariableName> {
+        let mut set = BTreeSet::new();
+        collect_variables(self, &mut set);
+        set
+    }
+
+    /// True iff the expression is affine in its variables (LP-expressible
+    /// without auxiliary variables). Equivalent to `as_linear().is_some()`.
+    pub fn is_linear(&self) -> bool {
+        self.as_linear().is_some()
+    }
+
+    /// Extract the affine form, or `None` if non-linear.
+    pub fn as_linear(&self) -> Option<LinearForm> {
+        match self {
+            Expr::Constant { value } => Some(LinearForm {
+                coefficients: BTreeMap::new(),
+                constant: *value,
+            }),
+
+            Expr::Variable { name } => {
+                let mut coefficients = BTreeMap::new();
+                coefficients.insert(name.clone(), 1.0);
+                Some(LinearForm {
+                    coefficients,
+                    constant: 0.0,
+                })
+            }
+
+            Expr::Linear { coeff, var, offset } => {
+                let inner = var.as_linear()?;
+                let mut result = inner.scale(*coeff);
+                result.constant += offset;
+                Some(result)
+            }
+
+            Expr::Sum { exprs } => {
+                let mut acc = LinearForm {
+                    coefficients: BTreeMap::new(),
+                    constant: 0.0,
+                };
+                for e in exprs {
+                    let lf = e.as_linear()?;
+                    acc.add_assign(lf);
+                }
+                Some(acc)
+            }
+
+            Expr::Product { exprs } => {
+                // Classify each factor as constant-only or variable-containing.
+                let mut constant_product = 1.0;
+                let mut variable_factor: Option<LinearForm> = None;
+
+                for e in exprs {
+                    let lf = e.as_linear()?;
+                    if lf.coefficients.is_empty() {
+                        // Pure constant factor — accumulate into the product.
+                        constant_product *= lf.constant;
+                    } else {
+                        // Variable-containing factor.
+                        if variable_factor.is_some() {
+                            // Two variable factors → non-linear product.
+                            return None;
+                        }
+                        variable_factor = Some(lf);
+                    }
+                }
+
+                Some(match variable_factor {
+                    None => LinearForm {
+                        coefficients: BTreeMap::new(),
+                        constant: constant_product,
+                    },
+                    Some(lf) => lf.scale(constant_product),
+                })
+            }
+
+            Expr::Div {
+                numerator,
+                denominator,
+            } => {
+                let d = denominator.as_linear()?;
+                // Division by a variable-containing expression is non-linear.
+                if !d.coefficients.is_empty() {
+                    return None;
+                }
+                // Division by zero is non-linear (undefined).
+                if d.constant == 0.0 {
+                    return None;
+                }
+                let n = numerator.as_linear()?;
+                Some(n.scale(1.0 / d.constant))
+            }
+
+            // Non-linear or non-affine variants.
+            Expr::Tiered { .. } | Expr::Max { .. } | Expr::Min { .. } | Expr::Ceil { .. } => None,
+        }
+    }
+}
+
+/// Recursively collect all `Variable` names from an expression into `set`.
+fn collect_variables(expr: &Expr, set: &mut BTreeSet<VariableName>) {
+    match expr {
+        Expr::Constant { .. } => {}
+        Expr::Variable { name } => {
+            set.insert(name.clone());
+        }
+        Expr::Linear { var, .. } => collect_variables(var, set),
+        Expr::Tiered { tiers: _, var } => collect_variables(var, set),
+        Expr::Sum { exprs } => {
+            for e in exprs {
+                collect_variables(e, set);
+            }
+        }
+        Expr::Product { exprs } => {
+            for e in exprs {
+                collect_variables(e, set);
+            }
+        }
+        Expr::Max { expr, .. } => collect_variables(expr, set),
+        Expr::Min { expr, .. } => collect_variables(expr, set),
+        Expr::Ceil { expr } => collect_variables(expr, set),
+        Expr::Div {
+            numerator,
+            denominator,
+        } => {
+            collect_variables(numerator, set);
+            collect_variables(denominator, set);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{Expr, Tier};
+
+    fn var(name: &str) -> VariableName {
+        VariableName::new(name)
+    }
+
+    // -------------------------------------------------------------------------
+    // variables()
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn variables_collects_all_nested() {
+        // Sum( Linear(x), Div(y, z), Product(x, Constant(2)) )
+        let expr = Expr::sum(vec![
+            Expr::linear(3.0, Expr::variable("x"), 0.0),
+            Expr::div(Expr::variable("y"), Expr::variable("z")),
+            Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+        ]);
+        let vars = expr.variables();
+        assert!(vars.contains(&var("x")));
+        assert!(vars.contains(&var("y")));
+        assert!(vars.contains(&var("z")));
+        assert_eq!(vars.len(), 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — basic cases
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn as_linear_constant_variable_linear() {
+        // Constant
+        let c = Expr::constant(7.0).as_linear().unwrap();
+        assert_eq!(c.coefficients.len(), 0);
+        assert_eq!(c.constant, 7.0);
+
+        // Variable
+        let v = Expr::variable("x").as_linear().unwrap();
+        assert_eq!(v.coefficients[&var("x")], 1.0);
+        assert_eq!(v.constant, 0.0);
+
+        // Linear(2.0 * x + 5.0)
+        let l = Expr::linear(2.0, Expr::variable("x"), 5.0)
+            .as_linear()
+            .unwrap();
+        assert_eq!(l.coefficients[&var("x")], 2.0);
+        assert_eq!(l.constant, 5.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — Sum merges coefficients
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn as_linear_sum_merges_coefficients() {
+        // 3x + 2x + 1  →  5x + 1
+        let expr = Expr::sum(vec![
+            Expr::linear(3.0, Expr::variable("x"), 0.0),
+            Expr::linear(2.0, Expr::variable("x"), 1.0),
+        ]);
+        let lf = expr.as_linear().unwrap();
+        assert_eq!(lf.coefficients[&var("x")], 5.0);
+        assert_eq!(lf.constant, 1.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — Product
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn as_linear_product_constant_times_linear() {
+        // Constant(3) * Variable(x)  →  3x
+        let expr = Expr::product(vec![Expr::constant(3.0), Expr::variable("x")]);
+        let lf = expr.as_linear().unwrap();
+        assert_eq!(lf.coefficients[&var("x")], 3.0);
+        assert_eq!(lf.constant, 0.0);
+
+        // Variable(x) * Variable(y)  →  None
+        let non_linear = Expr::product(vec![Expr::variable("x"), Expr::variable("y")]);
+        assert!(non_linear.as_linear().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — Div
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn as_linear_div_by_constant_ok_div_by_variable_none() {
+        // (2x + 4) / 2  →  x + 2
+        let expr = Expr::div(
+            Expr::linear(2.0, Expr::variable("x"), 4.0),
+            Expr::constant(2.0),
+        );
+        let lf = expr.as_linear().unwrap();
+        assert_eq!(lf.coefficients[&var("x")], 1.0);
+        assert_eq!(lf.constant, 2.0);
+
+        // x / y  →  None (variable denominator)
+        let div_by_var = Expr::div(Expr::variable("x"), Expr::variable("y"));
+        assert!(div_by_var.as_linear().is_none());
+
+        // x / 0  →  None (division by zero)
+        let div_by_zero = Expr::div(Expr::variable("x"), Expr::constant(0.0));
+        assert!(div_by_zero.as_linear().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — Non-linear variants
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn as_linear_tiered_max_min_ceil_are_none() {
+        let tiered = Expr::tiered(
+            vec![Tier {
+                upper_limit: Some(100.0),
+                unit_price: 0.01,
+            }],
+            Expr::variable("x"),
+        );
+        assert!(tiered.as_linear().is_none());
+
+        let max_expr = Expr::Max {
+            expr: Box::new(Expr::variable("x")),
+            floor: 0.0,
+        };
+        assert!(max_expr.as_linear().is_none());
+
+        let min_expr = Expr::Min {
+            expr: Box::new(Expr::variable("x")),
+            ceiling: 100.0,
+        };
+        assert!(min_expr.as_linear().is_none());
+
+        let ceil_expr = Expr::ceil(Expr::variable("x"));
+        assert!(ceil_expr.as_linear().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // is_linear() matches as_linear().is_some()
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn is_linear_matches_as_linear_some() {
+        let linear = Expr::linear(2.0, Expr::variable("x"), 1.0);
+        assert!(linear.is_linear());
+        assert_eq!(linear.is_linear(), linear.as_linear().is_some());
+
+        let non_linear = Expr::ceil(Expr::variable("x"));
+        assert!(!non_linear.is_linear());
+        assert_eq!(non_linear.is_linear(), non_linear.as_linear().is_some());
+    }
+}
