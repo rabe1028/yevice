@@ -1,10 +1,11 @@
 //! JSON Schema generation and template YAML generation from cost models.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
 
 use crate::cost::ArchitectureCost;
+use crate::types::VariableName;
 
 /// JSON Schema for the hierarchical usage parameters file.
 ///
@@ -53,11 +54,9 @@ pub fn generate_usage_schema(arch: &ArchitectureCost) -> UsageSchema {
     let mut properties = BTreeMap::new();
     let mut required = Vec::new();
 
-    for resource in &arch.resources {
-        if resource.required_variables.is_empty() {
-            continue;
-        }
+    let bound: HashSet<&VariableName> = arch.bindings.iter().map(|b| &b.target).collect();
 
+    for resource in &arch.resources {
         let logical_id = resource.logical_id.to_string();
         let prefix = format!("{logical_id}_");
 
@@ -65,6 +64,9 @@ pub fn generate_usage_schema(arch: &ArchitectureCost) -> UsageSchema {
         let mut resource_required = Vec::new();
 
         for var in &resource.required_variables {
+            if bound.contains(&var.name) {
+                continue;
+            }
             let var_name = var.name.to_string();
             let short_name = var_name.strip_prefix(&prefix).unwrap_or(&var_name);
 
@@ -76,6 +78,10 @@ pub fn generate_usage_schema(arch: &ArchitectureCost) -> UsageSchema {
                 },
             );
             resource_required.push(short_name.to_string());
+        }
+
+        if resource_props.is_empty() {
+            continue;
         }
 
         required.push(logical_id.clone());
@@ -103,24 +109,35 @@ pub fn generate_usage_schema(arch: &ArchitectureCost) -> UsageSchema {
 }
 
 /// Generate a template usage YAML with placeholder values.
+///
+/// Binding target variables are excluded; only user-supplied usage inputs
+/// appear in the template.
 pub fn generate_usage_template(arch: &ArchitectureCost) -> String {
     let mut lines = Vec::new();
     lines.push(format!("# Usage parameters for: {}", arch.name));
     lines.push(format!("# Region: {}", arch.region));
     lines.push(String::new());
 
-    for resource in &arch.resources {
-        if resource.required_variables.is_empty() {
-            continue;
-        }
+    let bound: HashSet<&VariableName> = arch.bindings.iter().map(|b| &b.target).collect();
 
+    for resource in &arch.resources {
         let logical_id = resource.logical_id.to_string();
         let prefix = format!("{logical_id}_");
+
+        let vars: Vec<_> = resource
+            .required_variables
+            .iter()
+            .filter(|v| !bound.contains(&v.name))
+            .collect();
+
+        if vars.is_empty() {
+            continue;
+        }
 
         lines.push(format!("# {}", resource.label));
         lines.push(format!("{logical_id}:"));
 
-        for var in &resource.required_variables {
+        for var in vars {
             let var_name = var.name.to_string();
             let short_name = var_name.strip_prefix(&prefix).unwrap_or(&var_name);
             lines.push(format!(
@@ -132,4 +149,232 @@ pub fn generate_usage_template(arch: &ArchitectureCost) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::{ResourceCost, VariableBinding, VariableInfo};
+    use crate::expr::Expr;
+    use crate::topology::Topology;
+    use crate::types::{ArchitectureName, LogicalId, Region, ResourceType};
+
+    fn make_arch_with_binding() -> ArchitectureCost {
+        let lambda = LogicalId::new("MyFunction");
+        let queue = LogicalId::new("MyQueue");
+
+        // MyFunction has two variables: requests (bound) and avg_duration_ms (not bound)
+        let function_resource = ResourceCost {
+            logical_id: lambda.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "My Lambda Function".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![
+                VariableInfo::new(&lambda, "requests", "Invocation count", "count"),
+                VariableInfo::new(&lambda, "avg_duration_ms", "Avg duration", "ms"),
+            ],
+        };
+
+        // MyQueue has one variable: requests (not bound)
+        let queue_resource = ResourceCost {
+            logical_id: queue.clone(),
+            resource_type: ResourceType::new("AWS::SQS::Queue"),
+            label: "My SQS Queue".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &queue,
+                "requests",
+                "Message count",
+                "count",
+            )],
+        };
+
+        // Binding: MyFunction_requests is derived from MyQueue_requests
+        let binding = VariableBinding {
+            target: lambda.var("requests"),
+            expr: Expr::variable(queue.var("requests")),
+            description: "SQS -> Lambda".to_string(),
+            source: "SQS -> Lambda (MyQueue -> MyFunction)".to_string(),
+        };
+
+        ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![function_resource, queue_resource],
+            bindings: vec![binding],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        }
+    }
+
+    #[test]
+    fn schema_excludes_binding_targets() {
+        let arch = make_arch_with_binding();
+        let schema = generate_usage_schema(&arch);
+
+        // MyFunction still appears because avg_duration_ms is not bound
+        assert!(
+            schema.properties.contains_key("MyFunction"),
+            "MyFunction should appear (has non-bound variables)"
+        );
+        let func = &schema.properties["MyFunction"];
+
+        // requests is a binding target and must be absent
+        assert!(
+            !func.properties.contains_key("requests"),
+            "binding target 'requests' must be excluded from schema"
+        );
+
+        // avg_duration_ms is not bound and must be present
+        assert!(
+            func.properties.contains_key("avg_duration_ms"),
+            "non-bound 'avg_duration_ms' must remain in schema"
+        );
+        assert_eq!(
+            func.required.len(),
+            1,
+            "only avg_duration_ms should be required"
+        );
+
+        // MyQueue is not a binding target; its requests variable must appear
+        assert!(
+            schema.properties.contains_key("MyQueue"),
+            "MyQueue should appear"
+        );
+        assert!(
+            schema.properties["MyQueue"]
+                .properties
+                .contains_key("requests"),
+            "MyQueue_requests is not bound and must appear"
+        );
+    }
+
+    #[test]
+    fn schema_omits_resource_when_all_variables_are_bound() {
+        let lambda = LogicalId::new("OnlyBound");
+
+        let resource = ResourceCost {
+            logical_id: lambda.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "Fully-bound function".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &lambda,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+
+        let binding = VariableBinding {
+            target: lambda.var("requests"),
+            expr: Expr::constant(1000.0),
+            description: "derived".to_string(),
+            source: "test".to_string(),
+        };
+
+        let arch = ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![resource],
+            bindings: vec![binding],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        };
+
+        let schema = generate_usage_schema(&arch);
+        assert!(
+            !schema.properties.contains_key("OnlyBound"),
+            "resource with all variables bound must be absent from schema"
+        );
+        assert!(
+            schema.required.is_empty(),
+            "no resources should be required when all are fully bound"
+        );
+    }
+
+    #[test]
+    fn template_excludes_binding_targets() {
+        let arch = make_arch_with_binding();
+        let template = generate_usage_template(&arch);
+
+        // MyFunction section present (has avg_duration_ms)
+        assert!(
+            template.contains("MyFunction:"),
+            "MyFunction section should appear"
+        );
+        // avg_duration_ms must appear
+        assert!(
+            template.contains("  avg_duration_ms: 0"),
+            "avg_duration_ms should be in template"
+        );
+        // requests must NOT appear under MyFunction (it is a binding target)
+        // We check that 'requests: 0' doesn't appear in the MyFunction block.
+        // Since MyQueue_requests also appears in the queue section, we verify
+        // that the MyFunction block specifically doesn't contain it by checking
+        // the template does not include "  requests: 0" under MyFunction.
+        // The simplest approach: MyQueue section does appear with requests, but
+        // binding target MyFunction_requests must not appear as a placeholder.
+        let function_section_start = template.find("MyFunction:").expect("MyFunction: not found");
+        let after_function = &template[function_section_start..];
+        let next_section = after_function[1..]
+            .find('\n')
+            .map_or(after_function.len(), |i| i + 1);
+        // collect lines of the MyFunction block (until next top-level key)
+        let block: Vec<&str> = after_function[next_section..]
+            .lines()
+            .take_while(|l| l.starts_with("  ") || l.is_empty())
+            .collect();
+        assert!(
+            !block.iter().any(|l| l.contains("requests:")),
+            "binding target 'requests' must not appear in MyFunction template block, block: {block:?}"
+        );
+
+        // MyQueue section must appear with requests (not a binding target)
+        assert!(
+            template.contains("MyQueue:"),
+            "MyQueue section should appear"
+        );
+    }
+
+    #[test]
+    fn template_omits_resource_when_all_variables_are_bound() {
+        let lambda = LogicalId::new("OnlyBound");
+
+        let resource = ResourceCost {
+            logical_id: lambda.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "Fully-bound function".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &lambda,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+
+        let binding = VariableBinding {
+            target: lambda.var("requests"),
+            expr: Expr::constant(1000.0),
+            description: "derived".to_string(),
+            source: "test".to_string(),
+        };
+
+        let arch = ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![resource],
+            bindings: vec![binding],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        };
+
+        let template = generate_usage_template(&arch);
+        assert!(
+            !template.contains("OnlyBound:"),
+            "resource with all variables bound must be absent from template"
+        );
+    }
 }

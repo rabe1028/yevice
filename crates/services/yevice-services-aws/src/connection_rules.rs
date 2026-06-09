@@ -219,10 +219,28 @@ impl ConnectionRule for AwsNotificationRule {
                     Some("aws.sns") => (conn.target.var("deliveries"), "SNS"),
                     _ => return Vec::new(),
                 };
+                // When S3 notifies an SNS topic, `deliveries` must equal
+                // s3_rate × N (where N is the topic's subscriber count) so
+                // that the downstream SNS→subscriber rule (which divides by N)
+                // delivers exactly s3_rate to each subscriber.
+                let effective_factor = if target_service_id == Some("aws.sns") {
+                    let subscriber_count = arch
+                        .connections
+                        .iter()
+                        .filter(|c| {
+                            c.source == conn.target
+                                && matches!(c.connection_type, ConnectionType::Notification)
+                        })
+                        .count()
+                        .max(1);
+                    factor * subscriber_count as f64
+                } else {
+                    factor
+                };
                 vec![scaled_binding(
                     target_var,
                     &source_var,
-                    factor,
+                    effective_factor,
                     format!(
                         "{source_type} -> {target_type} ({} -> {})",
                         conn.source, conn.target
@@ -1077,6 +1095,74 @@ mod tests {
         let params = params_from(&[("Bucket_put_requests", 300.0)]);
         let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
         assert_eq!(result, 600.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // S3→SNS with multiple subscribers
+    // -----------------------------------------------------------------------
+
+    /// S3→SNS where the topic has 2 subscribers.
+    /// deliveries binding must be s3_rate × factor × N (N=2) so that the
+    /// downstream SNS→subscriber rule (deliveries / N) delivers s3_rate to each.
+    #[test]
+    fn test_notification_s3_to_sns_two_subscribers_scales_deliveries() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Topic", "aws.sns"),
+                make_resource("HandlerA", "aws.lambda"),
+                make_resource("HandlerB", "aws.lambda"),
+            ],
+            connections: vec![
+                // S3 → SNS notification
+                Connection {
+                    source: LogicalId::new("Bucket"),
+                    target: LogicalId::new("Topic"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                // Topic has 2 subscribers
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerA"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerB"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+
+        // Find the S3→SNS binding (Topic_deliveries)
+        let s3_sns_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Topic").var("deliveries"))
+            .expect("Topic_deliveries binding should exist");
+
+        // With factor=1.0 and N=2 subscribers, deliveries = s3_rate × 1.0 × 2
+        let params = params_from(&[("Bucket_put_requests", 1000.0)]);
+        let result = yevice_core::evaluate::evaluate(&s3_sns_binding.expr, &params).unwrap();
+        assert_eq!(
+            result, 2000.0,
+            "S3→SNS deliveries must be s3_rate × N (N=2), got {result}"
+        );
     }
 
     // -----------------------------------------------------------------------

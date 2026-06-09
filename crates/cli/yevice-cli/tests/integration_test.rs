@@ -504,22 +504,32 @@ fn test_schema_generation() {
 
     let schema = generate_usage_schema(&arch);
 
-    // Should have properties for each resource with variables
+    // Should have properties for each resource with non-bound variables.
+    // OrderIngestFunction_requests is a binding target (Kinesis EventSourceMapping)
+    // so OrderIngestFunction still appears because it has avg_duration_ms and
+    // data_transfer_out_gb, but requests is excluded.
     assert!(
         schema.properties.contains_key("OrderIngestFunction"),
         "schema should contain OrderIngestFunction"
     );
+    // OrderBackupFunction_requests is a binding target (SQS EventSourceMapping)
+    // so OrderBackupFunction still appears because it has avg_duration_ms and
+    // data_transfer_out_gb, but requests is excluded.
     assert!(
         schema.properties.contains_key("OrderBackupFunction"),
         "schema should contain OrderBackupFunction"
     );
 
-    // OrderIngestFunction should require requests, avg_duration_ms, and data_transfer_out_gb
+    // OrderIngestFunction should require avg_duration_ms and data_transfer_out_gb
+    // (requests is a binding target and must be excluded).
     let ingest = &schema.properties["OrderIngestFunction"];
-    assert!(ingest.properties.contains_key("requests"));
+    assert!(
+        !ingest.properties.contains_key("requests"),
+        "requests is a binding target and must be excluded from schema"
+    );
     assert!(ingest.properties.contains_key("avg_duration_ms"));
     assert!(ingest.properties.contains_key("data_transfer_out_gb"));
-    assert_eq!(ingest.required.len(), 3);
+    assert_eq!(ingest.required.len(), 2);
 }
 
 #[test]

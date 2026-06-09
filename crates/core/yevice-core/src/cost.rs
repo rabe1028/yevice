@@ -133,6 +133,7 @@ mod tests {
         let json = r#"{
             "name": "arch",
             "resources": [],
+            "bindings": [],
             "region": "ap-northeast-1"
         }"#;
 
