@@ -113,14 +113,11 @@ impl ArchitectureRenderer for MermaidRenderer {
 
         // Emit edges.
         for conn in &topology.connections {
-            let src = id_map
-                .get(&conn.source)
-                .cloned()
-                .unwrap_or_else(|| sanitize_id(conn.source.as_str()));
-            let dst = id_map
-                .get(&conn.target)
-                .cloned()
-                .unwrap_or_else(|| sanitize_id(conn.target.as_str()));
+            let (Some(src), Some(dst)) = (id_map.get(&conn.source), id_map.get(&conn.target))
+            else {
+                // Skip edges whose endpoint is not a rendered node (e.g. external ARN source).
+                continue;
+            };
             let label = connection_type_label(&conn.connection_type);
             lines.push(format!("    {src} -->|{label}| {dst}"));
         }
@@ -321,6 +318,56 @@ mod tests {
         assert!(
             !output.contains("beta_2"),
             "beta must not get a suffix: {output}"
+        );
+    }
+
+    /// An edge whose source is not a rendered node must be skipped entirely;
+    /// an edge whose both endpoints are rendered must still appear in the output.
+    #[test]
+    fn edge_with_unknown_endpoint_is_skipped() {
+        let node_a = make_leaf_node("FunctionA");
+        let node_b = make_leaf_node("FunctionB");
+
+        // Edge FunctionA → FunctionB: both endpoints are known — must appear.
+        let known_edge = Connection {
+            source: LogicalId::new("FunctionA"),
+            target: LogicalId::new("FunctionB"),
+            connection_type: ConnectionType::Invocation,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+
+        // Edge ExternalArn → FunctionB: source is NOT a rendered node — must be skipped.
+        let unknown_edge = Connection {
+            source: LogicalId::new("arn:aws:sqs:us-east-1:123456789012:MyQueue"),
+            target: LogicalId::new("FunctionB"),
+            connection_type: ConnectionType::EventSource,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+
+        let topology = Topology {
+            nodes: vec![node_a, node_b],
+            connections: vec![known_edge, unknown_edge],
+        };
+        let cost = minimal_cost(topology);
+        let output = MermaidRenderer.render(&cost).unwrap();
+
+        // The known edge must appear.
+        assert!(
+            output.contains("FunctionA -->|Invocation| FunctionB"),
+            "known edge FunctionA→FunctionB must be rendered: {output}",
+        );
+
+        // The unknown edge must NOT produce an implicit node for the external ARN.
+        // Sanitized form of the ARN would contain "arn__aws__sqs"; must not appear as a node.
+        assert!(
+            !output.contains("arn__aws__sqs"),
+            "unknown-endpoint edge must not introduce an implicit node: {output}",
         );
     }
 }

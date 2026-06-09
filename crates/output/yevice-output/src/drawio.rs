@@ -199,8 +199,13 @@ fn emit_edges(
     edge_id: &mut u32,
 ) {
     for conn in connections {
-        let src_id = node_cell_ids.get(&conn.source).copied().unwrap_or(0);
-        let dst_id = node_cell_ids.get(&conn.target).copied().unwrap_or(0);
+        let (Some(&src_id), Some(&dst_id)) = (
+            node_cell_ids.get(&conn.source),
+            node_cell_ids.get(&conn.target),
+        ) else {
+            // Skip edges whose endpoint is not a rendered node (e.g. external ARN source).
+            continue;
+        };
         let label = xml_escape(connection_type_label(&conn.connection_type));
         let _ = writeln!(
             xml,
@@ -576,6 +581,57 @@ mod tests {
         assert!(
             height > CELL_HEIGHT,
             "outer container height {height} should exceed leaf height {CELL_HEIGHT}",
+        );
+    }
+
+    /// An edge whose source is not a rendered node must be skipped entirely;
+    /// an edge whose both endpoints are rendered must still appear in the output.
+    #[test]
+    fn edge_with_unknown_endpoint_is_skipped() {
+        use yevice_core::resource::{Connection, ConnectionType};
+
+        let node_a = make_node("A", None);
+        let node_b = make_node("B", None);
+
+        // Edge A → B: both endpoints are known — must appear.
+        let known_edge = Connection {
+            source: LogicalId::new("A"),
+            target: LogicalId::new("B"),
+            connection_type: ConnectionType::DataFlow,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+
+        // Edge ExternalArn → B: source is NOT a rendered node — must be skipped.
+        let unknown_edge = Connection {
+            source: LogicalId::new("arn:aws:sqs:us-east-1:123456789012:MyQueue"),
+            target: LogicalId::new("B"),
+            connection_type: ConnectionType::EventSource,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+
+        let topology = Topology {
+            nodes: vec![node_a, node_b],
+            connections: vec![known_edge, unknown_edge],
+        };
+        let cost = minimal_cost(topology);
+        let xml = DrawIoRenderer.render(&cost).unwrap();
+
+        // The known edge must appear; nodes A and B get cell ids 2 and 3.
+        assert!(
+            xml.contains("source=\"2\"") && xml.contains("target=\"3\""),
+            "known edge A→B must be rendered: {xml}",
+        );
+
+        // The unknown edge must NOT produce a source="0" (mxGraph root cell anchor).
+        assert!(
+            !xml.contains("source=\"0\""),
+            "unknown-endpoint edge must not anchor to cell 0 (mxGraph root): {xml}",
         );
     }
 
