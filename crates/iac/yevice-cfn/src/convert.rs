@@ -499,8 +499,25 @@ fn extract_events_rule_connections(rule_id: &str, cfn: &CfnResource) -> Vec<Conn
 }
 
 // ---------------------------------------------------------------------------
-// AWS::Serverless::Function Events (SQS / Kinesis / DynamoDB types only)
+// AWS::Serverless::Function Events (SQS / Kinesis / DynamoDB / S3 types)
 // ---------------------------------------------------------------------------
+
+/// Returns `true` when the SAM S3 event `Events` field contains at least one
+/// `s3:ObjectCreated` variant.  The field may be a single string or a YAML
+/// sequence of strings (both are valid in SAM).
+fn sam_s3_events_has_object_created(event_props: &serde_yaml_ng::Mapping) -> bool {
+    let Some(events_val) = event_props.get(YamlValue::String("Events".into())) else {
+        return false;
+    };
+    match events_val {
+        YamlValue::String(s) => s.starts_with("s3:ObjectCreated"),
+        YamlValue::Sequence(seq) => seq.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| s.starts_with("s3:ObjectCreated"))
+        }),
+        _ => false,
+    }
+}
 
 fn extract_sam_function_event_connections(
     function_id: &str,
@@ -529,18 +546,46 @@ fn extract_sam_function_event_connections(
             continue;
         };
 
-        // Only handle stream/queue event sources that create EventSource edges.
-        match event_type {
-            "SQS" | "Kinesis" | "DynamoDB" => {}
-            _ => continue,
-        }
-
         let event_props = event_map
             .get(YamlValue::String("Properties".into()))
             .and_then(|v| v.as_mapping());
         let Some(event_props) = event_props else {
             continue;
         };
+
+        if event_type == "S3" {
+            // SAM S3 event: emit a Notification edge from the bucket to the
+            // function, mirroring what SAM transform writes into
+            // AWS::S3::Bucket NotificationConfiguration.
+            if !sam_s3_events_has_object_created(event_props) {
+                continue;
+            }
+            let bucket_val = event_props.get(YamlValue::String("Bucket".into()));
+            let Some(bucket_val) = bucket_val else {
+                continue;
+            };
+            let Some(bucket_str) = bucket_val.as_str() else {
+                continue;
+            };
+            let Some(bucket_id) = extract_logical_id_from_sentinel(bucket_str) else {
+                continue;
+            };
+            if !resources.contains_key(&bucket_id) {
+                continue;
+            }
+            conns.push(simple_connection(
+                &bucket_id,
+                function_id,
+                ConnectionType::Notification,
+            ));
+            continue;
+        }
+
+        // Only handle stream/queue event sources that create EventSource edges.
+        match event_type {
+            "SQS" | "Kinesis" | "DynamoDB" => {}
+            _ => continue,
+        }
 
         // Stream field name: SQS uses "Queue", Kinesis/DynamoDB use "Stream".
         let source_key = match event_type {
@@ -1070,5 +1115,176 @@ mod connection_tests {
             conns[0].connection_type,
             ConnectionType::Notification
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // SAM AWS::Serverless::Function S3 event type tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an SAM function with a single S3 event entry.
+    fn sam_function_with_s3_event(
+        function_id: &str,
+        bucket_sentinel: &str,
+        s3_events: YamlValue,
+    ) -> CfnResource {
+        let event_props = yaml_map_values(vec![
+            ("Bucket", yaml_str(bucket_sentinel)),
+            ("Events", s3_events),
+        ]);
+        let event_entry =
+            yaml_map_values(vec![("Type", yaml_str("S3")), ("Properties", event_props)]);
+        let mut events_map = serde_yaml_ng::Mapping::new();
+        events_map.insert(YamlValue::String("Photo".to_string()), event_entry);
+        let fn_props = yaml_map_values(vec![("Events", YamlValue::Mapping(events_map))]);
+        cfn_resource_typed(function_id, "AWS::Serverless::Function", fn_props)
+    }
+
+    /// SAM `Type: S3` with `Events: s3:ObjectCreated:*` (string) must produce a
+    /// Notification edge from the bucket to the function.
+    #[test]
+    fn sam_s3_event_object_created_string_produces_notification_edge() {
+        let bucket = cfn_resource_typed("MediaBucket", "AWS::S3::Bucket", yaml_map_values(vec![]));
+        let function = sam_function_with_s3_event(
+            "MyFunction",
+            "{{ref:MediaBucket}}",
+            yaml_str("s3:ObjectCreated:*"),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MediaBucket".to_string(), bucket);
+        resources.insert("MyFunction".to_string(), function);
+
+        let conns = build_connections(&resources);
+        let notif = conns.iter().find(|c| {
+            c.source.as_str() == "MediaBucket"
+                && c.target.as_str() == "MyFunction"
+                && matches!(c.connection_type, ConnectionType::Notification)
+        });
+        assert!(
+            notif.is_some(),
+            "expected Notification edge for SAM S3 ObjectCreated:*; connections = {conns:?}",
+        );
+    }
+
+    /// SAM `Type: S3` with `Events: [s3:ObjectCreated:Put]` (sequence) must
+    /// produce a Notification edge.
+    #[test]
+    fn sam_s3_event_object_created_list_produces_notification_edge() {
+        let bucket = cfn_resource_typed("MediaBucket", "AWS::S3::Bucket", yaml_map_values(vec![]));
+        let function = sam_function_with_s3_event(
+            "MyFunction",
+            "{{ref:MediaBucket}}",
+            yaml_seq(vec![yaml_str("s3:ObjectCreated:Put")]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MediaBucket".to_string(), bucket);
+        resources.insert("MyFunction".to_string(), function);
+
+        let conns = build_connections(&resources);
+        let notif = conns.iter().find(|c| {
+            c.source.as_str() == "MediaBucket"
+                && c.target.as_str() == "MyFunction"
+                && matches!(c.connection_type, ConnectionType::Notification)
+        });
+        assert!(
+            notif.is_some(),
+            "expected Notification edge for SAM S3 ObjectCreated:Put list; connections = {conns:?}",
+        );
+    }
+
+    /// SAM `Type: S3` with `Events: s3:ObjectRemoved:*` must NOT produce any edge.
+    #[test]
+    fn sam_s3_event_object_removed_produces_no_edge() {
+        let bucket = cfn_resource_typed("MediaBucket", "AWS::S3::Bucket", yaml_map_values(vec![]));
+        let function = sam_function_with_s3_event(
+            "MyFunction",
+            "{{ref:MediaBucket}}",
+            yaml_str("s3:ObjectRemoved:*"),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MediaBucket".to_string(), bucket);
+        resources.insert("MyFunction".to_string(), function);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for SAM S3 ObjectRemoved:*; connections = {conns:?}",
+        );
+    }
+
+    /// SAM `Type: S3` where the bucket logical ID is absent from resources must
+    /// NOT produce any edge (dangling bucket reference).
+    #[test]
+    fn sam_s3_event_dangling_bucket_produces_no_edge() {
+        // Only the function is in resources; the bucket is not.
+        let function = sam_function_with_s3_event(
+            "MyFunction",
+            "{{ref:NonExistentBucket}}",
+            yaml_str("s3:ObjectCreated:*"),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MyFunction".to_string(), function);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for SAM S3 with dangling bucket; connections = {conns:?}",
+        );
+    }
+
+    /// SAM `Type: S3` and `Type: SQS` events on the same function must both
+    /// produce edges independently.
+    #[test]
+    fn sam_s3_and_sqs_events_both_produce_edges() {
+        let bucket = cfn_resource_typed("MediaBucket", "AWS::S3::Bucket", yaml_map_values(vec![]));
+        let queue = cfn_resource_typed("MyQueue", "AWS::SQS::Queue", yaml_map_values(vec![]));
+
+        // Build a function with two events: S3 and SQS.
+        let s3_event_props = yaml_map_values(vec![
+            ("Bucket", yaml_str("{{ref:MediaBucket}}")),
+            ("Events", yaml_str("s3:ObjectCreated:*")),
+        ]);
+        let s3_event = yaml_map_values(vec![
+            ("Type", yaml_str("S3")),
+            ("Properties", s3_event_props),
+        ]);
+        let sqs_event_props = yaml_map_values(vec![("Queue", yaml_str("{{ref:MyQueue}}"))]);
+        let sqs_event = yaml_map_values(vec![
+            ("Type", yaml_str("SQS")),
+            ("Properties", sqs_event_props),
+        ]);
+        let mut events_map = serde_yaml_ng::Mapping::new();
+        events_map.insert(YamlValue::String("PhotoEvent".to_string()), s3_event);
+        events_map.insert(YamlValue::String("QueueEvent".to_string()), sqs_event);
+        let fn_props = yaml_map_values(vec![("Events", YamlValue::Mapping(events_map))]);
+        let function = cfn_resource_typed("MyFunction", "AWS::Serverless::Function", fn_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MediaBucket".to_string(), bucket);
+        resources.insert("MyQueue".to_string(), queue);
+        resources.insert("MyFunction".to_string(), function);
+
+        let conns = build_connections(&resources);
+        let notif = conns.iter().find(|c| {
+            c.source.as_str() == "MediaBucket"
+                && c.target.as_str() == "MyFunction"
+                && matches!(c.connection_type, ConnectionType::Notification)
+        });
+        let esm = conns.iter().find(|c| {
+            c.source.as_str() == "MyQueue"
+                && c.target.as_str() == "MyFunction"
+                && matches!(c.connection_type, ConnectionType::EventSource)
+        });
+        assert!(
+            notif.is_some(),
+            "expected Notification edge for S3 event; connections = {conns:?}"
+        );
+        assert!(
+            esm.is_some(),
+            "expected EventSource edge for SQS event; connections = {conns:?}"
+        );
     }
 }

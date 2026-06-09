@@ -174,8 +174,11 @@ fn substitute_variables(
                 }
                 var_name.push(ch);
             }
-            // Try local vars first, then parameters
-            if let Some(val) = local_vars.get(&var_name) {
+            // ${!Literal} is the documented Fn::Sub escape for a literal ${Literal}.
+            if let Some(literal) = var_name.strip_prefix('!') {
+                use std::fmt::Write;
+                let _ = write!(result, "${{{literal}}}");
+            } else if let Some(val) = local_vars.get(&var_name) {
                 result.push_str(val);
             } else if let Some(val) = ctx.parameters.get(&var_name) {
                 result.push_str(val);
@@ -565,6 +568,53 @@ mod tests {
         assert_ne!(
             s, "{{ref:MyQueue}}",
             "embedded ref must NOT be a standalone sentinel"
+        );
+    }
+
+    // --- Fn::Sub ${!Literal} escape (#2) ---
+
+    /// `${!NotAVar}` must resolve to the literal `${NotAVar}` (no sentinel).
+    #[test]
+    fn test_sub_bang_escape_produces_literal() {
+        let ctx = make_ctx();
+        let val = Value::String("foo-${!NotAVar}-bar".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("foo-${NotAVar}-bar".into()),
+            "!Sub '${{!Literal}}' must produce literal '${{Literal}}', not a sentinel"
+        );
+    }
+
+    /// The escape must NOT produce any sentinel marker.
+    #[test]
+    fn test_sub_bang_escape_does_not_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("${!SomeVar}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        let s = result.as_str().unwrap();
+        assert!(
+            !s.contains("{{ref:"),
+            "escaped variable must not produce a ref sentinel: {s}"
+        );
+        assert!(
+            !s.contains("{{getatt:"),
+            "escaped variable must not produce a getatt sentinel: {s}"
+        );
+        assert_eq!(s, "${SomeVar}");
+    }
+
+    /// Normal `${Resource}` refs alongside `${!Escaped}` must both work correctly.
+    #[test]
+    fn test_sub_bang_escape_mixed_with_resource_ref() {
+        let ctx = make_ctx();
+        // MyQueue is not a parameter in make_ctx(), so it becomes a ref sentinel.
+        let val = Value::String("${MyQueue}-${!NotAVar}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{ref:MyQueue}}-${NotAVar}".into()),
+            "resource ref must sentinel-ise while escaped var stays literal"
         );
     }
 }
