@@ -1,9 +1,12 @@
 mod commands;
 mod render;
 
-use anyhow::Result;
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
+use yevice_core::resource::Provider;
 
 #[derive(Parser)]
 #[command(
@@ -80,6 +83,13 @@ enum Commands {
         /// calculated. Product-included allocations are still applied.
         #[arg(long)]
         list_price: bool,
+
+        /// Override the pricing region for a specific provider.
+        /// Format: PROVIDER=REGION (e.g. `gcp=asia-northeast1`).
+        /// May be repeated for multiple providers.
+        /// Providers not listed fall back to --region.
+        #[arg(long = "provider-region", value_name = "PROVIDER=REGION")]
+        provider_region: Vec<String>,
     },
 
     /// Evaluate a generated cost model with usage parameters.
@@ -226,6 +236,19 @@ enum Commands {
     },
 }
 
+/// Parse a list of `PROVIDER=REGION` strings into a `HashMap<Provider, String>`.
+///
+/// Delegates per-entry parsing to [`commands::parse_provider_region`].
+fn parse_provider_regions(specs: &[String]) -> Result<HashMap<Provider, String>> {
+    let mut map = HashMap::new();
+    for spec in specs {
+        let (provider, region) = commands::parse_provider_region(spec)
+            .with_context(|| format!("failed to parse --provider-region '{spec}'"))?;
+        map.insert(provider, region);
+    }
+    Ok(map)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -242,18 +265,23 @@ fn main() -> Result<()> {
             name,
             output,
             list_price,
-        } => commands::generate(
-            &template,
-            parameters.as_deref(),
-            imports.as_deref(),
-            bindings.as_deref(),
-            &name,
-            &output,
-            &cli.region,
-            cli.input_format.to_command_format(),
-            cli.strict,
-            list_price,
-        ),
+            provider_region,
+        } => {
+            let provider_regions = parse_provider_regions(&provider_region)?;
+            commands::generate(
+                &template,
+                parameters.as_deref(),
+                imports.as_deref(),
+                bindings.as_deref(),
+                &name,
+                &output,
+                &cli.region,
+                &provider_regions,
+                cli.input_format.to_command_format(),
+                cli.strict,
+                list_price,
+            )
+        }
         Commands::Eval {
             cost_model,
             params,

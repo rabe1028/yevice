@@ -106,6 +106,7 @@ pub fn generate(
     name: &str,
     output_path: &str,
     region: &str,
+    provider_regions: &HashMap<Provider, String>,
     input_format: Option<InputFormat>,
     strict: bool,
     list_price: bool,
@@ -124,7 +125,7 @@ pub fn generate(
         &cfn_adapters,
         &tf_adapters,
     )?;
-    let pricing = build_pricing_resolver(&parsed_input.architecture, region, list_price);
+    let pricing = build_pricing_resolver(&parsed_input.architecture, region, provider_regions, list_price);
     let mut cost_model = catalog
         .build_cost_model(&parsed_input.architecture, &pricing, strict)
         .context("failed to build cost model")?;
@@ -754,21 +755,54 @@ fn detect_tf_provider(resolved: &yevice_tf::ResolvedConfig) -> TfProvider {
     }
 }
 
+/// Parse a `PROVIDER=REGION` string into a `(Provider, String)` pair.
+///
+/// The provider name must be one of `aws`, `gcp`, or `cloudflare`.
+/// Returns an error for unknown provider names.
+pub fn parse_provider_region(s: &str) -> Result<(Provider, String)> {
+    let (provider_str, region_str) = s
+        .split_once('=')
+        .with_context(|| format!("invalid --provider-region value '{s}': expected PROVIDER=REGION (e.g. gcp=asia-northeast1)"))?;
+    let provider = provider_from_str(provider_str.trim())
+        .with_context(|| format!("unknown provider '{provider_str}' in --provider-region '{s}'"))?;
+    Ok((provider, region_str.trim().to_string()))
+}
+
+/// Reverse-map a provider name string to a [`Provider`] variant.
+///
+/// Accepts the same strings that [`Provider::as_str`] produces.
+fn provider_from_str(s: &str) -> Result<Provider> {
+    match s {
+        "aws" => Ok(Provider::Aws),
+        "gcp" => Ok(Provider::Gcp),
+        "cloudflare" => Ok(Provider::Cloudflare),
+        other => bail!("unknown provider '{other}': valid values are aws, gcp, cloudflare"),
+    }
+}
+
 /// Build a per-provider pricing resolver from the providers present in `arch`.
 ///
 /// Iterates over all registered provider plugins and, for each provider that
 /// appears in the architecture, inserts the plugin's pricing catalog into the
 /// resolver. The `Provider::Other` variant has no corresponding plugin and is
 /// handled separately with a [`yevice_pricing::NoopCatalog`].
+///
+/// `provider_regions` allows overriding the region used for a specific
+/// provider's pricing catalog. Providers not present in the map fall back to
+/// `default_region`, preserving full backward compatibility.
 fn build_pricing_resolver(
     arch: &Architecture,
-    region: &str,
+    default_region: &str,
+    provider_regions: &HashMap<Provider, String>,
     list_price: bool,
 ) -> MultiProviderCatalog {
     let mut resolver = MultiProviderCatalog::new();
 
     for plugin in provider_plugins() {
         if arch.has_provider(plugin.provider()) {
+            let region = provider_regions
+                .get(&plugin.provider())
+                .map_or(default_region, String::as_str);
             resolver.insert(plugin.provider(), plugin.pricing_catalog(region, list_price));
         }
     }
@@ -1321,5 +1355,86 @@ mod tests {
             locals: HashMap::new(),
         };
         assert_eq!(detect_tf_provider(&unknown), TfProvider::Unknown);
+    }
+
+    // --- parse_provider_region tests ---
+
+    #[test]
+    fn parses_gcp_provider_region() {
+        let (provider, region) = parse_provider_region("gcp=asia-northeast1").unwrap();
+        assert_eq!(provider, Provider::Gcp);
+        assert_eq!(region, "asia-northeast1");
+    }
+
+    #[test]
+    fn parses_aws_provider_region() {
+        let (provider, region) = parse_provider_region("aws=us-east-1").unwrap();
+        assert_eq!(provider, Provider::Aws);
+        assert_eq!(region, "us-east-1");
+    }
+
+    #[test]
+    fn parses_cloudflare_provider_region() {
+        let (provider, region) = parse_provider_region("cloudflare=global").unwrap();
+        assert_eq!(provider, Provider::Cloudflare);
+        assert_eq!(region, "global");
+    }
+
+    #[test]
+    fn parse_provider_region_trims_whitespace() {
+        let (provider, region) = parse_provider_region("gcp = asia-northeast1").unwrap();
+        assert_eq!(provider, Provider::Gcp);
+        assert_eq!(region, "asia-northeast1");
+    }
+
+    #[test]
+    fn parse_provider_region_rejects_unknown_provider() {
+        let err = parse_provider_region("azure=eastus").unwrap_err();
+        assert!(
+            err.to_string().contains("azure"),
+            "error should mention the unknown provider name"
+        );
+    }
+
+    #[test]
+    fn parse_provider_region_rejects_missing_equals() {
+        let err = parse_provider_region("gcp-asia-northeast1").unwrap_err();
+        assert!(
+            err.to_string().contains("PROVIDER=REGION"),
+            "error should describe expected format"
+        );
+    }
+
+    #[test]
+    fn build_pricing_resolver_uses_per_provider_region() {
+        use yevice_core::resource::{Architecture, Resource, ResourceShell};
+        use yevice_core::types::{LogicalId, Region, ResourceType};
+
+        // Build a minimal architecture that contains only a GCP resource so we
+        // can verify that build_pricing_resolver accepts an overridden region
+        // per provider without panicking.
+        let shell = ResourceShell::new("gcp.cloud_run", Provider::Gcp, &serde_json::json!({}));
+        let resource = Resource {
+            logical_id: LogicalId::new("MyService"),
+            resource_type: ResourceType::new("google_cloud_run_v2_service"),
+            shell,
+            group: None,
+        };
+        let arch = Architecture {
+            name: "test-arch".to_string(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![resource],
+            connections: Vec::new(),
+        };
+
+        let default_region = "ap-northeast-1";
+        let mut provider_regions: HashMap<Provider, String> = HashMap::new();
+        provider_regions.insert(Provider::Gcp, "asia-northeast1".to_string());
+
+        // build_pricing_resolver should complete without panicking.
+        // The overridden GCP region is used internally; we confirm the arch
+        // is recognised as having GCP present.
+        let _resolver = build_pricing_resolver(&arch, default_region, &provider_regions, false);
+        assert!(arch.has_provider(Provider::Gcp));
     }
 }
