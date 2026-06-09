@@ -49,6 +49,16 @@ fn conn_source_rate(
     source_rate_var(arch, &conn.source, conn.source_hint.as_deref())
 }
 
+/// Number of notification subscribers a topic fans out to (its outbound
+/// Notification edges), floored at 1.
+fn sns_subscriber_count(topic: &LogicalId, arch: &Architecture) -> usize {
+    arch.connections
+        .iter()
+        .filter(|c| &c.source == topic && matches!(c.connection_type, ConnectionType::Notification))
+        .count()
+        .max(1)
+}
+
 // ---------------------------------------------------------------------------
 // EventSource rule  (SQS / Kinesis / DDB Stream → Lambda)
 // ---------------------------------------------------------------------------
@@ -167,12 +177,15 @@ impl ConnectionRule for AwsDataFlowRule {
                     ),
                 )]
             }
-            Some("aws.sns") => vec![scaled_binding(
-                conn.target.var("deliveries"),
-                &source_var,
-                factor,
-                format!("{source_type} -> SNS ({} -> {})", conn.source, conn.target),
-            )],
+            Some("aws.sns") => {
+                let n = sns_subscriber_count(&conn.target, arch);
+                vec![scaled_binding(
+                    conn.target.var("deliveries"),
+                    &source_var,
+                    factor * n as f64,
+                    format!("{source_type} -> SNS ({} -> {})", conn.source, conn.target),
+                )]
+            }
             Some("aws.sqs") => vec![scaled_binding(
                 conn.target.var("requests"),
                 &source_var,
@@ -224,16 +237,7 @@ impl ConnectionRule for AwsNotificationRule {
                 // that the downstream SNS→subscriber rule (which divides by N)
                 // delivers exactly s3_rate to each subscriber.
                 let effective_factor = if target_service_id == Some("aws.sns") {
-                    let subscriber_count = arch
-                        .connections
-                        .iter()
-                        .filter(|c| {
-                            c.source == conn.target
-                                && matches!(c.connection_type, ConnectionType::Notification)
-                        })
-                        .count()
-                        .max(1);
-                    factor * subscriber_count as f64
+                    factor * sns_subscriber_count(&conn.target, arch) as f64
                 } else {
                     factor
                 };
@@ -256,16 +260,8 @@ impl ConnectionRule for AwsNotificationRule {
                 // SNS `deliveries` is the total across all subscribers.
                 // Divide by the subscriber count so each target receives the
                 // per-subscriber rate rather than the aggregated total.
-                let subscriber_count = arch
-                    .connections
-                    .iter()
-                    .filter(|c| {
-                        c.source == conn.source
-                            && matches!(c.connection_type, ConnectionType::Notification)
-                    })
-                    .count()
-                    .max(1);
-                let per_subscriber_factor = factor / subscriber_count as f64;
+                let per_subscriber_factor =
+                    factor / sns_subscriber_count(&conn.source, arch) as f64;
                 vec![scaled_binding(
                     target_var,
                     &source_var,
@@ -563,6 +559,97 @@ mod tests {
         assert_eq!(
             bindings[0].target,
             LogicalId::new("Topic").var("deliveries")
+        );
+    }
+
+    /// Lambda→SNS where the topic has 2 Notification subscribers.
+    /// deliveries binding must be lambda_rate × factor × N (N=2) so that each
+    /// downstream SNS→subscriber rule (deliveries / N) delivers lambda_rate.
+    #[test]
+    fn test_dataflow_lambda_to_sns_two_subscribers_scales_deliveries() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Publisher", "aws.lambda"),
+                make_resource("Topic", "aws.sns"),
+                make_resource("HandlerA", "aws.lambda"),
+                make_resource("HandlerB", "aws.lambda"),
+            ],
+            connections: vec![
+                // Lambda → SNS (DataFlow)
+                Connection {
+                    source: LogicalId::new("Publisher"),
+                    target: LogicalId::new("Topic"),
+                    connection_type: ConnectionType::DataFlow,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                // Topic has 2 Notification subscribers
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerA"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerB"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+
+        // DataFlow binding: Topic_deliveries = Publisher_requests × factor × N
+        let deliveries_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Topic").var("deliveries"))
+            .expect("Topic_deliveries binding should exist");
+
+        let lambda_rate = 1_000.0_f64;
+        let params = params_from(&[("Publisher_requests", lambda_rate)]);
+        let deliveries =
+            yevice_core::evaluate::evaluate(&deliveries_binding.expr, &params).unwrap();
+        // factor=1.0, N=2 → deliveries = 1000 × 2 = 2000
+        assert_eq!(
+            deliveries,
+            lambda_rate * 2.0,
+            "Topic_deliveries must be lambda_rate × N (N=2), got {deliveries}"
+        );
+
+        // End-to-end: each SNS→subscriber binding gets deliveries / N = lambda_rate
+        let handler_a_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("HandlerA").var("requests"))
+            .expect("HandlerA_requests binding should exist");
+        let handler_b_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("HandlerB").var("requests"))
+            .expect("HandlerB_requests binding should exist");
+
+        let deliveries_params = params_from(&[("Topic_deliveries", deliveries)]);
+        let result_a =
+            yevice_core::evaluate::evaluate(&handler_a_binding.expr, &deliveries_params).unwrap();
+        let result_b =
+            yevice_core::evaluate::evaluate(&handler_b_binding.expr, &deliveries_params).unwrap();
+        assert_eq!(
+            result_a, lambda_rate,
+            "HandlerA should receive lambda_rate, got {result_a}"
+        );
+        assert_eq!(
+            result_b, lambda_rate,
+            "HandlerB should receive lambda_rate, got {result_b}"
         );
     }
 
