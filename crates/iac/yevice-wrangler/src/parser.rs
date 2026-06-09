@@ -251,6 +251,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
             Provider::Cloudflare,
             &CloudflareWorkerSpec { usage_model },
         ),
+        group: None,
     });
 
     // KV namespaces
@@ -259,6 +260,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
             logical_id: LogicalId::new(format!("{}_kv_{}", worker_name, kv.binding.to_lowercase())),
             resource_type: ResourceType::new("cloudflare_workers_kv_namespace"),
             shell: ResourceShell::new("cloudflare.kv", Provider::Cloudflare, &CloudflareKvSpec {}),
+            group: None,
         });
     }
 
@@ -269,6 +271,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
             logical_id: LogicalId::new(format!("{}_r2_{}", worker_name, bucket.to_lowercase())),
             resource_type: ResourceType::new("cloudflare_r2_bucket"),
             shell: ResourceShell::new("cloudflare.r2", Provider::Cloudflare, &CloudflareR2Spec {}),
+            group: None,
         });
     }
 
@@ -278,6 +281,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
             logical_id: LogicalId::new(format!("{}_d1_{}", worker_name, d1.binding.to_lowercase())),
             resource_type: ResourceType::new("cloudflare_d1_database"),
             shell: ResourceShell::new("cloudflare.d1", Provider::Cloudflare, &CloudflareD1Spec {}),
+            group: None,
         });
     }
 
@@ -298,6 +302,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
                         Provider::Cloudflare,
                         &CloudflareQueueSpec {},
                     ),
+                    group: None,
                 });
             }
         }
@@ -315,6 +320,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
                         Provider::Cloudflare,
                         &CloudflareQueueSpec {},
                     ),
+                    group: None,
                 });
             }
         }
@@ -337,6 +343,7 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
                         Provider::Cloudflare,
                         &CloudflareDurableObjectSpec {},
                     ),
+                    group: None,
                 });
             }
         }

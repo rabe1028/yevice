@@ -44,6 +44,7 @@ pub fn build_architecture(
                 logical_id: LogicalId::new(&logical_id),
                 resource_type: ResourceType::new(&resource.resource_type),
                 shell,
+                group: None,
             }
         })
         .collect();

@@ -115,6 +115,9 @@ pub struct Resource {
     pub logical_id: LogicalId,
     pub resource_type: ResourceType,
     pub shell: ResourceShell,
+    /// Containment parent (VPC / subnet / cluster), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<LogicalId>,
 }
 
 impl Resource {
@@ -191,7 +194,7 @@ impl Architecture {
                     provider: r.shell.provider,
                     service_id: r.shell.service_id.clone(),
                     label: None,
-                    group: None,
+                    group: r.group.clone(),
                 })
                 .collect(),
             connections: self.connections.clone(),
@@ -212,6 +215,7 @@ mod tests {
             logical_id: LogicalId::new(logical_id),
             resource_type: ResourceType::new(resource_type),
             shell,
+            group: None,
         }
     }
 

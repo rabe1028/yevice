@@ -267,6 +267,7 @@ mod tests {
             logical_id: LogicalId::new(logical_id),
             resource_type: ResourceType::new("AWS::Unknown"),
             shell: ResourceShell::new(service_id, Provider::Aws, &serde_json::json!({})),
+            group: None,
         }
     }
 
@@ -281,6 +282,7 @@ mod tests {
             resource_type: ResourceType::new("AWS::Unknown"),
             shell: ResourceShell::new(service_id, Provider::Aws, &serde_json::json!({}))
                 .with_metadata(meta_key, meta_val),
+            group: None,
         }
     }
 

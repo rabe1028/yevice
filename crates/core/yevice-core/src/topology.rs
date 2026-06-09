@@ -58,6 +58,7 @@ mod tests {
             logical_id: LogicalId::new(logical_id),
             resource_type: ResourceType::new(resource_type),
             shell,
+            group: None,
         }
     }
 

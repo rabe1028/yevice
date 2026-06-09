@@ -267,4 +267,92 @@ mod tests {
         assert_eq!(DrawIoRenderer.format_name(), "drawio");
         assert_eq!(JsonRenderer.format_name(), "json");
     }
+
+    // ---- Group / containment rendering ----
+
+    /// Build an [`ArchitectureCost`] where one node is grouped under another.
+    fn make_grouped_cost() -> ArchitectureCost {
+        let vpc_node = TopologyNode {
+            logical_id: LogicalId::new("MyVpc"),
+            resource_type: ResourceType::new("AWS::EC2::VPC"),
+            provider: Provider::Aws,
+            service_id: "other".to_string(),
+            label: None,
+            group: None,
+        };
+        let subnet_node = TopologyNode {
+            logical_id: LogicalId::new("MySubnet"),
+            resource_type: ResourceType::new("AWS::EC2::Subnet"),
+            provider: Provider::Aws,
+            service_id: "other".to_string(),
+            label: None,
+            group: Some(LogicalId::new("MyVpc")),
+        };
+
+        let topology = Topology {
+            nodes: vec![vpc_node, subnet_node],
+            connections: vec![],
+        };
+
+        ArchitectureCost {
+            name: ArchitectureName::new("grouped-arch"),
+            resources: vec![],
+            bindings: vec![],
+            region: Region::new("ap-northeast-1"),
+            topology,
+        }
+    }
+
+    #[test]
+    fn mermaid_grouped_node_produces_subgraph() {
+        let cost = make_grouped_cost();
+        let output = MermaidRenderer.render(&cost).expect("render");
+
+        // A subgraph block keyed by the group logical ID must appear.
+        assert!(
+            output.contains("subgraph MyVpc"),
+            "mermaid output must contain 'subgraph MyVpc'; got:\n{output}"
+        );
+        // The grouped node must appear inside the subgraph block.
+        assert!(
+            output.contains("MySubnet"),
+            "mermaid output must contain MySubnet node; got:\n{output}"
+        );
+        // The subgraph must be closed.
+        assert!(
+            output.contains("    end"),
+            "mermaid output must contain 'end' to close the subgraph; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn drawio_grouped_node_produces_swimlane_container() {
+        let cost = make_grouped_cost();
+        let output = DrawIoRenderer.render(&cost).expect("render");
+
+        // The container cell must use swimlane style.
+        assert!(
+            output.contains("swimlane"),
+            "drawio output must contain a swimlane container; got:\n{output}"
+        );
+        // The grouped node must be parented to the container (not to cell 1).
+        // The container cell id is 2 (first assigned after reserved 0,1).
+        assert!(
+            output.contains("parent=\"2\""),
+            "grouped node must have parent=\"2\" (the container cell); got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn drawio_cell_count_with_group_matches_expected() {
+        let cost = make_grouped_cost();
+        let output = DrawIoRenderer.render(&cost).expect("render");
+
+        // 2 reserved + 1 container + 2 nodes + 0 edges = 5 mxCell elements.
+        let cell_count = output.matches("<mxCell").count();
+        assert_eq!(
+            cell_count, 5,
+            "expected 5 mxCell elements (2 reserved + 1 container + 2 nodes); got {cell_count}"
+        );
+    }
 }

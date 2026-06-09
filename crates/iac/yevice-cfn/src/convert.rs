@@ -43,6 +43,7 @@ pub fn build_architecture(
                 logical_id: LogicalId::new(logical_id),
                 resource_type: ResourceType::new(&cfn.resource_type),
                 shell,
+                group: extract_group(cfn, &template.resources),
             }
         })
         .collect();
@@ -250,6 +251,52 @@ fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
             .and_then(|inner| inner.split('.').next())
             .map(String::from);
     }
+    None
+}
+
+/// Determine the containment parent for a CFn resource.
+///
+/// Checks a prioritized list of single-reference properties and returns the
+/// logical ID of the first one that resolves to a known resource in `resources`.
+///
+/// Priority: `Cluster` → `ClusterName` → `SubnetId` → `VpcId`.
+///
+/// Array/multi-reference properties (e.g. `SubnetIds`) are intentionally skipped
+/// because they cannot unambiguously identify a single parent.
+///
+/// Returns `None` when:
+/// - no matching property is found,
+/// - the resolved logical ID does not exist in `resources` (dangling parent), or
+/// - the resolved logical ID equals the resource's own logical ID (self-reference).
+fn extract_group(
+    cfn: &CfnResource,
+    resources: &HashMap<String, CfnResource>,
+) -> Option<LogicalId> {
+    // Ordered list of single-reference property names to probe.
+    const SINGLE_REF_PROPS: &[&str] = &["Cluster", "ClusterName", "SubnetId", "VpcId"];
+
+    let props = cfn.properties.as_mapping()?;
+
+    for &prop in SINGLE_REF_PROPS {
+        let Some(val) = props.get(YamlValue::String(prop.into())) else {
+            continue;
+        };
+        let Some(s) = val.as_str() else {
+            continue;
+        };
+        let Some(parent_id) = extract_logical_id_from_sentinel(s) else {
+            continue;
+        };
+        // Skip self-references.
+        if parent_id == cfn.logical_id {
+            continue;
+        }
+        // Only accept the parent if it exists in the template.
+        if resources.contains_key(&parent_id) {
+            return Some(LogicalId::new(&parent_id));
+        }
+    }
+
     None
 }
 
@@ -617,5 +664,157 @@ fn yaml_to_json(value: &YamlValue) -> serde_json::Value {
         }
         // Tagged values (unresolved intrinsics) become a string representation
         YamlValue::Tagged(tagged) => serde_json::Value::String(format!("{:?}", tagged.value)),
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    // Build a minimal CfnResource with the given logical_id and a YamlValue mapping for properties.
+    fn cfn_resource(logical_id: &str, properties: YamlValue) -> CfnResource {
+        CfnResource {
+            logical_id: logical_id.to_string(),
+            resource_type: "AWS::Unknown".to_string(),
+            properties,
+            condition: None,
+            depends_on: Vec::new(),
+        }
+    }
+
+    // Build a YamlValue mapping from key-value pairs.
+    fn yaml_map(pairs: &[(&str, &str)]) -> YamlValue {
+        let mut map = serde_yaml_ng::Mapping::new();
+        for &(k, v) in pairs {
+            map.insert(
+                YamlValue::String(k.to_string()),
+                YamlValue::String(v.to_string()),
+            );
+        }
+        YamlValue::Mapping(map)
+    }
+
+    #[test]
+    fn vpc_id_sentinel_resolves_to_vpc_group() {
+        let vpc = cfn_resource("MyVpc", yaml_map(&[]));
+        let subnet = cfn_resource("MySubnet", yaml_map(&[("VpcId", "{{ref:MyVpc}}")]));
+
+        let mut resources = HashMap::new();
+        resources.insert("MyVpc".to_string(), vpc);
+        resources.insert("MySubnet".to_string(), subnet);
+
+        let group = extract_group(&resources["MySubnet"], &resources);
+        assert_eq!(group, Some(LogicalId::new("MyVpc")));
+    }
+
+    #[test]
+    fn subnet_id_sentinel_resolves_to_subnet_group() {
+        let subnet = cfn_resource("MySubnet", yaml_map(&[]));
+        let nat = cfn_resource(
+            "MyNat",
+            yaml_map(&[("SubnetId", "{{ref:MySubnet}}")]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MySubnet".to_string(), subnet);
+        resources.insert("MyNat".to_string(), nat);
+
+        let group = extract_group(&resources["MyNat"], &resources);
+        assert_eq!(group, Some(LogicalId::new("MySubnet")));
+    }
+
+    #[test]
+    fn cluster_sentinel_resolves_to_cluster_group() {
+        let cluster = cfn_resource("MyCluster", yaml_map(&[]));
+        let service = cfn_resource(
+            "MyService",
+            yaml_map(&[("Cluster", "{{ref:MyCluster}}")]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MyCluster".to_string(), cluster);
+        resources.insert("MyService".to_string(), service);
+
+        let group = extract_group(&resources["MyService"], &resources);
+        assert_eq!(group, Some(LogicalId::new("MyCluster")));
+    }
+
+    #[test]
+    fn cluster_takes_priority_over_vpc_id() {
+        // Both Cluster and VpcId present — Cluster wins (higher priority).
+        let cluster = cfn_resource("MyCluster", yaml_map(&[]));
+        let vpc = cfn_resource("MyVpc", yaml_map(&[]));
+        let resource = cfn_resource(
+            "MyResource",
+            yaml_map(&[
+                ("Cluster", "{{ref:MyCluster}}"),
+                ("VpcId", "{{ref:MyVpc}}"),
+            ]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MyCluster".to_string(), cluster);
+        resources.insert("MyVpc".to_string(), vpc);
+        resources.insert("MyResource".to_string(), resource);
+
+        let group = extract_group(&resources["MyResource"], &resources);
+        assert_eq!(group, Some(LogicalId::new("MyCluster")));
+    }
+
+    #[test]
+    fn dangling_parent_yields_no_group() {
+        // SubnetId points to a logical ID not present in resources.
+        let nat = cfn_resource(
+            "MyNat",
+            yaml_map(&[("SubnetId", "{{ref:NonExistentSubnet}}")]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MyNat".to_string(), nat);
+
+        let group = extract_group(&resources["MyNat"], &resources);
+        assert_eq!(group, None);
+    }
+
+    #[test]
+    fn literal_property_value_yields_no_group() {
+        // A plain string (not a sentinel) must not be treated as a logical ID.
+        let nat = cfn_resource(
+            "MyNat",
+            yaml_map(&[("SubnetId", "subnet-12345678")]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MyNat".to_string(), nat);
+
+        let group = extract_group(&resources["MyNat"], &resources);
+        assert_eq!(group, None);
+    }
+
+    #[test]
+    fn no_containment_properties_yields_no_group() {
+        let lambda = cfn_resource("MyFunction", yaml_map(&[("MemorySize", "256")]));
+
+        let mut resources = HashMap::new();
+        resources.insert("MyFunction".to_string(), lambda);
+
+        let group = extract_group(&resources["MyFunction"], &resources);
+        assert_eq!(group, None);
+    }
+
+    #[test]
+    fn getatt_sentinel_resolves_group() {
+        let subnet = cfn_resource("MySubnet", yaml_map(&[]));
+        let instance = cfn_resource(
+            "MyInstance",
+            yaml_map(&[("SubnetId", "{{getatt:MySubnet.SubnetId}}")]),
+        );
+
+        let mut resources = HashMap::new();
+        resources.insert("MySubnet".to_string(), subnet);
+        resources.insert("MyInstance".to_string(), instance);
+
+        let group = extract_group(&resources["MyInstance"], &resources);
+        assert_eq!(group, Some(LogicalId::new("MySubnet")));
     }
 }
