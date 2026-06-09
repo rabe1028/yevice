@@ -384,8 +384,8 @@ mod tests {
             Expr::constant(5.0),
         ]);
         // numerator: 2x + 4
-        let numer = Expr::linear(2.0, Expr::variable("x"), 4.0);
-        let expr = Expr::div(numer, denom);
+        let numerator = Expr::linear(2.0, Expr::variable("x"), 4.0);
+        let expr = Expr::div(numerator, denom);
         let lf = expr
             .as_linear()
             .expect("(2x+4)/(0*y+5) must be linear: denominator is effectively constant 5");
