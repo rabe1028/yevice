@@ -179,9 +179,16 @@ fn substitute_variables(
                 result.push_str(val);
             } else if let Some(val) = ctx.parameters.get(&var_name) {
                 result.push_str(val);
-            } else {
+            } else if var_name.starts_with("AWS::") {
+                // Pseudo-parameter (e.g. AWS::Region) — leave verbatim
                 use std::fmt::Write;
                 let _ = write!(result, "${{{var_name}}}");
+            } else if let Some((logical, attr)) = var_name.split_once('.') {
+                // Resource attribute reference: ${Resource.Attr} → GetAtt sentinel
+                result.push_str(&sentinel::make_getatt(logical, attr));
+            } else {
+                // Bare resource reference: ${Resource} → Ref sentinel
+                result.push_str(&sentinel::make_ref(&var_name));
             }
         } else {
             result.push(c);
@@ -492,6 +499,72 @@ mod tests {
             result,
             Value::String("{{getatt:MyResource.SomeNested.Attr}}".into()),
             "3-element sequence must join tail with '.' via make_getatt"
+        );
+    }
+
+    // --- Sub sentinel-isation (#1) ---
+
+    /// `!Sub '${Fn.Arn}'` (bare resource.attr) must produce a getatt sentinel,
+    /// not the literal `${{HandlerFunction.Arn}}`.
+    #[test]
+    fn test_sub_resource_attr_becomes_getatt_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("${HandlerFunction.Arn}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{getatt:HandlerFunction.Arn}}".into()),
+            "!Sub '${{Resource.Attr}}' must produce a getatt sentinel"
+        );
+    }
+
+    /// `!Sub '${MyQueue}'` (bare resource ref, not in parameters) must produce
+    /// a ref sentinel, not the literal `${{MyQueue}}`.
+    #[test]
+    fn test_sub_resource_ref_becomes_ref_sentinel() {
+        let ctx = make_ctx();
+        // "MyQueue" is not a parameter in make_ctx(), so it must sentinel-ise.
+        let val = Value::String("${MyQueue}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{ref:MyQueue}}".into()),
+            "!Sub '${{Resource}}' must produce a ref sentinel"
+        );
+    }
+
+    /// `!Sub '${AWS::Region}'` must remain verbatim — pseudo-parameters are
+    /// never sentinel-ised.
+    #[test]
+    fn test_sub_pseudo_parameter_stays_verbatim() {
+        let ctx = make_ctx();
+        let val = Value::String("${AWS::Region}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("${AWS::Region}".into()),
+            "!Sub '${{AWS::Region}}' must remain verbatim (no sentinel)"
+        );
+    }
+
+    /// An embedded `!Sub` such as `'arn:...:${MyQueue}/p'` puts the sentinel
+    /// inside a longer string. The whole result is still a single string (not a
+    /// standalone sentinel), which is expected — edge extraction requires a
+    /// whole-string sentinel.
+    #[test]
+    fn test_sub_embedded_resource_ref_is_not_standalone_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("arn:aws:sqs:us-east-1:123456789012:${MyQueue}/suffix".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        let s = result.as_str().unwrap();
+        // The sentinel is embedded, not the whole string.
+        assert!(
+            s.contains("{{ref:MyQueue}}"),
+            "embedded ref should contain the sentinel: {s}"
+        );
+        assert_ne!(
+            s, "{{ref:MyQueue}}",
+            "embedded ref must NOT be a standalone sentinel"
         );
     }
 }

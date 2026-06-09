@@ -26,7 +26,7 @@ fn source_rate_var(
         Some("aws.lambda") => Some((id.var("requests"), "Lambda")),
         Some("aws.s3") => Some((id.var("put_requests"), "S3")),
         Some("aws.eventbridge_rule") => Some((id.var("events"), "EventBridge")),
-        Some("aws.sns") => Some((id.var("published_messages"), "SNS")),
+        Some("aws.sns") => Some((id.var("deliveries"), "SNS")),
         _ => match hint {
             Some("sqs") => Some((id.var("requests"), "SQS")),
             Some("kinesis") => Some((id.var("put_records"), "Kinesis")),
@@ -34,7 +34,7 @@ fn source_rate_var(
             Some("lambda") => Some((id.var("requests"), "Lambda")),
             Some("s3") => Some((id.var("put_requests"), "S3")),
             Some("eventbridge_rule") => Some((id.var("events"), "EventBridge")),
-            Some("sns") => Some((id.var("published_messages"), "SNS")),
+            Some("sns") => Some((id.var("deliveries"), "SNS")),
             _ => None,
         },
     }
@@ -741,7 +741,7 @@ mod tests {
             bindings[0].target,
             LogicalId::new("Handler").var("requests")
         );
-        let params = params_from(&[("Topic_published_messages", 400.0)]);
+        let params = params_from(&[("Topic_deliveries", 400.0)]);
         let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
         assert_eq!(result, 400.0);
     }
@@ -769,7 +769,7 @@ mod tests {
         let bindings = derive_bindings(&arch, &all_rules());
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
-        let params = params_from(&[("Topic_published_messages", 100.0)]);
+        let params = params_from(&[("Topic_deliveries", 100.0)]);
         let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
         assert_eq!(result, 300.0);
     }
