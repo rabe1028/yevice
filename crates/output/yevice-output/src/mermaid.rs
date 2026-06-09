@@ -34,42 +34,31 @@ impl ArchitectureRenderer for MermaidRenderer {
 
         // Build a deterministic ID → sanitized Mermaid ID map.
         // If two distinct logical IDs sanitize to the same string, append
-        // `_2`, `_3`, … (in topology.nodes order) to make them unique.
+        // `_2`, `_3`, … (in topology.nodes order) to make them globally unique.
         // Nodes whose sanitized form is already unique get no suffix.
+        //
+        // The global `used` HashSet guarantees full uniqueness even when a
+        // candidate like `my_resource_2` is itself a pre-existing sanitized ID.
         let id_map: HashMap<&LogicalId, String> = {
-            // First pass: collect raw sanitized IDs in order.
-            let raw: Vec<(&LogicalId, String)> = topology
-                .nodes
-                .iter()
-                .map(|n| (&n.logical_id, sanitize_id(n.logical_id.as_str())))
-                .collect();
-
-            // Count how many times each raw sanitized ID appears.
-            let mut occurrence_count: HashMap<&str, usize> = HashMap::new();
-            for (_, raw_id) in &raw {
-                *occurrence_count.entry(raw_id.as_str()).or_insert(0) += 1;
-            }
-
-            // Second pass: assign unique IDs.
-            // For IDs that appear more than once, maintain a per-base counter
-            // so the second occurrence gets `_2`, the third `_3`, etc.
-            let mut assigned_counter: HashMap<String, usize> = HashMap::new();
+            let mut used: HashSet<String> = HashSet::new();
             let mut result: HashMap<&LogicalId, String> = HashMap::new();
-            for (lid, raw_id) in &raw {
-                if occurrence_count[raw_id.as_str()] == 1 {
+
+            for node in &topology.nodes {
+                let raw_id = sanitize_id(node.logical_id.as_str());
+                if used.insert(raw_id.clone()) {
                     // No collision — use as-is.
-                    result.insert(lid, raw_id.clone());
+                    result.insert(&node.logical_id, raw_id);
                 } else {
-                    // Collision — append counter starting from 1; first gets no
-                    // suffix, subsequent ones get `_2`, `_3`, …
-                    let cnt = assigned_counter.entry(raw_id.clone()).or_insert(0);
-                    *cnt += 1;
-                    let unique_id = if *cnt == 1 {
-                        raw_id.clone()
-                    } else {
-                        format!("{raw_id}_{cnt}")
-                    };
-                    result.insert(lid, unique_id);
+                    // Collision — find the first suffix >= 2 not yet taken.
+                    let mut counter: usize = 2;
+                    loop {
+                        let candidate = format!("{raw_id}_{counter}");
+                        if used.insert(candidate.clone()) {
+                            result.insert(&node.logical_id, candidate);
+                            break;
+                        }
+                        counter += 1;
+                    }
                 }
             }
             result
@@ -352,6 +341,73 @@ mod tests {
         assert!(
             output.contains("NodeB["),
             "NodeB must appear in output despite cycle: {output}"
+        );
+    }
+
+    /// Three nodes: `my-resource` (→ `my_resource`), `my_resource` (collision
+    /// → `my_resource_2`), and the pre-existing `my_resource_2` (would collide
+    /// with the suffix — must get `my_resource_3` via the global used-set).
+    #[test]
+    fn triple_collision_all_ids_globally_unique() {
+        let node_a = make_leaf_node("my-resource"); // sanitizes to my_resource
+        let node_b = make_leaf_node("my_resource"); // also my_resource → my_resource_2
+        let node_c = make_leaf_node("my_resource_2"); // already my_resource_2 → must NOT collide
+
+        let conn_ab = Connection {
+            source: LogicalId::new("my-resource"),
+            target: LogicalId::new("my_resource"),
+            connection_type: ConnectionType::DataFlow,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+        let conn_bc = Connection {
+            source: LogicalId::new("my_resource"),
+            target: LogicalId::new("my_resource_2"),
+            connection_type: ConnectionType::Invocation,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+
+        let topology = Topology {
+            nodes: vec![node_a, node_b, node_c],
+            connections: vec![conn_ab, conn_bc],
+        };
+        let cost = minimal_cost(topology);
+        let output = MermaidRenderer.render(&cost).unwrap();
+
+        // Collect all node IDs that appear as `ID[` in the output.
+        let node_ids: Vec<&str> = output
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                trimmed.find('[').map(|pos| &trimmed[..pos])
+            })
+            .filter(|id| id.starts_with("my_resource"))
+            .collect();
+
+        // All three must be distinct.
+        let mut dedup = node_ids.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            3,
+            "all three nodes must have distinct mermaid IDs; got: {node_ids:?}\noutput:\n{output}"
+        );
+
+        // Edges must be correctly wired (each endpoint exists in the output).
+        // The DataFlow edge connects node_a (my_resource) and node_b (my_resource_2).
+        assert!(
+            output.contains("-->|DataFlow|"),
+            "DataFlow edge must appear in output: {output}"
+        );
+        assert!(
+            output.contains("-->|Invocation|"),
+            "Invocation edge must appear in output: {output}"
         );
     }
 

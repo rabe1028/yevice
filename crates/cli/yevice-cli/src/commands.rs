@@ -214,6 +214,10 @@ pub fn sensitivity(
     steps: usize,
     breakdown: bool,
 ) -> Result<()> {
+    if steps == 0 {
+        bail!("--steps must be at least 1");
+    }
+
     let arch = load_cost_model(cost_model_path)?;
     let base_params = load_params(params_path)?;
 
@@ -1779,5 +1783,53 @@ mod tests {
         // is recognised as having GCP present.
         let _resolver = build_pricing_resolver(&arch, default_region, &provider_regions, false);
         assert!(arch.has_provider(Provider::Gcp));
+    }
+
+    // --- #8 sensitivity steps=0 guard ---
+
+    /// `sensitivity` with `steps=0` must return an error before computing
+    /// `step_size`, not silently produce NaN output.
+    #[test]
+    fn sensitivity_steps_zero_returns_error() {
+        use std::fs;
+        let dir = temp_dir("sensitivity-zero-steps");
+
+        // Minimal cost model with one constant resource so evaluate succeeds.
+        let cost_model = serde_json::json!({
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        // Minimal params file.
+        let params_path = dir.join("params.yaml");
+        fs::write(&params_path, "").unwrap();
+
+        let err = super::sensitivity(
+            cost_model_path.to_str().unwrap(),
+            params_path.to_str().unwrap(),
+            "SomeVar",
+            0.0,
+            1000.0,
+            0, // steps = 0 must be rejected
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--steps") || msg.contains("steps"),
+            "error must mention '--steps'; got: {msg}"
+        );
+        assert!(
+            msg.contains('1') || msg.contains("at least"),
+            "error must say at least 1; got: {msg}"
+        );
     }
 }

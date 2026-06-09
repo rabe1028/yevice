@@ -128,7 +128,11 @@ impl Expr {
             } => {
                 let d = denominator.as_linear()?;
                 // Division by a variable-containing expression is non-linear.
-                if !d.coefficients.is_empty() {
+                // A "variable-containing" denominator has at least one non-zero
+                // coefficient.  A map like {y: 0.0} has all-zero coefficients
+                // and is effectively a constant — same logic as Product.
+                let has_nonzero = d.coefficients.values().any(|&c| c != 0.0);
+                if has_nonzero {
                     return None;
                 }
                 // Division by zero is non-linear (undefined).
@@ -363,6 +367,38 @@ mod tests {
         let y_coeff = lf.coefficients.get(&var("y")).copied().unwrap_or(0.0);
         assert_eq!(y_coeff, 5.0, "(0*x + 5) * y should give y coefficient 5");
         assert_eq!(lf.constant, 0.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — Div with zero-coefficient denominator (#4 fix)
+    // -------------------------------------------------------------------------
+
+    /// `(2x+4) / (0*y + 5)` — the denominator `0*y + 5` has coefficient y=0.0
+    /// and constant 5.  It must be treated as the constant 5 (not non-linear),
+    /// giving LinearForm {x: 0.4, constant: 0.8}.
+    #[test]
+    fn as_linear_div_by_zero_coeff_plus_constant_is_linear() {
+        // denominator: 0*y + 5
+        let denom = Expr::sum(vec![
+            Expr::linear(0.0, Expr::variable("y"), 0.0),
+            Expr::constant(5.0),
+        ]);
+        // numerator: 2x + 4
+        let numer = Expr::linear(2.0, Expr::variable("x"), 4.0);
+        let expr = Expr::div(numer, denom);
+        let lf = expr
+            .as_linear()
+            .expect("(2x+4)/(0*y+5) must be linear: denominator is effectively constant 5");
+        assert!(
+            (lf.coefficients[&var("x")] - 0.4).abs() < 1e-12,
+            "x coefficient should be 0.4, got {:?}",
+            lf.coefficients[&var("x")]
+        );
+        assert!(
+            (lf.constant - 0.8).abs() < 1e-12,
+            "constant should be 0.8, got {}",
+            lf.constant
+        );
     }
 
     // -------------------------------------------------------------------------

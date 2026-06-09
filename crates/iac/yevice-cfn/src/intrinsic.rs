@@ -137,10 +137,14 @@ fn resolve_sub(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
                 Value::Mapping(m) => {
                     let mut map = HashMap::new();
                     for (k, v) in m {
-                        if let (Value::String(key), resolved) = (k, resolve(v, ctx)?)
-                            && let Some(s) = resolved.as_str()
-                        {
-                            map.insert(key.clone(), s.to_string());
+                        if let Value::String(key) = k {
+                            let resolved = resolve(v, ctx)?;
+                            // If the resolved value is a string, use it; otherwise
+                            // insert an empty string so that ${Key} is replaced with
+                            // "" rather than being left as a bare variable name that
+                            // would fall through to the resource-ref sentinel path.
+                            let s = resolved.as_str().map_or_else(String::new, str::to_string);
+                            map.insert(key.clone(), s);
                         }
                     }
                     map
@@ -322,6 +326,7 @@ fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> 
         .filter_map(|v| match v {
             Value::String(s) => Some(s.clone()),
             Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
             _ => None,
         })
         .collect();
@@ -616,5 +621,96 @@ mod tests {
             Value::String("{{ref:MyQueue}}-${NotAVar}".into()),
             "resource ref must sentinel-ise while escaped var stays literal"
         );
+    }
+
+    // --- resolve_join Bool support (#5) ---
+
+    /// `!Join` with a Bool element must include it in the result string.
+    #[test]
+    fn test_join_includes_bool_elements() {
+        let ctx = make_ctx();
+        // Join [":", [true, "suffix"]]  →  "true:suffix"
+        let val = Value::Sequence(vec![
+            Value::String(":".into()),
+            Value::Sequence(vec![
+                Value::Bool(true),
+                Value::String("suffix".into()),
+                Value::Bool(false),
+            ]),
+        ]);
+        let result = resolve_join(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("true:suffix:false".into()),
+            "Bool elements must be included in !Join result"
+        );
+    }
+
+    /// `!Join` with only a Bool element must not produce an empty string.
+    #[test]
+    fn test_join_bool_only_element() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String(String::new()),
+            Value::Sequence(vec![Value::Bool(false)]),
+        ]);
+        let result = resolve_join(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("false".into()),
+            "single Bool element must not be silently dropped"
+        );
+    }
+
+    // --- resolve_sub 2-arg non-string local var (#6) ---
+
+    /// 2-arg `!Sub` where a local var resolves to a non-string (e.g. Number)
+    /// must substitute the key with empty string, NOT produce a `{{ref:Key}}`
+    /// sentinel.
+    #[test]
+    fn test_sub_two_arg_non_string_local_var_becomes_empty_not_sentinel() {
+        let ctx = make_ctx();
+        // Template: "${NumVar}-suffix"
+        // vars mapping: NumVar -> !Ref InstanceType resolves to "t3.micro" (a string).
+        // But we want to test a Number value: use a Number literal in the mapping.
+        let val = Value::Sequence(vec![
+            Value::String("prefix-${NumVar}-suffix".into()),
+            Value::Mapping({
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(
+                    Value::String("NumVar".into()),
+                    Value::Number(serde_yaml_ng::value::Number::from(42_i64)),
+                );
+                m
+            }),
+        ]);
+        let result = resolve_sub(&val, &ctx).unwrap();
+        let s = result.as_str().unwrap();
+        // NumVar resolves to a Number, which is not a string — must be inserted
+        // as empty string, producing "prefix--suffix", NOT "prefix-{{ref:NumVar}}-suffix".
+        assert!(
+            !s.contains("{{ref:NumVar}}"),
+            "non-string local var must not produce a ref sentinel: {s}"
+        );
+        assert_eq!(
+            s, "prefix--suffix",
+            "non-string local var must become empty: {s}"
+        );
+    }
+
+    /// 2-arg `!Sub` where a local var resolves to a string must still work normally.
+    #[test]
+    fn test_sub_two_arg_string_local_var_substituted_correctly() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("hello-${Name}".into()),
+            Value::Mapping({
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(Value::String("Name".into()), Value::String("world".into()));
+                m
+            }),
+        ]);
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(result, Value::String("hello-world".into()));
     }
 }

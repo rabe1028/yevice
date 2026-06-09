@@ -61,11 +61,11 @@ pub struct EnumerationSolver;
 
 impl Solver for EnumerationSolver {
     fn solve(&self, problem: &OptimizationProblem) -> Result<Solution, SolverError> {
-        // Guard against combinatorial explosion.
-        let combination_count = combination_count(problem)?;
-
         // Guard: if any decision variable has an empty domain, no assignment
         // can ever be constructed — immediately return infeasible.
+        // This check must come before combination_count so that a problem
+        // with a huge leading domain followed by an empty domain returns
+        // infeasible rather than TooManyCombinations.
         if problem
             .decision_variables
             .iter()
@@ -77,6 +77,9 @@ impl Solver for EnumerationSolver {
                 feasible: false,
             });
         }
+
+        // Guard against combinatorial explosion.
+        let combination_count = combination_count(problem)?;
 
         if combination_count == 0 {
             // No decision variables: treat as a single empty combination.
@@ -557,6 +560,46 @@ mod tests {
         let sol = EnumerationSolver.solve(&problem).unwrap();
         assert!(sol.feasible, "expected feasible: binding must be resolved");
         assert_eq!(sol.objective_value, 10.0);
+    }
+
+    /// Huge leading domain (exceeds MAX_COMBINATIONS alone) followed by an
+    /// empty-domain variable must return infeasible, not TooManyCombinations.
+    ///
+    /// This validates that the empty-domain guard runs before combination_count.
+    #[test]
+    fn huge_leading_domain_plus_empty_domain_is_infeasible() {
+        // First variable: domain size 10^101 (would exceed MAX_COMBINATIONS alone).
+        let huge_dvs: Vec<DecisionVariable> = (0..101_u32)
+            .map(|i| {
+                dv(
+                    &format!("x{i}"),
+                    vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                )
+            })
+            .collect();
+        // Append a final variable with an empty domain.
+        let mut dvs = huge_dvs;
+        dvs.push(dv("empty_var", vec![]));
+
+        let problem = problem_with(
+            Expr::constant(0.0),
+            ObjectiveDirection::Minimize,
+            dvs,
+            vec![],
+            HashMap::new(),
+        );
+
+        let result = EnumerationSolver.solve(&problem);
+        assert!(
+            matches!(
+                result,
+                Ok(Solution {
+                    feasible: false,
+                    ..
+                })
+            ),
+            "expected infeasible (empty domain), got {result:?}"
+        );
     }
 
     /// Binding where the source is a decision variable.

@@ -12,8 +12,15 @@ use crate::types::VariableName;
 /// derivable targets.
 ///
 /// A target is derivable when every variable in `b.expr.variables()` is either:
-/// - a `required_variable` of some resource in the architecture, **or**
+/// - a modeled variable that is **not itself a binding target** (i.e. a
+///   genuine user-supplied seed), **or**
 /// - itself already derivable (fixed-point closure).
+///
+/// Using `modeled_vars − binding_targets` as the seed set ensures that
+/// **circular bindings** (e.g. A_requests = B_requests and B_requests =
+/// A_requests, where both are modeled) are treated correctly: neither side
+/// qualifies as a derivable seed, so both remain in the schema and the user
+/// can supply one to break the cycle.
 ///
 /// Binding targets that depend on external (unmodeled) sources are *not*
 /// derivable and must remain in the schema so the user can supply them.
@@ -26,7 +33,18 @@ fn compute_derivable_targets(arch: &ArchitectureCost) -> HashSet<VariableName> {
         .flat_map(|r| r.required_variables.iter().map(|v| &v.name))
         .collect();
 
-    // Step 2: fixed-point iteration.
+    // Step 2: collect all binding target names.
+    let binding_targets: HashSet<&VariableName> = arch.bindings.iter().map(|b| &b.target).collect();
+
+    // Step 3: the base "already known" seed set is modeled vars that are NOT
+    // themselves binding targets.  Binding targets are derived values, not
+    // user-supplied seeds; including them in the seed would incorrectly mark
+    // circularly-bound variables as derivable.
+    let seeds: HashSet<&VariableName> =
+        modeled_vars.difference(&binding_targets).copied().collect();
+
+    // Step 4: fixed-point iteration — a binding target is derivable when all
+    // variables it references are either seeds or already derivable.
     let mut derivable: HashSet<VariableName> = HashSet::new();
     loop {
         let prev_len = derivable.len();
@@ -34,13 +52,11 @@ fn compute_derivable_targets(arch: &ArchitectureCost) -> HashSet<VariableName> {
             if derivable.contains(&b.target) {
                 continue;
             }
-            // A binding is derivable when all variables it references are
-            // either modeled or already in the derivable set.
             let all_known = b
                 .expr
                 .variables()
                 .iter()
-                .all(|v| modeled_vars.contains(v) || derivable.contains(v));
+                .all(|v| seeds.contains(v) || derivable.contains(v));
             if all_known {
                 derivable.insert(b.target.clone());
             }
@@ -482,6 +498,152 @@ mod tests {
                 .properties
                 .contains_key("requests"),
             "non-derivable binding target 'requests' must remain in schema"
+        );
+    }
+
+    /// Circular bindings: A_requests = B_requests and B_requests = A_requests,
+    /// both variables are modeled.  Neither is derivable (the cycle has no
+    /// external seed), so both must remain in the schema so the user can
+    /// supply one to break the cycle.
+    #[test]
+    fn schema_keeps_both_vars_in_circular_binding() {
+        let fn_a = LogicalId::new("FnA");
+        let fn_b = LogicalId::new("FnB");
+
+        let resource_a = ResourceCost {
+            logical_id: fn_a.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "Function A".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &fn_a,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+        let resource_b = ResourceCost {
+            logical_id: fn_b.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "Function B".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &fn_b,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+
+        // Circular: FnA_requests = FnB_requests, FnB_requests = FnA_requests.
+        let binding_a = VariableBinding {
+            target: fn_a.var("requests"),
+            expr: Expr::variable(fn_b.var("requests")),
+            description: "A <- B".to_string(),
+            source: "circular".to_string(),
+        };
+        let binding_b = VariableBinding {
+            target: fn_b.var("requests"),
+            expr: Expr::variable(fn_a.var("requests")),
+            description: "B <- A".to_string(),
+            source: "circular".to_string(),
+        };
+
+        let arch = ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![resource_a, resource_b],
+            bindings: vec![binding_a, binding_b],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        };
+
+        let schema = generate_usage_schema(&arch);
+
+        // Both resources must appear because neither target is derivable
+        // (the cycle has no seed).
+        assert!(
+            schema.properties.contains_key("FnA"),
+            "FnA must appear in schema for circular binding"
+        );
+        assert!(
+            schema.properties.contains_key("FnB"),
+            "FnB must appear in schema for circular binding"
+        );
+        assert!(
+            schema.properties["FnA"].properties.contains_key("requests"),
+            "FnA.requests must remain in schema (circular, not derivable)"
+        );
+        assert!(
+            schema.properties["FnB"].properties.contains_key("requests"),
+            "FnB.requests must remain in schema (circular, not derivable)"
+        );
+    }
+
+    /// Template counterpart of the circular binding test.
+    #[test]
+    fn template_keeps_both_vars_in_circular_binding() {
+        let fn_a = LogicalId::new("FnA");
+        let fn_b = LogicalId::new("FnB");
+
+        let resource_a = ResourceCost {
+            logical_id: fn_a.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "Function A".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &fn_a,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+        let resource_b = ResourceCost {
+            logical_id: fn_b.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "Function B".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &fn_b,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+
+        let binding_a = VariableBinding {
+            target: fn_a.var("requests"),
+            expr: Expr::variable(fn_b.var("requests")),
+            description: "A <- B".to_string(),
+            source: "circular".to_string(),
+        };
+        let binding_b = VariableBinding {
+            target: fn_b.var("requests"),
+            expr: Expr::variable(fn_a.var("requests")),
+            description: "B <- A".to_string(),
+            source: "circular".to_string(),
+        };
+
+        let arch = ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![resource_a, resource_b],
+            bindings: vec![binding_a, binding_b],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        };
+
+        let template = generate_usage_template(&arch);
+
+        assert!(
+            template.contains("FnA:"),
+            "FnA section must appear in template for circular binding"
+        );
+        assert!(
+            template.contains("FnB:"),
+            "FnB section must appear in template for circular binding"
         );
     }
 

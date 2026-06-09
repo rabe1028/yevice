@@ -164,7 +164,9 @@ fn extract_event_source_connection(
 fn extract_function_logical_id(props: &serde_yaml_ng::Mapping) -> Option<String> {
     let fn_name = props.get(YamlValue::String("FunctionName".into()))?;
     let s = fn_name.as_str()?;
-    if let Some(cfn_ref) = sentinel::parse(s) {
+    // Whole-string sentinel first, then embedded (e.g. Fn::Sub ARN like
+    // "arn:...:function:{{ref:MyFn}}").
+    if let Some(cfn_ref) = sentinel::parse(s).or_else(|| sentinel::find_embedded(s)) {
         return Some(cfn_ref.logical_id);
     }
     Some(s.to_string())
@@ -178,7 +180,8 @@ fn extract_source_logical_id(
 
     if let Some(s) = source_arn.as_str() {
         // Resolved sentinel: "{{ref:X}}" or "{{getatt:X.Attr}}"
-        if let Some(cfn_ref) = sentinel::parse(s) {
+        // Also handles embedded sentinels from Fn::Sub ARNs.
+        if let Some(cfn_ref) = sentinel::parse(s).or_else(|| sentinel::find_embedded(s)) {
             let source_type = detect_source_type(&cfn_ref.logical_id, resources)?;
             return Some((cfn_ref.logical_id, source_type));
         }
@@ -422,6 +425,16 @@ fn extract_sns_topic_subscription_connections(
 
     for sub in subs {
         if let Some(m) = sub.as_mapping() {
+            // Only emit edges for runtime protocols that invoke a Lambda or SQS
+            // resource.  Non-runtime protocols (https, email, sms, http,
+            // application, …) do not model a cost-graph edge.
+            let protocol = m
+                .get(YamlValue::String("Protocol".into()))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !matches!(protocol, "lambda" | "sqs") {
+                continue;
+            }
             let endpoint = m.get(YamlValue::String("Endpoint".into()));
             if let Some(v) = endpoint
                 && let Some(s) = v.as_str()
@@ -445,6 +458,17 @@ fn extract_sns_topic_subscription_connections(
 
 fn extract_sns_subscription_resource_connection(cfn: &CfnResource) -> Option<Connection> {
     let props = cfn.properties.as_mapping()?;
+
+    // Only emit edges for runtime protocols (lambda / sqs).  Non-runtime
+    // protocols (https, email, sms, http, application, …) are not wired into
+    // the cost model.
+    let protocol = props
+        .get(YamlValue::String("Protocol".into()))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !matches!(protocol, "lambda" | "sqs") {
+        return None;
+    }
 
     let topic_arn = props.get(YamlValue::String("TopicArn".into()))?;
     let source_id = topic_arn
@@ -1233,6 +1257,214 @@ mod connection_tests {
             conns.is_empty(),
             "expected no edge for SAM S3 with dangling bucket; connections = {conns:?}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SNS subscription protocol gating tests (CFN)
+    // -----------------------------------------------------------------------
+
+    /// Inline subscription with `Protocol: lambda` must produce a Notification edge.
+    #[test]
+    fn sns_topic_subscription_lambda_protocol_produces_edge() {
+        let lambda = cfn_resource_typed(
+            "MyFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+        let sub_item = yaml_map_values(vec![
+            ("Protocol", yaml_str("lambda")),
+            ("Endpoint", yaml_str("{{ref:MyFunction}}")),
+        ]);
+        let topic_props = yaml_map_values(vec![("Subscription", yaml_seq(vec![sub_item]))]);
+        let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", topic_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyFunction".to_string(), lambda);
+        resources.insert("MyTopic".to_string(), topic);
+
+        let conns = build_connections(&resources);
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected one Notification edge for lambda protocol; connections = {conns:?}"
+        );
+        assert_eq!(conns[0].source.as_str(), "MyTopic");
+        assert_eq!(conns[0].target.as_str(), "MyFunction");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::Notification
+        ));
+    }
+
+    /// Inline subscription with `Protocol: https` must NOT produce any edge.
+    #[test]
+    fn sns_topic_subscription_https_protocol_produces_no_edge() {
+        let topic_props = yaml_map_values(vec![(
+            "Subscription",
+            yaml_seq(vec![yaml_map_values(vec![
+                ("Protocol", yaml_str("https")),
+                (
+                    "Endpoint",
+                    yaml_str(
+                        "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:{{ref:MyFn}}",
+                    ),
+                ),
+            ])]),
+        )]);
+        let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", topic_props);
+        let lambda = cfn_resource_typed("MyFn", "AWS::Lambda::Function", yaml_map_values(vec![]));
+
+        let mut resources = HashMap::new();
+        resources.insert("MyTopic".to_string(), topic);
+        resources.insert("MyFn".to_string(), lambda);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for https protocol; connections = {conns:?}"
+        );
+    }
+
+    /// `AWS::SNS::Subscription` resource with `Protocol: lambda` must produce
+    /// a Notification edge.
+    #[test]
+    fn sns_subscription_resource_lambda_protocol_produces_edge() {
+        let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", yaml_map_values(vec![]));
+        let lambda = cfn_resource_typed(
+            "MyFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+        let sub_props = yaml_map_values(vec![
+            ("TopicArn", yaml_str("{{ref:MyTopic}}")),
+            ("Protocol", yaml_str("lambda")),
+            ("Endpoint", yaml_str("{{ref:MyFunction}}")),
+        ]);
+        let sub = cfn_resource_typed("MySub", "AWS::SNS::Subscription", sub_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyTopic".to_string(), topic);
+        resources.insert("MyFunction".to_string(), lambda);
+        resources.insert("MySub".to_string(), sub);
+
+        let conns = build_connections(&resources);
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected one Notification edge for lambda protocol; connections = {conns:?}"
+        );
+        assert_eq!(conns[0].source.as_str(), "MyTopic");
+        assert_eq!(conns[0].target.as_str(), "MyFunction");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::Notification
+        ));
+    }
+
+    /// `AWS::SNS::Subscription` resource with `Protocol: https` must NOT
+    /// produce any edge, even if `Endpoint` contains an embedded sentinel.
+    #[test]
+    fn sns_subscription_resource_https_protocol_produces_no_edge() {
+        let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", yaml_map_values(vec![]));
+        let lambda = cfn_resource_typed(
+            "MyFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+        let embedded_endpoint =
+            "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:{{ref:MyFunction}}";
+        let sub_props = yaml_map_values(vec![
+            ("TopicArn", yaml_str("{{ref:MyTopic}}")),
+            ("Protocol", yaml_str("https")),
+            ("Endpoint", yaml_str(embedded_endpoint)),
+        ]);
+        let sub = cfn_resource_typed("MySub", "AWS::SNS::Subscription", sub_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyTopic".to_string(), topic);
+        resources.insert("MyFunction".to_string(), lambda);
+        resources.insert("MySub".to_string(), sub);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for https protocol; connections = {conns:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ESM FunctionName embedded sentinel tests
+    // -----------------------------------------------------------------------
+
+    /// ESM with `FunctionName` given as a `Fn::Sub`-style ARN containing an
+    /// embedded sentinel must produce an EventSource edge to the Lambda.
+    ///
+    /// Simulates:
+    ///   FunctionName: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${MyFn}'
+    /// After resolution: pseudo-params are left verbatim; resource refs become sentinels.
+    #[test]
+    fn esm_function_name_embedded_sentinel_produces_edge() {
+        let queue = cfn_resource_typed("MyQueue", "AWS::SQS::Queue", yaml_map_values(vec![]));
+        let lambda = cfn_resource_typed("MyFn", "AWS::Lambda::Function", yaml_map_values(vec![]));
+
+        let embedded_fn_name =
+            "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:{{ref:MyFn}}";
+        let esm_props = yaml_map_values(vec![
+            ("FunctionName", yaml_str(embedded_fn_name)),
+            ("EventSourceArn", yaml_str("{{ref:MyQueue}}")),
+        ]);
+        let esm = cfn_resource_typed("MyESM", "AWS::Lambda::EventSourceMapping", esm_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyQueue".to_string(), queue);
+        resources.insert("MyFn".to_string(), lambda);
+        resources.insert("MyESM".to_string(), esm);
+
+        let conns = build_connections(&resources);
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected one EventSource edge; connections = {conns:?}"
+        );
+        assert_eq!(conns[0].source.as_str(), "MyQueue");
+        assert_eq!(conns[0].target.as_str(), "MyFn");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::EventSource
+        ));
+    }
+
+    /// ESM with `EventSourceArn` as an embedded Fn::Sub ARN sentinel must
+    /// produce an EventSource edge from the SQS queue to the Lambda.
+    #[test]
+    fn esm_event_source_arn_embedded_sentinel_produces_edge() {
+        let queue = cfn_resource_typed("MyQueue", "AWS::SQS::Queue", yaml_map_values(vec![]));
+        let lambda = cfn_resource_typed("MyFn", "AWS::Lambda::Function", yaml_map_values(vec![]));
+
+        let embedded_source_arn = "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:{{ref:MyQueue}}";
+        let esm_props = yaml_map_values(vec![
+            ("FunctionName", yaml_str("{{ref:MyFn}}")),
+            ("EventSourceArn", yaml_str(embedded_source_arn)),
+        ]);
+        let esm = cfn_resource_typed("MyESM", "AWS::Lambda::EventSourceMapping", esm_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyQueue".to_string(), queue);
+        resources.insert("MyFn".to_string(), lambda);
+        resources.insert("MyESM".to_string(), esm);
+
+        let conns = build_connections(&resources);
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected one EventSource edge; connections = {conns:?}"
+        );
+        assert_eq!(conns[0].source.as_str(), "MyQueue");
+        assert_eq!(conns[0].target.as_str(), "MyFn");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::EventSource
+        ));
     }
 
     /// SAM `Type: S3` and `Type: SQS` events on the same function must both

@@ -143,6 +143,28 @@ const COMPUTE_RESOURCE_TYPES: &[&str] = &["aws_sfn_state_machine", "aws_lambda_f
 /// Notification resource types: these → Lambda/SQS produce Notification edges.
 const NOTIFICATION_SOURCE_TYPES: &[&str] = &["aws_s3_bucket_notification"];
 
+/// Terraform top-level attributes on `aws_lambda_function` that describe
+/// deployment artefacts, IAM, or encryption — not runtime data flow.
+/// References in these attributes must not produce DataFlow/Invocation edges.
+const NON_RUNTIME_ATTRS: &[&str] = &[
+    // Deployment source artefacts
+    "s3_bucket",
+    "s3_key",
+    "s3_object_version",
+    "filename",
+    "source_code_hash",
+    "image_uri",
+    "layers",
+    // Permissions / encryption
+    "role",
+    "kms_key_arn",
+    // Terraform meta-arguments
+    "depends_on",
+    "count",
+    "for_each",
+    "provider",
+];
+
 /// Terraform blocks that describe deployment/configuration, not runtime data
 /// flow; references inside them must not become runtime connection edges.
 const NON_RUNTIME_BLOCKS: &[&str] = &[
@@ -318,26 +340,40 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
         // ---------------------------------------------------------------
         // Special case: aws_sns_topic_subscription
         // This resource is glue (topic → subscriber); it is not itself a
-        // node.  Produce one Notification edge: topic → endpoint (lambda /
-        // SQS / …).  When `endpoint` is a literal string (http, email, …)
-        // the ResourceRef pattern won't match and no edge is emitted.
+        // node.  Only emit a Notification edge when `protocol` is "lambda"
+        // or "sqs" — the only protocols that represent a runtime invocation
+        // modelled by the cost graph.  Non-runtime protocols (https, email,
+        // sms, http, application, …) are skipped.
         // ---------------------------------------------------------------
         if src_type == "aws_sns_topic_subscription" {
-            if let (
-                Some(TfValue::ResourceRef {
-                    resource_type: topic_type,
-                    name: topic_name,
-                    ..
-                }),
-                Some(TfValue::ResourceRef {
-                    resource_type: ep_type,
-                    name: ep_name,
-                    ..
-                }),
-            ) = (
-                src_resource.attrs.get("topic_arn"),
-                src_resource.attrs.get("endpoint"),
-            ) {
+            let protocol = src_resource
+                .attrs
+                .get("protocol")
+                .and_then(|v| {
+                    if let TfValue::String(s) = v {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("");
+            if matches!(protocol, "lambda" | "sqs")
+                && let (
+                    Some(TfValue::ResourceRef {
+                        resource_type: topic_type,
+                        name: topic_name,
+                        ..
+                    }),
+                    Some(TfValue::ResourceRef {
+                        resource_type: ep_type,
+                        name: ep_name,
+                        ..
+                    }),
+                ) = (
+                    src_resource.attrs.get("topic_arn"),
+                    src_resource.attrs.get("endpoint"),
+                )
+            {
                 let topic_lid = logical_id_for(topic_type, topic_name);
                 let ep_lid = logical_id_for(ep_type, ep_name);
                 push_unique(
@@ -418,7 +454,10 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
         // ---------------------------------------------------------------
         let mut refs: Vec<(&str, &str, &str)> = Vec::new();
 
-        for attr_val in src_resource.attrs.values() {
+        for (attr_key, attr_val) in &src_resource.attrs {
+            if NON_RUNTIME_ATTRS.contains(&attr_key.as_str()) {
+                continue;
+            }
             collect_resource_refs(attr_val, &mut refs);
         }
 
@@ -802,6 +841,96 @@ mod sns_subscription_tests {
             "expected no edge for literal endpoint; connections = {conns:?}",
         );
     }
+
+    /// Helper: build a subscription with an explicit protocol string.
+    fn subscription_with_protocol(
+        sub_name: &str,
+        topic_type: &str,
+        topic_name: &str,
+        protocol: &str,
+        endpoint: TfValue,
+    ) -> TfResource {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "topic_arn".to_string(),
+            TfValue::ResourceRef {
+                resource_type: topic_type.to_string(),
+                name: topic_name.to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+        attrs.insert("endpoint".to_string(), endpoint);
+        attrs.insert(
+            "protocol".to_string(),
+            TfValue::String(protocol.to_string()),
+        );
+        TfResource {
+            resource_type: "aws_sns_topic_subscription".to_string(),
+            name: sub_name.to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        }
+    }
+
+    /// protocol=https with ResourceRef endpoint must NOT produce any edge.
+    #[test]
+    fn https_protocol_with_resource_ref_endpoint_produces_no_edge() {
+        let topic = node("aws_sns_topic", "my_topic");
+        let lambda = node("aws_lambda_function", "fn_a");
+
+        let sub_https = subscription_with_protocol(
+            "sub_https",
+            "aws_sns_topic",
+            "my_topic",
+            "https",
+            TfValue::ResourceRef {
+                resource_type: "aws_lambda_function".to_string(),
+                name: "fn_a".to_string(),
+                attr: "invoke_arn".to_string(),
+            },
+        );
+
+        let tf_resources = vec![sub_https];
+        let resources = vec![topic, lambda];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert!(
+            conns.is_empty(),
+            "expected no edge for https protocol even with ResourceRef endpoint; connections = {conns:?}",
+        );
+    }
+
+    /// protocol=sqs with ResourceRef endpoint must produce a Notification edge.
+    #[test]
+    fn sqs_protocol_produces_notification_edge() {
+        let topic = node("aws_sns_topic", "my_topic");
+        let queue = node("aws_sqs_queue", "my_queue");
+
+        let sub_sqs = subscription_with_protocol(
+            "sub_sqs",
+            "aws_sns_topic",
+            "my_topic",
+            "sqs",
+            TfValue::ResourceRef {
+                resource_type: "aws_sqs_queue".to_string(),
+                name: "my_queue".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+
+        let tf_resources = vec![sub_sqs];
+        let resources = vec![topic, queue];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected one Notification edge for sqs protocol; connections = {conns:?}",
+        );
+        assert_eq!(conns[0].source.as_str(), "aws_sns_topic_my_topic");
+        assert_eq!(conns[0].target.as_str(), "aws_sqs_queue_my_queue");
+        assert_eq!(conns[0].connection_type, ConnectionType::Notification);
+    }
 }
 
 #[cfg(test)]
@@ -850,5 +979,143 @@ mod tf_value_to_json_tests {
             json.get("UNRESOLVED").is_none(),
             "VarRef key must be dropped"
         );
+    }
+}
+
+#[cfg(test)]
+mod non_runtime_attrs_tests {
+    use super::*;
+
+    fn node(resource_type: &str, name: &str) -> Resource {
+        let lid = logical_id_for(resource_type, name);
+        Resource {
+            logical_id: LogicalId::new(&lid),
+            resource_type: ResourceType::new(resource_type),
+            shell: ResourceShell::other(resource_type),
+            group: None,
+        }
+    }
+
+    /// Lambda with `s3_bucket = aws_s3_bucket.code.id` and
+    /// `depends_on = [aws_sqs_queue.q]` must NOT produce any DataFlow edge —
+    /// these attrs are deployment-only / meta.
+    #[test]
+    fn deployment_attrs_do_not_produce_dataflow_edges() {
+        let lambda = node("aws_lambda_function", "fn");
+        let code_bucket = node("aws_s3_bucket", "code");
+        let dep_queue = node("aws_sqs_queue", "q");
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "s3_bucket".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_s3_bucket".to_string(),
+                name: "code".to_string(),
+                attr: "id".to_string(),
+            },
+        );
+        attrs.insert(
+            "depends_on".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_sqs_queue".to_string(),
+                name: "q".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+
+        let tf = TfResource {
+            resource_type: "aws_lambda_function".to_string(),
+            name: "fn".to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        };
+
+        let tf_resources = vec![tf];
+        let resources = vec![lambda, code_bucket, dep_queue];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert!(
+            conns.is_empty(),
+            "deployment attrs must not produce edges; got: {conns:?}"
+        );
+    }
+
+    /// Lambda with `role = aws_iam_role.exec.arn` (non-runtime IAM attr) must
+    /// not produce any edge, even if the IAM role were in the node set.
+    #[test]
+    fn role_attr_does_not_produce_edge() {
+        let lambda = node("aws_lambda_function", "fn");
+        // Create a fake "iam role" node to verify no spurious edge is emitted
+        // (in practice IAM roles are not in the node set, but we test the attr
+        // denylist regardless of whether the target node exists).
+        let fake_role = node("aws_iam_role", "exec");
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "role".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_iam_role".to_string(),
+                name: "exec".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+
+        let tf = TfResource {
+            resource_type: "aws_lambda_function".to_string(),
+            name: "fn".to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        };
+
+        let tf_resources = vec![tf];
+        let resources = vec![lambda, fake_role];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert!(
+            conns.is_empty(),
+            "role attr must not produce an edge; got: {conns:?}"
+        );
+    }
+
+    /// Lambda with `environment` block that references another resource via a
+    /// variable (not a ResourceRef) is fine; and a genuine runtime DataFlow edge
+    /// via `STORAGE_RESOURCE_TYPES` must still be produced when the attr is not
+    /// in `NON_RUNTIME_ATTRS`.
+    #[test]
+    fn runtime_attr_ref_still_produces_dataflow_edge() {
+        let lambda = node("aws_lambda_function", "fn");
+        let table = node("aws_dynamodb_table", "tbl");
+
+        // Use a non-denylisted attr (e.g. a custom "table_name" attr that holds
+        // a ResourceRef — simulates how some modules pass table ARN).
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "table_name".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_dynamodb_table".to_string(),
+                name: "tbl".to_string(),
+                attr: "name".to_string(),
+            },
+        );
+
+        let tf = TfResource {
+            resource_type: "aws_lambda_function".to_string(),
+            name: "fn".to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        };
+
+        let tf_resources = vec![tf];
+        let resources = vec![lambda, table];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert_eq!(
+            conns.len(),
+            1,
+            "runtime attr ref must produce DataFlow edge; got: {conns:?}"
+        );
+        assert_eq!(conns[0].connection_type, ConnectionType::DataFlow);
+        assert_eq!(conns[0].source.as_str(), "aws_lambda_function_fn");
+        assert_eq!(conns[0].target.as_str(), "aws_dynamodb_table_tbl");
     }
 }

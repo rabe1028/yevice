@@ -26,6 +26,7 @@ fn source_rate_var(
         Some("aws.lambda") => Some((id.var("requests"), "Lambda")),
         Some("aws.s3") => Some((id.var("put_requests"), "S3")),
         Some("aws.eventbridge_rule") => Some((id.var("events"), "EventBridge")),
+        Some("aws.eventbridge_scheduler") => Some((id.var("invocations"), "EventBridge Scheduler")),
         Some("aws.sns") => Some((id.var("deliveries"), "SNS")),
         _ => match hint {
             Some("sqs") => Some((id.var("requests"), "SQS")),
@@ -34,6 +35,7 @@ fn source_rate_var(
             Some("lambda") => Some((id.var("requests"), "Lambda")),
             Some("s3") => Some((id.var("put_requests"), "S3")),
             Some("eventbridge_rule") => Some((id.var("events"), "EventBridge")),
+            Some("eventbridge_scheduler") => Some((id.var("invocations"), "EventBridge Scheduler")),
             Some("sns") => Some((id.var("deliveries"), "SNS")),
             _ => None,
         },
@@ -197,6 +199,15 @@ impl ConnectionRule for AwsDataFlowRule {
                 &source_var,
                 factor,
                 format!("{source_type} -> S3 ({} -> {})", conn.source, conn.target),
+            )],
+            Some("aws.kinesis") => vec![scaled_binding(
+                conn.target.var("put_records"),
+                &source_var,
+                factor,
+                format!(
+                    "{source_type} -> Kinesis ({} -> {})",
+                    conn.source, conn.target
+                ),
             )],
             _ => Vec::new(),
         }
@@ -1302,5 +1313,132 @@ mod tests {
             result, 500.0,
             "fan-in bindings must sum, not overwrite — got {result}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1 EventBridge Scheduler as Invocation source
+    // -----------------------------------------------------------------------
+
+    /// EventBridge Scheduler → Lambda: source-rate variable must be
+    /// `Scheduler_invocations`, not silent no-binding.
+    #[test]
+    fn test_invocation_eventbridge_scheduler_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Scheduler", "aws.eventbridge_scheduler"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Scheduler"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1, "expected exactly one binding");
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        let params = params_from(&[("Scheduler_invocations", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 100.0);
+    }
+
+    /// hint-based fallback for eventbridge_scheduler must also bind.
+    #[test]
+    fn test_source_rate_var_eventbridge_scheduler_hint() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![make_resource("Handler", "aws.lambda")],
+            connections: vec![Connection {
+                source: LogicalId::new("UnknownScheduler"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: Some("eventbridge_scheduler".to_string()),
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1, "hint-based scheduler binding missing");
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2 Lambda → Kinesis DataFlow
+    // -----------------------------------------------------------------------
+
+    /// Lambda → Kinesis DataFlow: target variable must be `Stream_put_records`.
+    #[test]
+    fn test_dataflow_lambda_to_kinesis() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Producer", "aws.lambda"),
+                make_resource("Stream", "aws.kinesis"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Producer"),
+                target: LogicalId::new("Stream"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1, "expected exactly one DataFlow binding");
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Stream").var("put_records")
+        );
+        let params = params_from(&[("Producer_requests", 500.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 500.0);
+    }
+
+    /// Lambda → Kinesis DataFlow with factor > 1.
+    #[test]
+    fn test_dataflow_lambda_to_kinesis_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Producer", "aws.lambda"),
+                make_resource("Stream", "aws.kinesis"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Producer"),
+                target: LogicalId::new("Stream"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(3.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        let params = params_from(&[("Producer_requests", 200.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 600.0);
     }
 }
