@@ -606,3 +606,100 @@ fn nested_ref_spec_json_has_no_resource_ref() {
         "ResourceRef leaked into spec JSON: {json_str}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3: classify_connection — unrecognised pairs must NOT produce edges
+// ---------------------------------------------------------------------------
+
+/// Lambda → IAM role (role attr) and lambda → CloudWatch log group must not
+/// generate any connection edges. Lambda → S3 / DynamoDB must still appear.
+#[test]
+fn lambda_to_iam_role_does_not_produce_edge() {
+    let dir = FixtureDir::new("classify-iam", &["classify_connection.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    // IAM role must NOT be a connection target from any lambda.
+    let iam_edge = arch
+        .connections
+        .iter()
+        .find(|c| c.target.as_str() == "aws_iam_role_lambda_exec");
+    assert!(
+        iam_edge.is_none(),
+        "unexpected edge to aws_iam_role_lambda_exec; connections = {:?}",
+        arch.connections,
+    );
+}
+
+/// Lambda → S3 bucket produces a DataFlow edge (STORAGE_RESOURCE_TYPES).
+#[test]
+fn lambda_to_s3_produces_data_flow_edge() {
+    let dir = FixtureDir::new("classify-s3", &["classify_connection.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_writer"
+            && c.target.as_str() == "aws_s3_bucket_uploads"
+    });
+    assert!(
+        edge.is_some(),
+        "expected DataFlow edge from aws_lambda_function_writer to aws_s3_bucket_uploads; connections = {:?}",
+        arch.connections,
+    );
+}
+
+/// Lambda → DynamoDB produces a DataFlow edge (STORAGE_RESOURCE_TYPES).
+#[test]
+fn lambda_to_dynamodb_produces_data_flow_edge_via_classify() {
+    let dir = FixtureDir::new("classify-ddb", &["classify_connection.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_writer"
+            && c.target.as_str() == "aws_dynamodb_table_items"
+    });
+    assert!(
+        edge.is_some(),
+        "expected DataFlow edge from aws_lambda_function_writer to aws_dynamodb_table_items; connections = {:?}",
+        arch.connections,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #6: local ref — ResourceRef aliased through locals must produce edges
+// ---------------------------------------------------------------------------
+
+/// `local.fn_arn = aws_lambda_function.fn.arn` is used as the
+/// `lambda_function_arn` inside an `aws_s3_bucket_notification` block.
+/// After the fix the local resolves to a ResourceRef and the notification
+/// resource produces a Notification edge from the S3 bucket to the lambda.
+#[test]
+fn local_resource_ref_alias_produces_notification_edge() {
+    let dir = FixtureDir::new("local-ref", &["local_ref.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::Notification
+            && c.source.as_str() == "aws_s3_bucket_uploads"
+            && c.target.as_str() == "aws_lambda_function_fn"
+    });
+    assert!(
+        edge.is_some(),
+        "expected Notification edge from aws_s3_bucket_uploads to aws_lambda_function_fn \
+         (via local.fn_arn alias); connections = {:?}",
+        arch.connections,
+    );
+}

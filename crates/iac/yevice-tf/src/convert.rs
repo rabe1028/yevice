@@ -348,15 +348,16 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
 
         for (tgt_type, tgt_name, _attr) in refs {
             let tgt_lid = logical_id_for(tgt_type, tgt_name);
-            let conn_type = classify_connection(src_type, tgt_type);
-            push_unique(
-                &mut connections,
-                &mut seen,
-                &nodes,
-                &src_lid,
-                &tgt_lid,
-                conn_type,
-            );
+            if let Some(conn_type) = classify_connection(src_type, tgt_type) {
+                push_unique(
+                    &mut connections,
+                    &mut seen,
+                    &nodes,
+                    &src_lid,
+                    &tgt_lid,
+                    conn_type,
+                );
+            }
         }
     }
 
@@ -364,15 +365,21 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
 }
 
 /// Determine `ConnectionType` for a generic (non-ESM, non-notification) edge.
-fn classify_connection(src_type: &str, tgt_type: &str) -> ConnectionType {
+///
+/// Returns `Some` only for recognised source/target pairs:
+/// - `aws_lambda_function` → STORAGE_RESOURCE_TYPES  ⇒  `DataFlow`
+/// - `aws_lambda_function` → COMPUTE_RESOURCE_TYPES  ⇒  `Invocation`
+///
+/// Unrecognised pairs (e.g. lambda → IAM role, lambda → CloudWatch log group)
+/// return `None` so that no spurious edges are created.
+fn classify_connection(src_type: &str, tgt_type: &str) -> Option<ConnectionType> {
     if src_type == "aws_lambda_function" {
         if STORAGE_RESOURCE_TYPES.contains(&tgt_type) {
-            return ConnectionType::DataFlow;
+            return Some(ConnectionType::DataFlow);
         }
         if COMPUTE_RESOURCE_TYPES.contains(&tgt_type) {
-            return ConnectionType::Invocation;
+            return Some(ConnectionType::Invocation);
         }
     }
-    // Fallback: generic DataFlow
-    ConnectionType::DataFlow
+    None
 }

@@ -122,11 +122,6 @@ fn emit_roots<'a>(
     node_cell_ids: &HashMap<&'a LogicalId, u32>,
     xml: &mut String,
 ) {
-    // Cycle guard for container-size computation.  A single shared set is used
-    // for all `compute_container_size` calls so that cycles that span containers
-    // at any nesting level are detected without fresh-set re-entry.
-    let mut size_visited: HashSet<&LogicalId> = HashSet::new();
-
     // Pre-compute the vertical offset where containers begin (after top-level leaves).
     let ungrouped_leaf_count = u32::try_from(
         roots
@@ -148,11 +143,8 @@ fn emit_roots<'a>(
 
     for root in roots {
         if children.contains_key(&root.logical_id) {
-            // Container root.
-            if size_visited.contains(&root.logical_id) {
-                continue;
-            }
-            let size = compute_container_size(root, children, &mut size_visited);
+            // Container root: compute size with a fresh cycle-guard set.
+            let size = compute_container_size(root, children, &mut HashSet::new());
 
             let container_cell_id = node_cell_ids[&root.logical_id];
             let label = xml_escape(&node_label(root));
@@ -174,7 +166,6 @@ fn emit_roots<'a>(
                 node_cell_ids,
                 children,
                 &mut emit_visited,
-                &mut size_visited,
                 xml,
             );
 
@@ -196,7 +187,6 @@ fn emit_roots<'a>(
                     <mxGeometry x=\"{x}\" y=\"{y}\" width=\"{CELL_WIDTH}\" height=\"{CELL_HEIGHT}\" as=\"geometry\"/>\
                   </mxCell>"
             );
-            size_visited.insert(&root.logical_id);
         }
     }
 }
@@ -245,7 +235,14 @@ fn compute_container_size<'a>(
     children: &HashMap<&'a LogicalId, Vec<&'a TopologyNode>>,
     visited: &mut HashSet<&'a LogicalId>,
 ) -> Size {
-    visited.insert(&node.logical_id);
+    // Cycle guard: if this node was already entered during the current traversal,
+    // return leaf size to break the cycle.
+    if !visited.insert(&node.logical_id) {
+        return Size {
+            width: CELL_WIDTH,
+            height: CELL_HEIGHT,
+        };
+    }
 
     let Some(child_nodes) = children.get(&node.logical_id) else {
         // Leaf node: return its fixed size.
@@ -258,18 +255,9 @@ fn compute_container_size<'a>(
     // Measure each child (recursively for sub-containers).
     let mut child_sizes: Vec<Size> = Vec::new();
     for child in child_nodes {
-        if visited.contains(&child.logical_id) {
-            // Cycle — treat as a leaf.
-            child_sizes.push(Size {
-                width: CELL_WIDTH,
-                height: CELL_HEIGHT,
-            });
-            continue;
-        }
         if children.contains_key(&child.logical_id) {
             child_sizes.push(compute_container_size(child, children, visited));
         } else {
-            visited.insert(&child.logical_id);
             child_sizes.push(Size {
                 width: CELL_WIDTH,
                 height: CELL_HEIGHT,
@@ -316,17 +304,17 @@ fn compute_container_size<'a>(
 /// way, and their own children are emitted recursively with the sub-container
 /// cell id as parent.
 ///
-/// `size_visited` is the shared cycle guard used exclusively for
-/// `compute_container_size` calls — it is threaded through so that cycles
-/// that span nested containers are detected without creating a fresh set
-/// per call (which would allow re-entry and infinite recursion).
+/// Each call to `compute_container_size` within this function uses a fresh
+/// `HashSet` so that sibling containers do not pollute each other's cycle
+/// detection. `compute_container_size` itself guards against cycles at its
+/// entry point, so a fresh set per call is safe and gives accurate sizes for
+/// all nesting levels.
 fn emit_children<'a>(
     parent_node: &'a TopologyNode,
     parent_cell_id: u32,
     node_cell_ids: &HashMap<&'a LogicalId, u32>,
     children: &HashMap<&'a LogicalId, Vec<&'a TopologyNode>>,
     visited: &mut HashSet<&'a LogicalId>,
-    size_visited: &mut HashSet<&'a LogicalId>,
     xml: &mut String,
 ) {
     let Some(child_nodes) = children.get(&parent_node.logical_id) else {
@@ -338,18 +326,18 @@ fn emit_children<'a>(
     )
     .expect("cols fits in usize");
 
-    // Measure children sizes for layout using the shared size_visited guard.
+    // Measure children sizes for layout. Each sub-container gets its own fresh
+    // cycle-guard set so siblings don't cross-contaminate.
     let child_sizes: Vec<Size> = child_nodes
         .iter()
         .map(|child| {
-            if size_visited.contains(&child.logical_id) || !children.contains_key(&child.logical_id)
-            {
+            if children.contains_key(&child.logical_id) {
+                compute_container_size(child, children, &mut HashSet::new())
+            } else {
                 Size {
                     width: CELL_WIDTH,
                     height: CELL_HEIGHT,
                 }
-            } else {
-                compute_container_size(child, children, size_visited)
             }
         })
         .collect();
@@ -394,15 +382,7 @@ fn emit_children<'a>(
                   </mxCell>",
                 sz.width, sz.height
             );
-            emit_children(
-                child,
-                cell_id,
-                node_cell_ids,
-                children,
-                visited,
-                size_visited,
-                xml,
-            );
+            emit_children(child, cell_id, node_cell_ids, children, visited, xml);
         } else {
             // Leaf.
             let value = xml_escape(&node_label(child));
@@ -546,5 +526,93 @@ mod tests {
         // Should complete without stack overflow.
         let xml = DrawIoRenderer.render(&cost).unwrap();
         assert!(xml.contains("<mxCell"), "must produce mxCell XML: {xml}");
+    }
+
+    /// Extract a numeric attribute value from a draw.io mxCell XML line.
+    /// E.g. `extract_dim(line, "width")` parses the value of `width="NNN"`.
+    fn extract_dim(line: &str, key: &str) -> u32 {
+        let pat = format!("{key}=\"");
+        let start = line
+            .find(&pat)
+            .unwrap_or_else(|| panic!("{key} not found in: {line}"))
+            + pat.len();
+        let rest = &line[start..];
+        let end = rest.find('"').expect("closing quote");
+        rest[..end].parse().expect("numeric dimension")
+    }
+
+    /// A 3-level nesting (VPC > Subnet > Instance) must produce an outer
+    /// container whose width and height exceed the leaf cell dimensions, i.e.
+    /// the outer container is large enough to contain its contents.
+    #[test]
+    fn three_level_nesting_outer_container_larger_than_leaf() {
+        // vpc (root container)
+        //   subnet (container, child of vpc)
+        //     instance (leaf, child of subnet)
+        let vpc = make_node("vpc", None);
+        let subnet = make_node("subnet", Some("vpc"));
+        let instance = make_node("instance", Some("subnet"));
+
+        let topology = Topology {
+            nodes: vec![vpc, subnet, instance],
+            connections: vec![],
+        };
+        let cost = minimal_cost(topology);
+        let xml = DrawIoRenderer.render(&cost).unwrap();
+
+        // vpc cell is written first (id=2); extract its width/height.
+        let vpc_line = xml
+            .lines()
+            .find(|l| l.contains("id=\"2\""))
+            .expect("vpc mxCell (id=2) must be present");
+
+        let width = extract_dim(vpc_line, "width");
+        let height = extract_dim(vpc_line, "height");
+
+        assert!(
+            width > CELL_WIDTH,
+            "outer container width {width} should exceed leaf width {CELL_WIDTH}",
+        );
+        assert!(
+            height > CELL_HEIGHT,
+            "outer container height {height} should exceed leaf height {CELL_HEIGHT}",
+        );
+    }
+
+    /// `compute_container_size` must return a finite (leaf) size immediately when
+    /// called on a node that is already in the visited set, preventing infinite
+    /// recursion when cycles are injected directly into the children map.
+    #[test]
+    fn compute_container_size_cycle_guard_returns_leaf_size() {
+        // Construct a children map where A contains B and B contains A (direct cycle).
+        let node_a = make_node("A", None);
+        let node_b = make_node("B", None);
+
+        let lid_a = &node_a.logical_id;
+        let lid_b = &node_b.logical_id;
+
+        let mut children: HashMap<&LogicalId, Vec<&TopologyNode>> = HashMap::new();
+        children.insert(lid_a, vec![&node_b]);
+        children.insert(lid_b, vec![&node_a]);
+
+        // Pre-seed visited with B to simulate a cycle where A is being computed
+        // and B's computation would re-enter A.
+        let mut visited: HashSet<&LogicalId> = HashSet::new();
+        visited.insert(lid_b);
+
+        // Computing size of A: A's child is B, but B is already in visited →
+        // B should be treated as a leaf size (CELL_WIDTH × CELL_HEIGHT).
+        // The result for A must be larger than leaf (it contains B as a leaf cell).
+        let size = compute_container_size(&node_a, &children, &mut visited);
+        assert!(
+            size.width >= CELL_WIDTH,
+            "container A width {w} should be at least leaf width {CELL_WIDTH}",
+            w = size.width,
+        );
+        assert!(
+            size.height >= CELL_HEIGHT,
+            "container A height {h} should be at least leaf height {CELL_HEIGHT}",
+            h = size.height,
+        );
     }
 }

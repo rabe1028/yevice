@@ -48,8 +48,8 @@ pub fn resolve_config(
                 continue;
             };
 
-            let Some(resolved) =
-                resolve_value(value, &vars, &locals, 0).filter(TfValue::is_concrete)
+            let Some(resolved) = resolve_value(value, &vars, &locals, 0)
+                .filter(|v| v.is_concrete() || v.contains_resource_ref())
             else {
                 continue;
             };
@@ -136,9 +136,11 @@ fn resolve_value(
             .and_then(|next| resolve_value(next, vars, locals, depth + 1)),
         // ResourceRef is a cross-resource reference; it cannot be resolved to a
         // concrete scalar value, but it must be preserved in the resource attrs for
-        // connection building. Returning None here causes resolve_resource to leave
-        // the original ResourceRef value untouched.
-        TfValue::ResourceRef { .. } | TfValue::Unknown => None,
+        // connection building. Pass it through so that a local aliasing a
+        // ResourceRef (e.g. `fn_arn = aws_lambda_function.fn.arn`) is stored in
+        // the locals map and can later be resolved by `resolve_resource`.
+        TfValue::ResourceRef { .. } => Some(value.clone()),
+        TfValue::Unknown => None,
         // Recursively resolve Object/Array values. Each inner value is resolved
         // independently; unresolvable non-ref values stay as-is (the map/vec is
         // rebuilt with every entry preserved, letting the caller decide what to
