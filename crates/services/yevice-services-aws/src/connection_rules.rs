@@ -235,10 +235,23 @@ impl ConnectionRule for AwsNotificationRule {
                     Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
                     _ => return Vec::new(),
                 };
+                // SNS `deliveries` is the total across all subscribers.
+                // Divide by the subscriber count so each target receives the
+                // per-subscriber rate rather than the aggregated total.
+                let subscriber_count = arch
+                    .connections
+                    .iter()
+                    .filter(|c| {
+                        c.source == conn.source
+                            && matches!(c.connection_type, ConnectionType::Notification)
+                    })
+                    .count()
+                    .max(1);
+                let per_subscriber_factor = factor / subscriber_count as f64;
                 vec![scaled_binding(
                     target_var,
                     &source_var,
-                    factor,
+                    per_subscriber_factor,
                     format!(
                         "{source_type} -> {target_type} ({} -> {})",
                         conn.source, conn.target
@@ -774,6 +787,104 @@ mod tests {
         let params = params_from(&[("Topic_deliveries", 100.0)]);
         let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
         assert_eq!(result, 300.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SNS fan-out: per-subscriber rate (deliveries / N)
+    // -----------------------------------------------------------------------
+
+    /// Single subscriber (N=1): behaviour must be identical to the pre-fix path.
+    #[test]
+    fn test_notification_sns_single_subscriber_unchanged() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Topic", "aws.sns"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Topic"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        // N=1 → per-subscriber factor = 1.0/1 = 1.0, result unchanged
+        let params = params_from(&[("Topic_deliveries", 1_000_000.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 1_000_000.0);
+    }
+
+    /// Two subscribers (Lambda + SQS): each target should receive deliveries / 2.
+    #[test]
+    fn test_notification_sns_two_subscribers_per_subscriber_rate() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Topic", "aws.sns"),
+                make_resource("Handler", "aws.lambda"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("Handler"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("Queue"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 2);
+
+        let handler_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Handler").var("requests"))
+            .expect("Handler_requests binding should exist");
+        let queue_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Queue").var("requests"))
+            .expect("Queue_requests binding should exist");
+
+        // 1M publishes × 2 subscribers → deliveries = 2M
+        // Each subscriber should see 2M / 2 = 1M requests
+        let params = params_from(&[("Topic_deliveries", 2_000_000.0)]);
+        let handler_result =
+            yevice_core::evaluate::evaluate(&handler_binding.expr, &params).unwrap();
+        let queue_result = yevice_core::evaluate::evaluate(&queue_binding.expr, &params).unwrap();
+        assert_eq!(
+            handler_result, 1_000_000.0,
+            "Handler should receive deliveries/2, got {handler_result}"
+        );
+        assert_eq!(
+            queue_result, 1_000_000.0,
+            "Queue should receive deliveries/2, got {queue_result}"
+        );
     }
 
     // -----------------------------------------------------------------------
