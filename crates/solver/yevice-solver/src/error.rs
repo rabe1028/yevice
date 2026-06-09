@@ -31,6 +31,6 @@ pub enum SolverError {
     Infeasible,
 
     /// A core evaluation error propagated from the expression evaluator.
-    #[error("expression evaluation error: {0}")]
+    #[error("expression evaluation error")]
     Eval(#[from] yevice_core::error::CoreError),
 }

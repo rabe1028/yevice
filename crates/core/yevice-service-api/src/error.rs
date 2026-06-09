@@ -4,7 +4,7 @@ use yevice_pricing::error::PricingError;
 
 #[derive(Debug, Error)]
 pub enum CostError {
-    #[error("pricing error: {0}")]
+    #[error("pricing error")]
     Pricing(#[from] PricingError),
 
     #[error("failed to deserialize spec for service '{service_id}': {cause}")]

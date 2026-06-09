@@ -4,7 +4,7 @@ use thiserror::Error;
 pub enum WranglerError {
     #[error("failed to parse Wrangler config: {0}")]
     ParseError(String),
-    #[error("IO error: {0}")]
+    #[error("IO error")]
     Io(#[from] std::io::Error),
 }
 

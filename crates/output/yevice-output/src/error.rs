@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum RenderError {
     /// JSON serialization failed.
     #[cfg(feature = "json")]
-    #[error("JSON serialization error: {0}")]
+    #[error("JSON serialization error")]
     Json(#[from] serde_json::Error),
 
     /// Topology is empty and cannot produce a meaningful diagram.
