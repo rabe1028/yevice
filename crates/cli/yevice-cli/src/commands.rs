@@ -848,6 +848,15 @@ fn load_quotas(path: &str) -> Result<Quotas> {
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
     let quotas: Quotas =
         serde_yaml_ng::from_str(&content).context("failed to parse quotas file")?;
+    let legacy: Vec<&str> = quotas.keys().filter(|k| !k.contains('.')).collect();
+    if !legacy.is_empty() {
+        bail!(
+            "quota file '{path}' uses non-namespaced keys ({}); quota files now use \
+             provider-namespaced keys such as 'aws.lambda.concurrent_executions'. \
+             Please migrate these keys.",
+            legacy.join(", ")
+        );
+    }
     Ok(quotas)
 }
 
@@ -1565,6 +1574,45 @@ mod tests {
         assert!(
             msg.contains("sideways"),
             "error must mention the invalid direction value: {msg}"
+        );
+    }
+
+    // --- load_quotas validation tests ---
+
+    /// Non-namespaced key (no `.`) must cause `load_quotas` to bail with a
+    /// message that names the offending key.
+    #[test]
+    fn load_quotas_rejects_non_namespaced_keys() {
+        use std::fs;
+        let dir = temp_dir("quotas-legacy");
+        let quota_file = dir.join("quotas.yaml");
+        fs::write(&quota_file, "lambda_concurrent_executions: 50\n").unwrap();
+
+        let err = load_quotas(quota_file.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lambda_concurrent_executions"),
+            "error must name the non-namespaced key; got: {msg}"
+        );
+        assert!(
+            msg.contains("non-namespaced"),
+            "error must mention 'non-namespaced'; got: {msg}"
+        );
+    }
+
+    /// Namespaced keys (containing `.`) must be accepted without error.
+    #[test]
+    fn load_quotas_accepts_namespaced_keys() {
+        use std::fs;
+        let dir = temp_dir("quotas-namespaced");
+        let quota_file = dir.join("quotas.yaml");
+        fs::write(&quota_file, "aws.lambda.concurrent_executions: 50\n").unwrap();
+
+        let quotas = load_quotas(quota_file.to_str().unwrap()).unwrap();
+        assert_eq!(
+            quotas.get("aws.lambda.concurrent_executions"),
+            Some(50.0),
+            "namespaced quota value must be loaded correctly"
         );
     }
 

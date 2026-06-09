@@ -183,6 +183,11 @@ impl Quotas {
         self.0.is_empty()
     }
 
+    /// Iterate over the quota keys.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
     /// Merge another set of quotas into this one; values in `other` win on key collision.
     pub fn merge_from(&mut self, other: Quotas) {
         self.0.extend(other.0);
