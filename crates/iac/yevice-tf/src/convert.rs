@@ -213,6 +213,31 @@ fn push_unique(
     }
 }
 
+/// Returns `true` when a notification block's `events` attribute contains at
+/// least one value that begins with `"s3:ObjectCreated"`.
+///
+/// This is used to gate `aws_s3_bucket_notification` block refs so that only
+/// object-creation notifications are wired to the cost model (the source-rate
+/// variable is derived from `put_requests`).  Delete / restore / tagging events
+/// must not produce a put-bound edge.
+///
+/// Blocks without an `events` key, or whose `events` array contains only
+/// non-ObjectCreated strings, return `false`.
+fn block_has_object_created_event(
+    block_attrs: &std::collections::HashMap<String, TfValue>,
+) -> bool {
+    let Some(events_val) = block_attrs.get("events") else {
+        return false;
+    };
+    let TfValue::Array(items) = events_val else {
+        return false;
+    };
+    items.iter().any(|v| {
+        v.as_str()
+            .is_some_and(|s| s.starts_with("s3:ObjectCreated"))
+    })
+}
+
 /// Recursively collect every `ResourceRef` reachable from `value`.
 ///
 /// Each found ref is appended to `out` as `(resource_type, name, attr)`.
@@ -310,11 +335,17 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
                 _ => continue,
             };
 
-            // Collect all ResourceRefs from blocks (e.g. lambda_function,
-            // queue, topic) — these are the targets.
+            // Collect ResourceRefs from notification blocks (e.g. lambda_function,
+            // queue, topic) — but only from blocks whose `events` array contains
+            // at least one `s3:ObjectCreated` event.  Non-create events (delete,
+            // restore, etc.) are driven by different source-rate variables and
+            // must not produce a put_requests-bound Notification edge.
             let mut target_refs: Vec<(&str, &str, &str)> = Vec::new();
             for block_list in src_resource.blocks.values() {
                 for block_attrs in block_list {
+                    if !block_has_object_created_event(block_attrs) {
+                        continue;
+                    }
                     for ref_val in block_attrs.values() {
                         collect_resource_refs(ref_val, &mut target_refs);
                     }
@@ -400,4 +431,213 @@ fn classify_connection(src_type: &str, tgt_type: &str) -> Option<ConnectionType>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod s3_notification_gating_tests {
+    use super::*;
+
+    /// Build a minimal `Resource` node for the node-set guard.
+    fn node(resource_type: &str, name: &str) -> Resource {
+        let lid = logical_id_for(resource_type, name);
+        Resource {
+            logical_id: LogicalId::new(&lid),
+            resource_type: ResourceType::new(resource_type),
+            shell: ResourceShell::other(resource_type),
+            group: None,
+        }
+    }
+
+    /// Build a minimal `TfResource` for `aws_s3_bucket_notification` with one
+    /// `lambda_function` block whose `events` attribute is `events_list`.
+    fn s3_notif_resource(
+        bucket_type: &str,
+        bucket_name: &str,
+        lambda_type: &str,
+        lambda_name: &str,
+        events_list: Vec<&str>,
+    ) -> TfResource {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket".to_string(),
+            TfValue::ResourceRef {
+                resource_type: bucket_type.to_string(),
+                name: bucket_name.to_string(),
+                attr: "id".to_string(),
+            },
+        );
+
+        let events_tf: Vec<TfValue> = events_list
+            .into_iter()
+            .map(|e| TfValue::String(e.to_string()))
+            .collect();
+        let mut block_attrs = HashMap::new();
+        block_attrs.insert(
+            "lambda_function_arn".to_string(),
+            TfValue::ResourceRef {
+                resource_type: lambda_type.to_string(),
+                name: lambda_name.to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+        block_attrs.insert("events".to_string(), TfValue::Array(events_tf));
+
+        let mut blocks = HashMap::new();
+        blocks.insert("lambda_function".to_string(), vec![block_attrs]);
+
+        TfResource {
+            resource_type: "aws_s3_bucket_notification".to_string(),
+            name: "notif".to_string(),
+            attrs,
+            blocks,
+        }
+    }
+
+    /// `events = ["s3:ObjectCreated:*"]` must produce a Notification edge.
+    #[test]
+    fn object_created_event_produces_notification_edge() {
+        let bucket = node("aws_s3_bucket", "my_bucket");
+        let lambda = node("aws_lambda_function", "my_lambda");
+        let notif = s3_notif_resource(
+            "aws_s3_bucket",
+            "my_bucket",
+            "aws_lambda_function",
+            "my_lambda",
+            vec!["s3:ObjectCreated:*"],
+        );
+
+        let tf_resources = vec![notif];
+        let resources = vec![bucket, lambda];
+        let conns = build_connections(&tf_resources, &resources);
+
+        let edge = conns.iter().find(|c| {
+            c.connection_type == ConnectionType::Notification
+                && c.source.as_str() == "aws_s3_bucket_my_bucket"
+                && c.target.as_str() == "aws_lambda_function_my_lambda"
+        });
+        assert!(
+            edge.is_some(),
+            "expected Notification edge for s3:ObjectCreated:*; connections = {conns:?}",
+        );
+    }
+
+    /// `events = ["s3:ObjectRemoved:*"]` must NOT produce a Notification edge.
+    #[test]
+    fn object_removed_event_skipped() {
+        let bucket = node("aws_s3_bucket", "my_bucket");
+        let lambda = node("aws_lambda_function", "my_lambda");
+        let notif = s3_notif_resource(
+            "aws_s3_bucket",
+            "my_bucket",
+            "aws_lambda_function",
+            "my_lambda",
+            vec!["s3:ObjectRemoved:*"],
+        );
+
+        let tf_resources = vec![notif];
+        let resources = vec![bucket, lambda];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert!(
+            conns.is_empty(),
+            "expected no Notification edge for s3:ObjectRemoved:*; connections = {conns:?}",
+        );
+    }
+
+    /// `events = ["s3:ObjectRestore:*"]` must NOT produce a Notification edge.
+    #[test]
+    fn object_restore_event_skipped() {
+        let bucket = node("aws_s3_bucket", "my_bucket");
+        let lambda = node("aws_lambda_function", "my_lambda");
+        let notif = s3_notif_resource(
+            "aws_s3_bucket",
+            "my_bucket",
+            "aws_lambda_function",
+            "my_lambda",
+            vec!["s3:ObjectRestore:*"],
+        );
+
+        let tf_resources = vec![notif];
+        let resources = vec![bucket, lambda];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert!(
+            conns.is_empty(),
+            "expected no Notification edge for s3:ObjectRestore:*; connections = {conns:?}",
+        );
+    }
+
+    /// Mixed events: one ObjectCreated + one ObjectRemoved block → only the
+    /// ObjectCreated block contributes a Notification edge.
+    #[test]
+    fn mixed_events_only_object_created_block_produces_edge() {
+        let bucket = node("aws_s3_bucket", "my_bucket");
+        let lambda_a = node("aws_lambda_function", "fn_a");
+        let lambda_b = node("aws_lambda_function", "fn_b");
+
+        // Build the notification resource manually with two lambda_function blocks.
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_s3_bucket".to_string(),
+                name: "my_bucket".to_string(),
+                attr: "id".to_string(),
+            },
+        );
+
+        let mut block_created = HashMap::new();
+        block_created.insert(
+            "lambda_function_arn".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_lambda_function".to_string(),
+                name: "fn_a".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+        block_created.insert(
+            "events".to_string(),
+            TfValue::Array(vec![TfValue::String("s3:ObjectCreated:*".to_string())]),
+        );
+
+        let mut block_removed = HashMap::new();
+        block_removed.insert(
+            "lambda_function_arn".to_string(),
+            TfValue::ResourceRef {
+                resource_type: "aws_lambda_function".to_string(),
+                name: "fn_b".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+        block_removed.insert(
+            "events".to_string(),
+            TfValue::Array(vec![TfValue::String("s3:ObjectRemoved:*".to_string())]),
+        );
+
+        let mut blocks = HashMap::new();
+        blocks.insert(
+            "lambda_function".to_string(),
+            vec![block_created, block_removed],
+        );
+
+        let notif = TfResource {
+            resource_type: "aws_s3_bucket_notification".to_string(),
+            name: "notif".to_string(),
+            attrs,
+            blocks,
+        };
+
+        let tf_resources = vec![notif];
+        let resources = vec![bucket, lambda_a, lambda_b];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected exactly one Notification edge; connections = {conns:?}",
+        );
+        assert_eq!(conns[0].source.as_str(), "aws_s3_bucket_my_bucket");
+        assert_eq!(conns[0].target.as_str(), "aws_lambda_function_fn_a");
+        assert_eq!(conns[0].connection_type, ConnectionType::Notification);
+    }
 }

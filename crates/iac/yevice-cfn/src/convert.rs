@@ -291,6 +291,17 @@ fn simple_connection(source: &str, target: &str, connection_type: ConnectionType
 // S3 NotificationConfiguration
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when a notification config item targets an `s3:ObjectCreated`
+/// event.  Only `s3:ObjectCreated:*` / `:Put` / `:Post` etc. (any sub-type)
+/// should produce a cost-model edge, because the source-rate variable bound in
+/// the cost model is derived from `put_requests` and is semantically meaningful
+/// only for object-creation events.
+fn is_object_created_event(item: &serde_yaml_ng::Mapping) -> bool {
+    item.get(serde_yaml_ng::Value::String("Event".into()))
+        .and_then(serde_yaml_ng::Value::as_str)
+        .is_some_and(|e| e.starts_with("s3:ObjectCreated"))
+}
+
 fn extract_s3_notification_connections(bucket_id: &str, cfn: &CfnResource) -> Vec<Connection> {
     let mut conns = Vec::new();
     let Some(props) = cfn.properties.as_mapping() else {
@@ -311,6 +322,9 @@ fn extract_s3_notification_connections(bucket_id: &str, cfn: &CfnResource) -> Ve
         {
             for item in items {
                 if let Some(m) = item.as_mapping() {
+                    if !is_object_created_event(m) {
+                        continue;
+                    }
                     // Function can be in "Function" (cfn) or "LambdaFunctionArn" (cfn)
                     let fn_value = m
                         .get(YamlValue::String("Function".into()))
@@ -337,6 +351,9 @@ fn extract_s3_notification_connections(bucket_id: &str, cfn: &CfnResource) -> Ve
     {
         for item in items {
             if let Some(m) = item.as_mapping() {
+                if !is_object_created_event(m) {
+                    continue;
+                }
                 let queue_value = m
                     .get(YamlValue::String("Queue".into()))
                     .or_else(|| m.get(YamlValue::String("QueueArn".into())));
@@ -361,6 +378,9 @@ fn extract_s3_notification_connections(bucket_id: &str, cfn: &CfnResource) -> Ve
     {
         for item in items {
             if let Some(m) = item.as_mapping() {
+                if !is_object_created_event(m) {
+                    continue;
+                }
                 let topic_value = m
                     .get(YamlValue::String("Topic".into()))
                     .or_else(|| m.get(YamlValue::String("TopicArn".into())));
@@ -874,6 +894,181 @@ mod connection_tests {
         assert!(matches!(
             conns[0].connection_type,
             ConnectionType::Invocation
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // S3 NotificationConfiguration event-type gating tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a LambdaConfiguration item with the given `Event` string.
+    fn lambda_config_item(event: &str, function_sentinel: &str) -> YamlValue {
+        yaml_map_values(vec![
+            ("Event", yaml_str(event)),
+            ("Function", yaml_str(function_sentinel)),
+        ])
+    }
+
+    /// Helper: build a QueueConfiguration item with the given `Event` string.
+    fn queue_config_item(event: &str, queue_sentinel: &str) -> YamlValue {
+        yaml_map_values(vec![
+            ("Event", yaml_str(event)),
+            ("Queue", yaml_str(queue_sentinel)),
+        ])
+    }
+
+    /// Helper: build a TopicConfiguration item with the given `Event` string.
+    fn topic_config_item(event: &str, topic_sentinel: &str) -> YamlValue {
+        yaml_map_values(vec![
+            ("Event", yaml_str(event)),
+            ("Topic", yaml_str(topic_sentinel)),
+        ])
+    }
+
+    /// `s3:ObjectCreated:*` lambda notification must produce a Notification edge.
+    #[test]
+    fn s3_object_created_lambda_notification_produces_edge() {
+        let lambda = cfn_resource_typed(
+            "MyFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+        let notif_config = yaml_map_values(vec![(
+            "LambdaConfigurations",
+            yaml_seq(vec![lambda_config_item(
+                "s3:ObjectCreated:*",
+                "{{ref:MyFunction}}",
+            )]),
+        )]);
+        let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
+        let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyFunction".to_string(), lambda);
+        resources.insert("MyBucket".to_string(), bucket);
+
+        let conns = build_connections(&resources);
+        let notif = conns.iter().find(|c| {
+            c.source.as_str() == "MyBucket"
+                && c.target.as_str() == "MyFunction"
+                && matches!(c.connection_type, ConnectionType::Notification)
+        });
+        assert!(
+            notif.is_some(),
+            "expected Notification edge for s3:ObjectCreated:*; connections = {conns:?}",
+        );
+    }
+
+    /// `s3:ObjectRemoved:*` lambda notification must NOT produce a Notification edge.
+    #[test]
+    fn s3_object_removed_lambda_notification_skipped() {
+        let lambda = cfn_resource_typed(
+            "MyFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+        let notif_config = yaml_map_values(vec![(
+            "LambdaConfigurations",
+            yaml_seq(vec![lambda_config_item(
+                "s3:ObjectRemoved:*",
+                "{{ref:MyFunction}}",
+            )]),
+        )]);
+        let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
+        let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyFunction".to_string(), lambda);
+        resources.insert("MyBucket".to_string(), bucket);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for s3:ObjectRemoved:*; connections = {conns:?}",
+        );
+    }
+
+    /// `s3:ObjectRemoved:*` queue notification must NOT produce a Notification edge.
+    #[test]
+    fn s3_object_removed_queue_notification_skipped() {
+        let queue = cfn_resource_typed("MyQueue", "AWS::SQS::Queue", yaml_map_values(vec![]));
+        let notif_config = yaml_map_values(vec![(
+            "QueueConfigurations",
+            yaml_seq(vec![queue_config_item(
+                "s3:ObjectRemoved:*",
+                "{{ref:MyQueue}}",
+            )]),
+        )]);
+        let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
+        let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyQueue".to_string(), queue);
+        resources.insert("MyBucket".to_string(), bucket);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for s3:ObjectRemoved:* on queue; connections = {conns:?}",
+        );
+    }
+
+    /// `s3:ObjectRemoved:*` topic notification must NOT produce a Notification edge.
+    #[test]
+    fn s3_object_removed_topic_notification_skipped() {
+        let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", yaml_map_values(vec![]));
+        let notif_config = yaml_map_values(vec![(
+            "TopicConfigurations",
+            yaml_seq(vec![topic_config_item(
+                "s3:ObjectRemoved:*",
+                "{{ref:MyTopic}}",
+            )]),
+        )]);
+        let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
+        let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("MyTopic".to_string(), topic);
+        resources.insert("MyBucket".to_string(), bucket);
+
+        let conns = build_connections(&resources);
+        assert!(
+            conns.is_empty(),
+            "expected no edge for s3:ObjectRemoved:* on topic; connections = {conns:?}",
+        );
+    }
+
+    /// Mixed: one ObjectCreated + one ObjectRemoved lambda config → only one edge.
+    #[test]
+    fn s3_mixed_events_only_object_created_produces_edge() {
+        let lambda_a = cfn_resource_typed("FnA", "AWS::Lambda::Function", yaml_map_values(vec![]));
+        let lambda_b = cfn_resource_typed("FnB", "AWS::Lambda::Function", yaml_map_values(vec![]));
+        let notif_config = yaml_map_values(vec![(
+            "LambdaConfigurations",
+            yaml_seq(vec![
+                lambda_config_item("s3:ObjectCreated:*", "{{ref:FnA}}"),
+                lambda_config_item("s3:ObjectRemoved:*", "{{ref:FnB}}"),
+            ]),
+        )]);
+        let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
+        let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("FnA".to_string(), lambda_a);
+        resources.insert("FnB".to_string(), lambda_b);
+        resources.insert("MyBucket".to_string(), bucket);
+
+        let conns = build_connections(&resources);
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected exactly one Notification edge (only ObjectCreated); connections = {conns:?}",
+        );
+        assert_eq!(conns[0].source.as_str(), "MyBucket");
+        assert_eq!(conns[0].target.as_str(), "FnA");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::Notification
         ));
     }
 }
