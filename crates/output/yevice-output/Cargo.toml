@@ -12,9 +12,15 @@ description = "Architecture diagram renderers (draw.io, Mermaid, JSON) for the y
 keywords = ["aws", "cost", "diagram", "drawio", "mermaid"]
 categories = ["development-tools"]
 
+[features]
+default = ["drawio", "mermaid", "json"]
+drawio = []
+mermaid = []
+json = ["dep:serde_json"]
+
 [dependencies]
 yevice-core = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [lints]

@@ -6,6 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RenderError {
     /// JSON serialization failed.
+    #[cfg(feature = "json")]
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 

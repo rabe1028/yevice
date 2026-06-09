@@ -9,14 +9,20 @@
 //! All renderers consume [`yevice_core::cost::ArchitectureCost`] and read the
 //! embedded [`yevice_core::topology::Topology`] to produce a diagram string.
 
+#[cfg(feature = "drawio")]
 pub mod drawio;
 pub mod error;
+#[cfg(feature = "json")]
 pub mod json;
+#[cfg(feature = "mermaid")]
 pub mod mermaid;
 
+#[cfg(feature = "drawio")]
 pub use drawio::DrawIoRenderer;
 pub use error::RenderError;
+#[cfg(feature = "json")]
 pub use json::JsonRenderer;
+#[cfg(feature = "mermaid")]
 pub use mermaid::MermaidRenderer;
 
 use yevice_core::cost::ArchitectureCost;
@@ -110,6 +116,7 @@ mod tests {
 
     // ---- MermaidRenderer ----
 
+    #[cfg(feature = "mermaid")]
     #[test]
     fn mermaid_output_contains_node_ids_and_edges() {
         let cost = make_test_cost();
@@ -135,6 +142,7 @@ mod tests {
         assert!(output.contains("Invocation"), "missing Invocation label");
     }
 
+    #[cfg(feature = "mermaid")]
     #[test]
     fn mermaid_uses_label_when_present_and_falls_back_to_logical_id() {
         let cost = make_test_cost();
@@ -152,6 +160,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mermaid")]
     #[test]
     fn mermaid_includes_resource_type_in_node_label() {
         let cost = make_test_cost();
@@ -165,6 +174,7 @@ mod tests {
 
     // ---- DrawIoRenderer ----
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_output_contains_mxgraphmodel_wrapper() {
         let cost = make_test_cost();
@@ -181,6 +191,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_has_reserved_cells_0_and_1() {
         let cost = make_test_cost();
@@ -193,6 +204,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_cell_count_matches_nodes_plus_edges() {
         let cost = make_test_cost();
@@ -206,6 +218,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_xml_escapes_special_characters() {
         let mut cost = make_test_cost();
@@ -224,6 +237,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_edge_cells_reference_correct_source_and_target() {
         let cost = make_test_cost();
@@ -243,6 +257,7 @@ mod tests {
 
     // ---- JsonRenderer ----
 
+    #[cfg(feature = "json")]
     #[test]
     fn json_output_round_trips_topology() {
         use yevice_core::topology::Topology;
@@ -260,6 +275,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn json_output_is_valid_json() {
         let cost = make_test_cost();
@@ -270,6 +286,7 @@ mod tests {
 
     // ---- format_name ----
 
+    #[cfg(all(feature = "mermaid", feature = "drawio", feature = "json"))]
     #[test]
     fn format_names_are_correct() {
         assert_eq!(MermaidRenderer.format_name(), "mermaid");
@@ -312,6 +329,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mermaid")]
     #[test]
     fn mermaid_grouped_node_produces_subgraph() {
         let cost = make_grouped_cost();
@@ -334,6 +352,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_grouped_node_produces_swimlane_container() {
         let cost = make_grouped_cost();
@@ -352,6 +371,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_cell_count_with_group_matches_expected() {
         let cost = make_grouped_cost();
@@ -410,6 +430,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mermaid")]
     #[test]
     fn mermaid_three_level_nesting_produces_nested_subgraphs() {
         let cost = make_three_level_cost();
@@ -491,6 +512,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_three_level_nesting_produces_correct_parent_chain() {
         let cost = make_three_level_cost();
@@ -549,6 +571,7 @@ mod tests {
     // ---- Dangling parent test ----
 
     /// A node whose `group` points to a non-existent ID is treated as a root.
+    #[cfg(feature = "mermaid")]
     #[test]
     fn mermaid_dangling_parent_treated_as_root() {
         let orphan_node = TopologyNode {
@@ -593,6 +616,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "drawio")]
     #[test]
     fn drawio_dangling_parent_treated_as_root() {
         let orphan_node = TopologyNode {
