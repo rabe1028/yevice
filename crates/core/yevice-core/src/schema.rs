@@ -7,6 +7,52 @@ use serde::Serialize;
 use crate::cost::ArchitectureCost;
 use crate::types::VariableName;
 
+/// Compute the set of binding targets that are **derivable** — i.e., their
+/// expression can be evaluated solely from modeled variables or other
+/// derivable targets.
+///
+/// A target is derivable when every variable in `b.expr.variables()` is either:
+/// - a `required_variable` of some resource in the architecture, **or**
+/// - itself already derivable (fixed-point closure).
+///
+/// Binding targets that depend on external (unmodeled) sources are *not*
+/// derivable and must remain in the schema so the user can supply them.
+fn compute_derivable_targets(arch: &ArchitectureCost) -> HashSet<VariableName> {
+    // Step 1: collect all variable names that are modeled (appear as a
+    // required_variable in some resource).
+    let modeled_vars: HashSet<&VariableName> = arch
+        .resources
+        .iter()
+        .flat_map(|r| r.required_variables.iter().map(|v| &v.name))
+        .collect();
+
+    // Step 2: fixed-point iteration.
+    let mut derivable: HashSet<VariableName> = HashSet::new();
+    loop {
+        let prev_len = derivable.len();
+        for b in &arch.bindings {
+            if derivable.contains(&b.target) {
+                continue;
+            }
+            // A binding is derivable when all variables it references are
+            // either modeled or already in the derivable set.
+            let all_known = b
+                .expr
+                .variables()
+                .iter()
+                .all(|v| modeled_vars.contains(v) || derivable.contains(v));
+            if all_known {
+                derivable.insert(b.target.clone());
+            }
+        }
+        if derivable.len() == prev_len {
+            break;
+        }
+    }
+
+    derivable
+}
+
 /// JSON Schema for the hierarchical usage parameters file.
 ///
 /// Structure:
@@ -54,7 +100,7 @@ pub fn generate_usage_schema(arch: &ArchitectureCost) -> UsageSchema {
     let mut properties = BTreeMap::new();
     let mut required = Vec::new();
 
-    let bound: HashSet<&VariableName> = arch.bindings.iter().map(|b| &b.target).collect();
+    let derivable = compute_derivable_targets(arch);
 
     for resource in &arch.resources {
         let logical_id = resource.logical_id.to_string();
@@ -64,7 +110,7 @@ pub fn generate_usage_schema(arch: &ArchitectureCost) -> UsageSchema {
         let mut resource_required = Vec::new();
 
         for var in &resource.required_variables {
-            if bound.contains(&var.name) {
+            if derivable.contains(&var.name) {
                 continue;
             }
             let var_name = var.name.to_string();
@@ -118,7 +164,7 @@ pub fn generate_usage_template(arch: &ArchitectureCost) -> String {
     lines.push(format!("# Region: {}", arch.region));
     lines.push(String::new());
 
-    let bound: HashSet<&VariableName> = arch.bindings.iter().map(|b| &b.target).collect();
+    let derivable = compute_derivable_targets(arch);
 
     for resource in &arch.resources {
         let logical_id = resource.logical_id.to_string();
@@ -127,7 +173,7 @@ pub fn generate_usage_template(arch: &ArchitectureCost) -> String {
         let vars: Vec<_> = resource
             .required_variables
             .iter()
-            .filter(|v| !bound.contains(&v.name))
+            .filter(|v| !derivable.contains(&v.name))
             .collect();
 
         if vars.is_empty() {
@@ -375,6 +421,114 @@ mod tests {
         assert!(
             !template.contains("OnlyBound:"),
             "resource with all variables bound must be absent from template"
+        );
+    }
+
+    /// When a binding's source is an external (unmodeled) resource, the target
+    /// is NOT derivable and must remain in the schema so the user can supply it.
+    ///
+    /// Scenario: `AWS::Lambda::EventSourceMapping` binds
+    /// `Function_requests = ExternalQueue_requests`, but `ExternalQueue` is not
+    /// a modeled resource (it lives outside the template).  Neither the target
+    /// (`Function_requests`) nor the source (`ExternalQueue_requests`) is in
+    /// `modeled_vars`, so the target cannot be derived and must stay in schema.
+    #[test]
+    fn schema_keeps_non_derivable_binding_target_when_source_is_external() {
+        let lambda = LogicalId::new("MyFunction");
+        // ExternalQueue is intentionally NOT added as a resource.
+        let external_queue = LogicalId::new("ExternalQueue");
+
+        let function_resource = ResourceCost {
+            logical_id: lambda.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "My Lambda Function".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &lambda,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+
+        // Binding target is Function_requests, but its expr references
+        // ExternalQueue_requests which is NOT in any resource's required_variables.
+        let binding = VariableBinding {
+            target: lambda.var("requests"),
+            expr: Expr::variable(external_queue.var("requests")),
+            description: "ESM -> Lambda".to_string(),
+            source: "external SQS -> MyFunction".to_string(),
+        };
+
+        let arch = ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![function_resource],
+            bindings: vec![binding],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        };
+
+        let schema = generate_usage_schema(&arch);
+
+        // MyFunction must appear because its binding target is NOT derivable.
+        assert!(
+            schema.properties.contains_key("MyFunction"),
+            "MyFunction should appear when binding source is external"
+        );
+        // The non-derivable target must be present for the user to supply.
+        assert!(
+            schema.properties["MyFunction"]
+                .properties
+                .contains_key("requests"),
+            "non-derivable binding target 'requests' must remain in schema"
+        );
+    }
+
+    /// Template counterpart of the external-source test above.
+    #[test]
+    fn template_keeps_non_derivable_binding_target_when_source_is_external() {
+        let lambda = LogicalId::new("MyFunction");
+        let external_queue = LogicalId::new("ExternalQueue");
+
+        let function_resource = ResourceCost {
+            logical_id: lambda.clone(),
+            resource_type: ResourceType::new("AWS::Lambda::Function"),
+            label: "My Lambda Function".to_string(),
+            expr: Expr::constant(0.0),
+            components: vec![],
+            required_variables: vec![VariableInfo::new(
+                &lambda,
+                "requests",
+                "Invocation count",
+                "count",
+            )],
+        };
+
+        let binding = VariableBinding {
+            target: lambda.var("requests"),
+            expr: Expr::variable(external_queue.var("requests")),
+            description: "ESM -> Lambda".to_string(),
+            source: "external SQS -> MyFunction".to_string(),
+        };
+
+        let arch = ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources: vec![function_resource],
+            bindings: vec![binding],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+        };
+
+        let template = generate_usage_template(&arch);
+
+        assert!(
+            template.contains("MyFunction:"),
+            "MyFunction section should appear when binding source is external"
+        );
+        assert!(
+            template.contains("  requests: 0"),
+            "non-derivable binding target 'requests' must appear in template"
         );
     }
 }

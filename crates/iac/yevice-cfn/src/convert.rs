@@ -221,10 +221,14 @@ fn arn_last_segment(arn: &str) -> String {
 /// to avoid spurious edges to same-named resources.
 ///
 /// Handles:
-/// - `"{{ref:X}}"` → `Some("X")`
-/// - `"{{getatt:X.Attr}}"` → `Some("X")`
+/// - Whole-string sentinels: `"{{ref:X}}"` → `Some("X")`
+/// - Whole-string sentinels: `"{{getatt:X.Attr}}"` → `Some("X")`
+/// - Embedded sentinels (e.g. `Fn::Sub` ARNs after resolution):
+///   `"arn:...:function:{{ref:X}}"` → `Some("X")` (first embedded sentinel wins)
 fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
-    sentinel::parse(s).map(|r| r.logical_id)
+    sentinel::parse(s)
+        .or_else(|| sentinel::find_embedded(s))
+        .map(|r| r.logical_id)
 }
 
 /// Determine the containment parent for a CFn resource.
@@ -765,5 +769,111 @@ mod containment_tests {
 
         let group = extract_group(&resources["MyInstance"], &resources);
         assert_eq!(group, Some(LogicalId::new("MySubnet")));
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    fn cfn_resource_typed(
+        logical_id: &str,
+        resource_type: &str,
+        properties: YamlValue,
+    ) -> CfnResource {
+        CfnResource {
+            logical_id: logical_id.to_string(),
+            resource_type: resource_type.to_string(),
+            properties,
+            condition: None,
+            depends_on: Vec::new(),
+        }
+    }
+
+    fn yaml_str(s: &str) -> YamlValue {
+        YamlValue::String(s.to_string())
+    }
+
+    fn yaml_seq(items: Vec<YamlValue>) -> YamlValue {
+        YamlValue::Sequence(items)
+    }
+
+    fn yaml_map_values(pairs: Vec<(&str, YamlValue)>) -> YamlValue {
+        let mut map = serde_yaml_ng::Mapping::new();
+        for (k, v) in pairs {
+            map.insert(YamlValue::String(k.to_string()), v);
+        }
+        YamlValue::Mapping(map)
+    }
+
+    /// `AWS::Events::Rule` with a bare sentinel Arn must still create an
+    /// Invocation edge (existing behavior must not regress).
+    #[test]
+    fn events_rule_bare_sentinel_arn_creates_edge() {
+        let lambda = cfn_resource_typed(
+            "HandlerFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+
+        let target_entry = yaml_map_values(vec![
+            ("Id", yaml_str("TargetId")),
+            ("Arn", yaml_str("{{ref:HandlerFunction}}")),
+        ]);
+        let rule_props = yaml_map_values(vec![("Targets", yaml_seq(vec![target_entry]))]);
+        let rule = cfn_resource_typed("MyRule", "AWS::Events::Rule", rule_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("HandlerFunction".to_string(), lambda);
+        resources.insert("MyRule".to_string(), rule);
+
+        let conns = build_connections(&resources);
+        assert_eq!(conns.len(), 1, "expected one Invocation edge");
+        assert_eq!(conns[0].source.as_str(), "MyRule");
+        assert_eq!(conns[0].target.as_str(), "HandlerFunction");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::Invocation
+        ));
+    }
+
+    /// `AWS::Events::Rule` with an embedded sentinel inside a full-ARN `Fn::Sub`
+    /// value must create an Invocation edge to the target Lambda.
+    #[test]
+    fn events_rule_embedded_sentinel_arn_creates_edge() {
+        let lambda = cfn_resource_typed(
+            "HandlerFunction",
+            "AWS::Lambda::Function",
+            yaml_map_values(vec![]),
+        );
+
+        // Simulates what the intrinsic resolver produces for:
+        //   Arn: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${HandlerFunction}'
+        // After resolution: pseudo-params are left verbatim, resource refs become sentinels.
+        let embedded_arn =
+            "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:{{ref:HandlerFunction}}";
+        let target_entry = yaml_map_values(vec![
+            ("Id", yaml_str("TargetId")),
+            ("Arn", yaml_str(embedded_arn)),
+        ]);
+        let rule_props = yaml_map_values(vec![("Targets", yaml_seq(vec![target_entry]))]);
+        let rule = cfn_resource_typed("MyRule", "AWS::Events::Rule", rule_props);
+
+        let mut resources = HashMap::new();
+        resources.insert("HandlerFunction".to_string(), lambda);
+        resources.insert("MyRule".to_string(), rule);
+
+        let conns = build_connections(&resources);
+        assert_eq!(
+            conns.len(),
+            1,
+            "expected one Invocation edge for embedded-sentinel ARN"
+        );
+        assert_eq!(conns[0].source.as_str(), "MyRule");
+        assert_eq!(conns[0].target.as_str(), "HandlerFunction");
+        assert!(matches!(
+            conns[0].connection_type,
+            ConnectionType::Invocation
+        ));
     }
 }

@@ -59,6 +59,39 @@ pub(crate) fn parse(s: &str) -> Option<CfnRef> {
     None
 }
 
+/// Search for the **first** embedded sentinel (`{{ref:...}}` or
+/// `{{getatt:...}}`) within a larger string and parse it into a [`CfnRef`].
+///
+/// This handles values like
+/// `"arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:{{ref:HandlerFunction}}"`
+/// that result from resolving a `Fn::Sub` containing both pseudo-parameters
+/// (left verbatim) and resource logical IDs (encoded as sentinels).
+///
+/// Returns `None` when no recognisable sentinel prefix is found in the string.
+/// When multiple sentinels are embedded, only the first one is returned
+/// (pseudo-parameter placeholders such as `${AWS::Region}` are never encoded
+/// as sentinels and therefore do not interfere).
+pub(crate) fn find_embedded(s: &str) -> Option<CfnRef> {
+    // Find the earliest occurrence of either sentinel prefix.
+    let ref_pos = s.find(REF_PREFIX);
+    let getatt_pos = s.find(GETATT_PREFIX);
+
+    // Pick the prefix that starts earliest (or the one that exists if only one does).
+    let start = match (ref_pos, getatt_pos) {
+        (Some(r), Some(g)) => r.min(g),
+        (Some(r), None) => r,
+        (None, Some(g)) => g,
+        (None, None) => return None,
+    };
+
+    // Find the closing `}}` after the start position.
+    let end = s[start..].find(SUFFIX)?;
+    // The sentinel substring (including prefix and suffix).
+    let sentinel = &s[start..start + end + SUFFIX.len()];
+
+    parse(sentinel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +155,69 @@ mod tests {
         assert!(parse("MyQueue}}").is_none());
         // getatt without dot — no logical_id/attr split possible
         assert!(parse("{{getatt:MyQueueNoAttr}}").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // find_embedded
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn find_embedded_bare_sentinel_still_works() {
+        // A string that IS a whole sentinel should also be found by find_embedded.
+        let s = "{{ref:MyQueue}}";
+        let result = find_embedded(s).expect("should find embedded sentinel");
+        assert_eq!(result.logical_id, "MyQueue");
+        assert_eq!(result.attr, None);
+    }
+
+    #[test]
+    fn find_embedded_ref_in_arn_sub() {
+        // Simulates Fn::Sub ARN resolve with embedded ref sentinel.
+        let s = "arn:aws:lambda:us-east-1:123456789012:function:{{ref:HandlerFunction}}";
+        let result = find_embedded(s).expect("should find embedded ref");
+        assert_eq!(result.logical_id, "HandlerFunction");
+        assert_eq!(result.attr, None);
+    }
+
+    #[test]
+    fn find_embedded_getatt_in_arn_sub() {
+        // Simulates Fn::Sub ARN resolve with embedded getatt sentinel.
+        let s = "arn:aws:lambda:us-east-1:123456789012:function:{{getatt:MyFunction.Arn}}";
+        let result = find_embedded(s).expect("should find embedded getatt");
+        assert_eq!(result.logical_id, "MyFunction");
+        assert_eq!(result.attr, Some("Arn".to_string()));
+    }
+
+    #[test]
+    fn find_embedded_prefers_earliest_sentinel() {
+        // Two sentinels embedded — only the first one is returned.
+        let s = "prefix-{{ref:FirstResource}}-middle-{{ref:SecondResource}}-suffix";
+        let result = find_embedded(s).expect("should find first embedded sentinel");
+        assert_eq!(result.logical_id, "FirstResource");
+    }
+
+    #[test]
+    fn find_embedded_no_sentinel_returns_none() {
+        assert!(find_embedded("arn:aws:sqs:us-east-1:123456789012:MyQueue").is_none());
+        assert!(find_embedded("some-literal-string").is_none());
+        assert!(find_embedded("").is_none());
+    }
+
+    #[test]
+    fn find_embedded_pseudo_param_suffix_not_confused_with_sentinel() {
+        // ${AWS::Region} is NOT encoded as a sentinel — it stays verbatim.
+        // Confirm that a string with only pseudo-param placeholders yields None.
+        let s = "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:MyFunction";
+        assert!(find_embedded(s).is_none());
+    }
+
+    #[test]
+    fn find_embedded_pseudo_params_plus_sentinel_extracts_sentinel() {
+        // Common pattern after Fn::Sub resolution: pseudo-params stay verbatim,
+        // resource references become sentinels.
+        let s = "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:{{ref:HandlerFunction}}";
+        let result = find_embedded(s).expect("should find sentinel amid pseudo-params");
+        assert_eq!(result.logical_id, "HandlerFunction");
+        assert_eq!(result.attr, None);
     }
 }

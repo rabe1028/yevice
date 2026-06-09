@@ -504,32 +504,41 @@ fn test_schema_generation() {
 
     let schema = generate_usage_schema(&arch);
 
-    // Should have properties for each resource with non-bound variables.
-    // OrderIngestFunction_requests is a binding target (Kinesis EventSourceMapping)
-    // so OrderIngestFunction still appears because it has avg_duration_ms and
-    // data_transfer_out_gb, but requests is excluded.
+    // Should have properties for each resource with non-bound or non-derivable variables.
     assert!(
         schema.properties.contains_key("OrderIngestFunction"),
         "schema should contain OrderIngestFunction"
     );
-    // OrderBackupFunction_requests is a binding target (SQS EventSourceMapping)
-    // so OrderBackupFunction still appears because it has avg_duration_ms and
-    // data_transfer_out_gb, but requests is excluded.
+    // OrderBackupFunction_requests is a binding target derived from FailedOrderQueue_requests
+    // (internal/modeled source), so it IS derivable and must be excluded from the schema.
+    // OrderBackupFunction still appears because it has avg_duration_ms and data_transfer_out_gb.
     assert!(
         schema.properties.contains_key("OrderBackupFunction"),
         "schema should contain OrderBackupFunction"
     );
 
-    // OrderIngestFunction should require avg_duration_ms and data_transfer_out_gb
-    // (requests is a binding target and must be excluded).
+    // OrderIngestFunction_requests is a binding target whose source is an external Kinesis
+    // stream (Fn::ImportValue — not a modeled resource in this template).  It is NOT
+    // derivable, so it must remain in the schema for the user to supply.
     let ingest = &schema.properties["OrderIngestFunction"];
     assert!(
-        !ingest.properties.contains_key("requests"),
-        "requests is a binding target and must be excluded from schema"
+        ingest.properties.contains_key("requests"),
+        "OrderIngestFunction_requests has an external (unmodeled) Kinesis source \
+         and must remain in schema as a non-derivable binding target"
     );
     assert!(ingest.properties.contains_key("avg_duration_ms"));
     assert!(ingest.properties.contains_key("data_transfer_out_gb"));
-    assert_eq!(ingest.required.len(), 2);
+
+    // OrderBackupFunction_requests is derivable (FailedOrderQueue is modeled) and
+    // must be excluded from the schema.
+    let backup = &schema.properties["OrderBackupFunction"];
+    assert!(
+        !backup.properties.contains_key("requests"),
+        "OrderBackupFunction_requests is derivable (internal SQS source) \
+         and must be excluded from schema"
+    );
+    assert!(backup.properties.contains_key("avg_duration_ms"));
+    assert!(backup.properties.contains_key("data_transfer_out_gb"));
 }
 
 #[test]
