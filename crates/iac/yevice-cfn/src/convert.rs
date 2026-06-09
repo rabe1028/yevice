@@ -93,28 +93,23 @@ fn build_connections(resources: &HashMap<String, CfnResource>) -> Vec<Connection
     // when both EventSourceMapping and SAM Events create the same edge.
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
 
-    // ---- 1. AWS::Lambda::EventSourceMapping (existing) ----
-    // Source may be an external ARN not in resources; only the target must exist.
-    for cfn in resources.values() {
-        if cfn.resource_type == "AWS::Lambda::EventSourceMapping"
-            && let Some(conn) = extract_event_source_connection(cfn, resources)
-        {
-            try_push_connection(conn, resources, false, &mut seen, &mut connections);
-        }
-    }
+    // Sort by logical ID for deterministic output (HashMap iteration order is unspecified).
+    let mut entries: Vec<(&String, &CfnResource)> = resources.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    // ---- 2. AWS::S3::Bucket NotificationConfiguration ----
-    for (id, cfn) in resources {
-        if cfn.resource_type == "AWS::S3::Bucket" {
-            for conn in extract_s3_notification_connections(id, cfn) {
-                try_push_connection(conn, resources, true, &mut seen, &mut connections);
-            }
-        }
-    }
-
-    // ---- 3. AWS::SNS::Topic Subscription / AWS::SNS::Subscription ----
-    for (id, cfn) in resources {
+    for (id, cfn) in entries {
         match cfn.resource_type.as_str() {
+            // ESM: source may be an external ARN not in resources; only target must exist.
+            "AWS::Lambda::EventSourceMapping" => {
+                if let Some(conn) = extract_event_source_connection(cfn, resources) {
+                    try_push_connection(conn, resources, false, &mut seen, &mut connections);
+                }
+            }
+            "AWS::S3::Bucket" => {
+                for conn in extract_s3_notification_connections(id, cfn) {
+                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                }
+            }
             "AWS::SNS::Topic" => {
                 for conn in extract_sns_topic_subscription_connections(id, cfn) {
                     try_push_connection(conn, resources, true, &mut seen, &mut connections);
@@ -125,26 +120,18 @@ fn build_connections(resources: &HashMap<String, CfnResource>) -> Vec<Connection
                     try_push_connection(conn, resources, true, &mut seen, &mut connections);
                 }
             }
+            "AWS::Events::Rule" => {
+                for conn in extract_events_rule_connections(id, cfn) {
+                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                }
+            }
+            // SAM: source must be a known node in the template (no external ARN supported here).
+            "AWS::Serverless::Function" => {
+                for conn in extract_sam_function_event_connections(id, cfn, resources) {
+                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                }
+            }
             _ => {}
-        }
-    }
-
-    // ---- 4. AWS::Events::Rule Targets ----
-    for (id, cfn) in resources {
-        if cfn.resource_type == "AWS::Events::Rule" {
-            for conn in extract_events_rule_connections(id, cfn) {
-                try_push_connection(conn, resources, true, &mut seen, &mut connections);
-            }
-        }
-    }
-
-    // ---- 5. AWS::Serverless::Function Events (SQS/Kinesis/DynamoDB types) ----
-    // Source must be a known node in the template (no external ARN supported here).
-    for (id, cfn) in resources {
-        if cfn.resource_type == "AWS::Serverless::Function" {
-            for conn in extract_sam_function_event_connections(id, cfn, resources) {
-                try_push_connection(conn, resources, true, &mut seen, &mut connections);
-            }
         }
     }
 
