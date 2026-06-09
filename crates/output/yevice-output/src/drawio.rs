@@ -73,7 +73,35 @@ impl ArchitectureRenderer for DrawIoRenderer {
         xml.push_str("  <mxCell id=\"0\"/>\n");
         xml.push_str("  <mxCell id=\"1\" parent=\"0\"/>\n");
 
-        emit_roots(&roots, &children, &node_cell_ids, &mut xml);
+        let mut emitted: HashSet<&LogicalId> = HashSet::new();
+        emit_roots(&roots, &children, &node_cell_ids, &mut xml, &mut emitted);
+
+        // Emit any nodes not yet visited (e.g. nodes in a group cycle where
+        // every node has a valid parent and no roots exist). Visited guard in
+        // emit_node prevents duplicates even if a node was already emitted.
+        let mut leaf_index: u32 = 0;
+        for node in &topology.nodes {
+            if emitted.contains(&node.logical_id) {
+                continue;
+            }
+            // Emit as a top-level leaf (parent="1").
+            let col = leaf_index % GRID_COLUMNS;
+            let row = leaf_index / GRID_COLUMNS;
+            let x = col * CELL_COL_STEP;
+            let y = row * CELL_ROW_STEP;
+            leaf_index += 1;
+
+            let cell_id = node_cell_ids[&node.logical_id];
+            let value = xml_escape(&node_label(node));
+            let style = node_style(node.provider);
+            let _ = writeln!(
+                xml,
+                "  <mxCell id=\"{cell_id}\" value=\"{value}\" style=\"{style}\" vertex=\"1\" parent=\"1\">\
+                    <mxGeometry x=\"{x}\" y=\"{y}\" width=\"{CELL_WIDTH}\" height=\"{CELL_HEIGHT}\" as=\"geometry\"/>\
+                  </mxCell>"
+            );
+            emitted.insert(&node.logical_id);
+        }
 
         emit_edges(
             &topology.connections,
@@ -121,6 +149,7 @@ fn emit_roots<'a>(
     children: &HashMap<&'a LogicalId, Vec<&'a TopologyNode>>,
     node_cell_ids: &HashMap<&'a LogicalId, u32>,
     xml: &mut String,
+    emitted: &mut HashSet<&'a LogicalId>,
 ) {
     // Pre-compute the vertical offset where containers begin (after top-level leaves).
     let ungrouped_leaf_count = u32::try_from(
@@ -168,6 +197,8 @@ fn emit_roots<'a>(
                 &mut emit_visited,
                 xml,
             );
+            emitted.extend(emit_visited.iter());
+            emitted.insert(&root.logical_id);
 
             container_y += size.height + CONTAINER_GAP;
         } else {
@@ -187,6 +218,7 @@ fn emit_roots<'a>(
                     <mxGeometry x=\"{x}\" y=\"{y}\" width=\"{CELL_WIDTH}\" height=\"{CELL_HEIGHT}\" as=\"geometry\"/>\
                   </mxCell>"
             );
+            emitted.insert(&root.logical_id);
         }
     }
 }
@@ -507,6 +539,31 @@ mod tests {
             region: Region::new("ap-northeast-1"),
             topology,
         }
+    }
+
+    /// When all nodes form a group cycle (A.group=B, B.group=A), no roots
+    /// exist but all nodes must still appear in the draw.io XML output (no drop).
+    #[test]
+    fn cyclic_group_both_nodes_emitted() {
+        let node_a = make_node("CycleA", Some("CycleB")); // A's parent = B
+        let node_b = make_node("CycleB", Some("CycleA")); // B's parent = A
+
+        let topology = Topology {
+            nodes: vec![node_a, node_b],
+            connections: vec![],
+        };
+        let cost = minimal_cost(topology);
+        let xml = DrawIoRenderer.render(&cost).unwrap();
+
+        // Both nodes must appear as mxCell entries (id=2 and id=3).
+        assert!(
+            xml.contains("id=\"2\""),
+            "CycleA (id=2) must appear in output despite cycle: {xml}"
+        );
+        assert!(
+            xml.contains("id=\"3\""),
+            "CycleB (id=3) must appear in output despite cycle: {xml}"
+        );
     }
 
     /// A topology with a cyclic group reference (A→B→C→B) must terminate

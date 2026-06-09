@@ -117,6 +117,7 @@ impl ConnectionRule for AwsInvocationRule {
                 Some("express") => (conn.target.var("requests"), "Step Functions"),
                 _ => (conn.target.var("transitions"), "Step Functions"),
             },
+            Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
             _ => return Vec::new(),
         };
 
@@ -215,6 +216,7 @@ impl ConnectionRule for AwsNotificationRule {
                 let (target_var, target_type) = match target_service_id {
                     Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
                     Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
+                    Some("aws.sns") => (conn.target.var("deliveries"), "SNS"),
                     _ => return Vec::new(),
                 };
                 vec![scaled_binding(
@@ -838,6 +840,132 @@ mod tests {
         let params = params_from(&[("Processor_requests", 100.0)]);
         let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
         assert_eq!(result, 500.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1 EventBridge Rule → SQS Invocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invocation_eventbridge_rule_to_sqs() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Rule", "aws.eventbridge_rule"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Rule"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+        let params = params_from(&[("Rule_events", 200.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 200.0);
+    }
+
+    #[test]
+    fn test_invocation_eventbridge_rule_to_sqs_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Rule", "aws.eventbridge_rule"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Rule"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(3.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+        let params = params_from(&[("Rule_events", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 300.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2 S3 Notification → SNS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_s3_to_sns() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Topic", "aws.sns"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Bucket"),
+                target: LogicalId::new("Topic"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Topic").var("deliveries")
+        );
+        let params = params_from(&[("Bucket_put_requests", 500.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 500.0);
+    }
+
+    #[test]
+    fn test_notification_s3_to_sns_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Topic", "aws.sns"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Bucket"),
+                target: LogicalId::new("Topic"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(2.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Topic").var("deliveries")
+        );
+        let params = params_from(&[("Bucket_put_requests", 300.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 600.0);
     }
 
     // -----------------------------------------------------------------------

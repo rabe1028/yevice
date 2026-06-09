@@ -111,6 +111,14 @@ impl ArchitectureRenderer for MermaidRenderer {
             emit_node(root, &id_map, &children, &mut visited, &mut lines, 1);
         }
 
+        // Emit any nodes not yet visited (e.g. nodes involved in a group cycle
+        // where every node has a parent and no roots exist).
+        for node in &topology.nodes {
+            if !visited.contains(&node.logical_id) {
+                emit_node(node, &id_map, &children, &mut visited, &mut lines, 1);
+            }
+        }
+
         // Emit edges.
         for conn in &topology.connections {
             let (Some(src), Some(dst)) = (id_map.get(&conn.source), id_map.get(&conn.target))
@@ -318,6 +326,32 @@ mod tests {
         assert!(
             !output.contains("beta_2"),
             "beta must not get a suffix: {output}"
+        );
+    }
+
+    /// When all nodes form a group cycle (A.group=B, B.group=A), no roots
+    /// exist but all nodes must still appear in the output (no drop).
+    #[test]
+    fn cyclic_group_both_nodes_emitted() {
+        let mut node_a = make_leaf_node("NodeA");
+        let mut node_b = make_leaf_node("NodeB");
+        node_a.group = Some(LogicalId::new("NodeB")); // A's parent = B
+        node_b.group = Some(LogicalId::new("NodeA")); // B's parent = A
+
+        let topology = Topology {
+            nodes: vec![node_a, node_b],
+            connections: vec![],
+        };
+        let cost = minimal_cost(topology);
+        let output = MermaidRenderer.render(&cost).unwrap();
+
+        assert!(
+            output.contains("NodeA["),
+            "NodeA must appear in output despite cycle: {output}"
+        );
+        assert!(
+            output.contains("NodeB["),
+            "NodeB must appear in output despite cycle: {output}"
         );
     }
 

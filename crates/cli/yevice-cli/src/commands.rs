@@ -454,18 +454,29 @@ pub fn optimize(
     }
 
     // Every variable in the objective must be bound — either fixed via --params,
-    // chosen as a --decision, or derivable via a binding.  Otherwise the
-    // objective cannot be evaluated and the solver would (misleadingly) report
-    // INFEASIBLE.  Surface it as a clear error instead, listing exactly what is
-    // missing.
+    // chosen as a --decision, or derivable via a binding whose own inputs are
+    // themselves bound.  Compute the set via a fixed-point closure so that only
+    // bindings whose source variables are already satisfied propagate their
+    // targets into the bound set.  This prevents a binding whose source is
+    // missing from silently masking an unbound variable in the objective.
     let mut bound: std::collections::HashSet<VariableName> = fixed_params.keys().cloned().collect();
     for dv in &decision_variables {
         bound.insert(dv.name.clone());
     }
-    // Binding targets are resolved at solve-time, so they count as "bound" for
-    // the purpose of this pre-flight check.
-    for b in arch.all_bindings() {
-        bound.insert(b.target.clone());
+    loop {
+        let mut progressed = false;
+        for b in arch.all_bindings() {
+            if bound.contains(&b.target) {
+                continue;
+            }
+            if b.expr.variables().iter().all(|v| bound.contains(v)) {
+                bound.insert(b.target.clone());
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
     }
     let unbound: Vec<String> = objective
         .variables()
@@ -1613,6 +1624,127 @@ mod tests {
             quotas.get("aws.lambda.concurrent_executions"),
             Some(50.0),
             "namespaced quota value must be loaded correctly"
+        );
+    }
+
+    // --- #3 optimize unbound-check closure tests ---
+
+    /// When a binding's source variable is not provided, the binding target
+    /// must NOT be treated as bound.  If the objective references the binding
+    /// target, optimize() must return an actionable "unbound" error that
+    /// names the missing source variable — not INFEASIBLE from the solver.
+    #[test]
+    fn optimize_unbound_source_gives_unbound_error_not_infeasible() {
+        use std::fs;
+        // Cost model:
+        //   resource "Widget" with expr = Variable("Widget_derived_cost")
+        //   binding:  target="Widget_derived_cost"
+        //             expr = Variable("Widget_source_input") * Constant(0.01)
+        //
+        // If Widget_source_input is NOT provided as a param or decision,
+        // the closure must leave Widget_derived_cost unbound, causing an
+        // actionable error.  The old flat approach would mark Widget_derived_cost
+        // bound regardless of whether Widget_source_input is present.
+        let cost_model = serde_json::json!({
+            "name": "closure-test",
+            "resources": [{
+                "logical_id": "Widget",
+                "resource_type": "AWS::Unknown",
+                "label": "Widget",
+                "expr": { "type": "Variable", "name": "Widget_derived_cost" },
+                "required_variables": [
+                    { "name": "Widget_derived_cost", "description": "derived", "unit": "USD" }
+                ]
+            }],
+            "bindings": [{
+                "target": "Widget_derived_cost",
+                "expr": {
+                    "type": "Product",
+                    "exprs": [
+                        { "type": "Variable", "name": "Widget_source_input" },
+                        { "type": "Constant", "value": 0.01 }
+                    ]
+                },
+                "description": "source * price",
+                "source": "test"
+            }],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+
+        let dir = temp_dir("closure-unbound");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        // No params, no decisions → Widget_source_input is missing.
+        // Must get an unbound error mentioning Widget_source_input (the missing source),
+        // not an INFEASIBLE result from the solver.
+        let err = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unbound") || msg.contains("Widget_source_input"),
+            "expected unbound error mentioning Widget_source_input, got: {msg}"
+        );
+        assert!(
+            !msg.contains("INFEASIBLE"),
+            "must not report INFEASIBLE when source variable is missing, got: {msg}"
+        );
+    }
+
+    /// When the missing source variable is supplied as a decision variable,
+    /// optimize() must solve successfully.
+    #[test]
+    fn optimize_with_source_as_decision_solves_successfully() {
+        use std::fs;
+        let cost_model = serde_json::json!({
+            "name": "closure-test-ok",
+            "resources": [{
+                "logical_id": "Widget",
+                "resource_type": "AWS::Unknown",
+                "label": "Widget",
+                "expr": { "type": "Variable", "name": "Widget_derived_cost" },
+                "required_variables": [
+                    { "name": "Widget_derived_cost", "description": "derived", "unit": "USD" }
+                ]
+            }],
+            "bindings": [{
+                "target": "Widget_derived_cost",
+                "expr": {
+                    "type": "Product",
+                    "exprs": [
+                        { "type": "Variable", "name": "Widget_source_input" },
+                        { "type": "Constant", "value": 0.01 }
+                    ]
+                },
+                "description": "source * price",
+                "source": "test"
+            }],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+
+        let dir = temp_dir("closure-ok");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        // Provide Widget_source_input as a decision variable.
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &["Widget_source_input=100,200".to_string()],
+            "min",
+        );
+        assert!(
+            result.is_ok(),
+            "optimize must succeed when source variable is provided: {result:?}"
         );
     }
 
