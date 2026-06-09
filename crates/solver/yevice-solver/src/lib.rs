@@ -64,6 +64,16 @@ impl Solver for EnumerationSolver {
         // Guard against combinatorial explosion.
         let combination_count = combination_count(problem)?;
 
+        // Guard: if any decision variable has an empty domain, no assignment
+        // can ever be constructed — immediately return infeasible.
+        if problem.decision_variables.iter().any(|dv| dv.domain.is_empty()) {
+            return Ok(Solution {
+                assignments: HashMap::new(),
+                objective_value: f64::NAN,
+                feasible: false,
+            });
+        }
+
         if combination_count == 0 {
             // No decision variables: treat as a single empty combination.
             return solve_single(problem, HashMap::new());
@@ -422,6 +432,39 @@ mod tests {
         assert!(sol.feasible);
         assert_eq!(sol.assignments[&var("x")], 1.0);
         assert_eq!(sol.objective_value, 5.0);
+    }
+
+    /// Empty domain is immediately infeasible — even with no constraints.
+    #[test]
+    fn empty_domain_is_infeasible() {
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![])],
+            vec![],
+            HashMap::new(),
+        );
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(!sol.feasible, "empty domain must be infeasible");
+        assert!(sol.objective_value.is_nan());
+        assert!(sol.assignments.is_empty());
+    }
+
+    /// Mixed: one variable with domain, one with empty domain → infeasible.
+    #[test]
+    fn mixed_empty_domain_is_infeasible() {
+        let problem = problem_with(
+            Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0]), dv("y", vec![])],
+            vec![],
+            HashMap::new(),
+        );
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(!sol.feasible, "empty domain on any variable must be infeasible");
+        assert!(sol.objective_value.is_nan());
     }
 
     /// Eq constraint: only the assignment where x == 2.0 is feasible.

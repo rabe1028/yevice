@@ -233,6 +233,10 @@ enum Commands {
         /// May be repeated for multiple decision variables.
         #[arg(long = "decision", value_name = "NAME=v1,v2,...")]
         decision: Vec<String>,
+
+        /// Optimization direction: `min` to minimize cost (default), `max` to maximize.
+        #[arg(long = "direction", default_value = "min", value_name = "min|max")]
+        direction: String,
     },
 }
 
@@ -339,6 +343,7 @@ fn main() -> Result<()> {
             cost_model,
             params,
             decision,
-        } => commands::optimize(&cost_model, params.as_deref(), &decision),
+            direction,
+        } => commands::optimize(&cost_model, params.as_deref(), &decision, &direction),
     }
 }

@@ -18,7 +18,15 @@ pub enum SolverError {
         limit: u64,
     },
 
-    /// No assignment satisfies all constraints.
+    /// Reserved for future solver backends that signal infeasibility as an
+    /// error rather than through a `Solution` value.
+    ///
+    /// The current [`EnumerationSolver`] expresses infeasibility as
+    /// `Ok(Solution { feasible: false, .. })` and never constructs this variant.
+    /// It is kept in the public API so that future backends (e.g., LP/MIP
+    /// solvers) can use it without a breaking change.
+    ///
+    /// [`EnumerationSolver`]: crate::EnumerationSolver
     #[error("problem is infeasible: no combination satisfies all constraints")]
     Infeasible,
 

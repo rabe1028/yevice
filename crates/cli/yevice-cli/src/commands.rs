@@ -409,10 +409,12 @@ pub fn validate(
 ///   as fixed (non-decision) variables.
 /// * `decisions` – each element is `"NAME=v1,v2,..."` specifying one decision
 ///   variable and its candidate domain.
+/// * `direction` – `"min"` to minimize (default) or `"max"` to maximize.
 pub fn optimize(
     cost_model_path: &str,
     params_path: Option<&str>,
     decisions: &[String],
+    direction: &str,
 ) -> Result<()> {
     let arch = load_cost_model(cost_model_path)?;
     let objective = arch.total_expr();
@@ -429,6 +431,9 @@ pub fn optimize(
             .split_once('=')
             .with_context(|| format!("invalid --decision value '{spec}': expected NAME=v1,v2,..."))?;
         let name = VariableName::new(name_part.trim());
+        if values_part.trim().is_empty() {
+            bail!("decision variable '{name_part}' has an empty domain");
+        }
         let domain: Vec<f64> = values_part
             .split(',')
             .map(|s| {
@@ -441,9 +446,6 @@ pub fn optimize(
                     })
             })
             .collect::<Result<_>>()?;
-        if domain.is_empty() {
-            bail!("decision variable '{name_part}' has an empty domain");
-        }
         decision_variables.push(DecisionVariable { name, domain });
     }
 
@@ -470,9 +472,17 @@ pub fn optimize(
         );
     }
 
+    let obj_direction = match direction {
+        "min" => ObjectiveDirection::Minimize,
+        "max" => ObjectiveDirection::Maximize,
+        other => bail!(
+            "unknown --direction value '{other}': valid values are min, max"
+        ),
+    };
+
     let problem = OptimizationProblem {
         objective,
-        direction: ObjectiveDirection::Minimize,
+        direction: obj_direction,
         decision_variables,
         constraints: vec![],
         fixed_params: fixed_params.into_iter().collect(),
@@ -489,7 +499,7 @@ pub fn optimize(
         Err(e) => return Err(e.into()),
     };
 
-    println!("\nOptimization Result ({}):", arch.name);
+    println!("\nOptimization Result ({}, direction={direction}):", arch.name);
     if sol.feasible {
         // Print each decision variable's chosen value.
         for dv in &problem.decision_variables {
@@ -1402,6 +1412,147 @@ mod tests {
         assert!(
             err.to_string().contains("PROVIDER=REGION"),
             "error should describe expected format"
+        );
+    }
+
+    // --- empty domain --decision tests (#4) ---
+
+    /// `NAME=` (empty values_part) must be detected before split and return an
+    /// actionable error message.
+    #[test]
+    fn empty_domain_spec_returns_error() {
+        // Build a minimal cost model file so we can call optimize.
+        // We only care that parsing the decision spec fails before the solver.
+        // Use a temp dir with a trivial cost model JSON.
+        use std::fs;
+        let dir = temp_dir("empty-domain");
+        let cost_model = serde_json::json!({
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(&cost_model_path, serde_json::to_string(&cost_model).unwrap()).unwrap();
+
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &["MyVar=".to_string()],
+            "min",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty domain"),
+            "expected 'empty domain' error, got: {msg}"
+        );
+    }
+
+    /// `NAME=  ` (whitespace-only values_part) must also return empty-domain error.
+    #[test]
+    fn whitespace_only_domain_spec_returns_error() {
+        use std::fs;
+        let dir = temp_dir("ws-domain");
+        let cost_model = serde_json::json!({
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(&cost_model_path, serde_json::to_string(&cost_model).unwrap()).unwrap();
+
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &["MyVar=  ".to_string()],
+            "min",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty domain"),
+            "expected 'empty domain' error, got: {msg}"
+        );
+    }
+
+    // --- direction parsing tests (#7) ---
+
+    fn empty_cost_model_json(name: &str) -> serde_json::Value {
+        // A cost model with no resources — total_expr() = Sum([]) = constant 0,
+        // which has no variables, so the "unbound" check passes immediately.
+        serde_json::json!({
+            "name": name,
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        })
+    }
+
+    #[test]
+    fn direction_min_is_accepted() {
+        use std::fs;
+        let dir = temp_dir("dir-min");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("dir-min")).unwrap(),
+        )
+        .unwrap();
+
+        // No decisions needed for an empty objective.
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "min",
+        );
+        assert!(result.is_ok(), "min direction must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn direction_max_is_accepted() {
+        use std::fs;
+        let dir = temp_dir("dir-max");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("dir-max")).unwrap(),
+        )
+        .unwrap();
+
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "max",
+        );
+        assert!(result.is_ok(), "max direction must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn direction_unknown_returns_error() {
+        use std::fs;
+        let dir = temp_dir("dir-bad");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("dir-bad")).unwrap(),
+        )
+        .unwrap();
+
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "sideways",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sideways"),
+            "error must mention the invalid direction value: {msg}"
         );
     }
 

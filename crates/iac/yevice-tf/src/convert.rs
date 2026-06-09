@@ -277,26 +277,49 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
 
         // ---------------------------------------------------------------
         // aws_s3_bucket_notification: Notification edges
+        //
+        // The `bucket` attribute holds a ResourceRef to the S3 bucket that
+        // owns this notification configuration.  All other refs (lambda ARNs,
+        // queue ARNs, topic ARNs, …) are the notification targets.
+        // Correct direction: bucket → target.
         // ---------------------------------------------------------------
         if NOTIFICATION_SOURCE_TYPES.contains(&src_type) {
-            let mut notif_refs: Vec<(&str, &str, &str)> = Vec::new();
-            for ref_val in src_resource.attrs.values() {
-                collect_resource_refs(ref_val, &mut notif_refs);
-            }
+            // Resolve the bucket source.
+            let bucket_lid = match src_resource.attrs.get("bucket") {
+                Some(TfValue::ResourceRef {
+                    resource_type: bucket_type,
+                    name: bucket_name,
+                    ..
+                }) => logical_id_for(bucket_type, bucket_name),
+                // `bucket` is missing or not a ResourceRef — skip notification edges.
+                _ => continue,
+            };
+
+            // Collect all ResourceRefs from blocks (e.g. lambda_function,
+            // queue, topic) — these are the targets.
+            let mut target_refs: Vec<(&str, &str, &str)> = Vec::new();
             for block_list in src_resource.blocks.values() {
                 for block_attrs in block_list {
                     for ref_val in block_attrs.values() {
-                        collect_resource_refs(ref_val, &mut notif_refs);
+                        collect_resource_refs(ref_val, &mut target_refs);
                     }
                 }
             }
-            for (tgt_type, tgt_name, _attr) in notif_refs {
+            // Also collect any non-`bucket` attr refs.
+            for (attr_key, ref_val) in &src_resource.attrs {
+                if attr_key == "bucket" {
+                    continue;
+                }
+                collect_resource_refs(ref_val, &mut target_refs);
+            }
+
+            for (tgt_type, tgt_name, _attr) in target_refs {
                 let tgt_lid = logical_id_for(tgt_type, tgt_name);
                 push_unique(
                     &mut connections,
                     &mut seen,
                     &nodes,
-                    &src_lid,
+                    &bucket_lid,
                     &tgt_lid,
                     ConnectionType::Notification,
                 );

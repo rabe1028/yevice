@@ -87,21 +87,29 @@ impl Expr {
 
             Expr::Product { exprs } => {
                 // Classify each factor as constant-only or variable-containing.
+                //
+                // A factor is "constant" when it has no non-zero coefficients —
+                // this covers pure `Constant` nodes *and* degenerate cases such as
+                // `0 * x` (which has coefficient x→0.0, effectively zero).
+                // Only factors with at least one non-zero coefficient are treated
+                // as "variable-containing".
                 let mut constant_product = 1.0;
                 let mut variable_factor: Option<LinearForm> = None;
 
                 for e in exprs {
                     let lf = e.as_linear()?;
-                    if lf.coefficients.is_empty() {
-                        // Pure constant factor — accumulate into the product.
-                        constant_product *= lf.constant;
-                    } else {
+                    let has_nonzero_coeff = lf.coefficients.values().any(|&c| c != 0.0);
+                    if has_nonzero_coeff {
                         // Variable-containing factor.
                         if variable_factor.is_some() {
                             // Two variable factors → non-linear product.
                             return None;
                         }
                         variable_factor = Some(lf);
+                    } else {
+                        // Effectively a constant factor (all coefficients are 0).
+                        // The "value" of this factor is its constant term.
+                        constant_product *= lf.constant;
                     }
                 }
 
@@ -307,6 +315,54 @@ mod tests {
 
         let ceil_expr = Expr::ceil(Expr::variable("x"));
         assert!(ceil_expr.as_linear().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // as_linear() — zero-coefficient Product (#8)
+    // -------------------------------------------------------------------------
+
+    /// `0 * x` has a coefficient for `x` of 0.0.  The product must be treated
+    /// as the constant 0 (empty coefficients map, constant = 0.0).
+    #[test]
+    fn as_linear_product_zero_coeff_factor_is_constant_zero() {
+        // Linear(0.0, x, 0.0) → coefficients: {x: 0.0}, constant: 0.0
+        let zero_x = Expr::linear(0.0, Expr::variable("x"), 0.0);
+        let lf = zero_x.as_linear().unwrap();
+        assert!(
+            lf.coefficients.values().all(|&c| c == 0.0),
+            "0*x should have zero coefficient: {lf:?}"
+        );
+
+        // Product(Linear(0, x), Variable(y)) → effectively 0 * y → constant 0
+        let product = Expr::product(vec![
+            Expr::linear(0.0, Expr::variable("x"), 0.0),
+            Expr::variable("y"),
+        ]);
+        let lf_prod = product.as_linear().unwrap();
+        // The result should be: {y: 0.0} (or empty map), constant 0.
+        // The important property: no non-zero y coefficient.
+        let y_coeff = lf_prod.coefficients.get(&var("y")).copied().unwrap_or(0.0);
+        assert_eq!(
+            y_coeff, 0.0,
+            "0*x * y should yield coefficient 0 for y, got {y_coeff}"
+        );
+        assert_eq!(lf_prod.constant, 0.0);
+    }
+
+    /// `(0*x + 5) * y` — the `0*x + 5` factor has coefficient 0 for x and
+    /// constant 5.  It should be treated as constant 5, giving `{y: 5}`.
+    #[test]
+    fn as_linear_product_zero_coeff_plus_constant_times_var() {
+        // Sum(Linear(0,x,0), Constant(5)) → constant-only factor with value 5
+        let factor_lhs = Expr::sum(vec![
+            Expr::linear(0.0, Expr::variable("x"), 0.0),
+            Expr::constant(5.0),
+        ]);
+        let product = Expr::product(vec![factor_lhs, Expr::variable("y")]);
+        let lf = product.as_linear().unwrap();
+        let y_coeff = lf.coefficients.get(&var("y")).copied().unwrap_or(0.0);
+        assert_eq!(y_coeff, 5.0, "(0*x + 5) * y should give y coefficient 5");
+        assert_eq!(lf.constant, 0.0);
     }
 
     // -------------------------------------------------------------------------

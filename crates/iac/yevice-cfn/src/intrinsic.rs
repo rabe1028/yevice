@@ -321,7 +321,9 @@ fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> 
 
 fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     // !GetAtt cannot be fully resolved statically.
-    // Return a sentinel placeholder.
+    // Return a sentinel placeholder when we have enough information (logical_id + attr),
+    // otherwise pass the value through unmodified so downstream consumers can
+    // recognise it as unresolved rather than silently dropping it.
     let _ = ctx;
     match value {
         Value::String(s) => {
@@ -329,8 +331,10 @@ fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnErro
             if let Some((logical_id, attr)) = s.split_once('.') {
                 return Ok(Value::String(sentinel::make_getatt(logical_id, attr)));
             }
-            // No dot: encode as-is (degenerate case, logical_id only)
-            Ok(Value::String(format!("{{{{getatt:{s}}}}}")))
+            // No dot: cannot construct a valid sentinel (no attr present).
+            // Return the value as-is so downstream sees an unresolved reference.
+            tracing::warn!(value = %s, "!GetAtt string has no dot separator — treating as unresolved");
+            Ok(value.clone())
         }
         Value::Sequence(seq) => {
             let parts: Vec<&str> = seq.iter().filter_map(|v| v.as_str()).collect();
@@ -338,12 +342,15 @@ fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnErro
                 [logical_id, attr] => {
                     Ok(Value::String(sentinel::make_getatt(logical_id, attr)))
                 }
+                [logical_id, rest @ ..] if !rest.is_empty() => {
+                    // More than 2 elements: join remaining parts with "." as the attr.
+                    let attr = rest.join(".");
+                    Ok(Value::String(sentinel::make_getatt(logical_id, &attr)))
+                }
                 _ => {
-                    // Fallback for unusual multi-part sequences (>2 elements): join with dot.
-                    Ok(Value::String(format!(
-                        "{{{{getatt:{}}}}}",
-                        parts.join(".")
-                    )))
+                    // Empty or single-element sequence: unresolvable, pass through.
+                    tracing::warn!(parts = ?parts, "!GetAtt sequence has fewer than 2 elements — treating as unresolved");
+                    Ok(value.clone())
                 }
             }
         }
@@ -422,5 +429,74 @@ mod tests {
         let val = Value::String("SharedVpcId".into());
         let result = resolve_import_value(&val, &ctx).unwrap();
         assert_eq!(result, Value::String("vpc-12345".into()));
+    }
+
+    // --- GetAtt edge cases (#5) ---
+
+    /// A dot-notation GetAtt must produce the correct sentinel.
+    #[test]
+    fn test_getatt_dot_notation_produces_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("MyBucket.Arn".into());
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{getatt:MyBucket.Arn}}".into()),
+            "dot-notation GetAtt must produce sentinel"
+        );
+    }
+
+    /// A string with no dot must NOT produce a sentinel — it must be passed
+    /// through as-is (unresolved).
+    #[test]
+    fn test_getatt_no_dot_passes_through() {
+        let ctx = make_ctx();
+        let val = Value::String("MyBucketNoAttr".into());
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        // Must return the original value unchanged (no sentinel generated).
+        assert_eq!(
+            result,
+            Value::String("MyBucketNoAttr".into()),
+            "GetAtt without dot must be a pass-through, not a sentinel"
+        );
+        // And specifically must NOT contain the getatt sentinel format.
+        assert!(
+            !result
+                .as_str()
+                .unwrap_or("")
+                .contains("{{getatt:"),
+            "no-dot GetAtt must not produce a getatt sentinel: {result:?}"
+        );
+    }
+
+    /// A sequence with exactly 2 elements must produce the correct sentinel.
+    #[test]
+    fn test_getatt_sequence_two_elements_produces_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("MyQueue".into()),
+            Value::String("Arn".into()),
+        ]);
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        assert_eq!(result, Value::String("{{getatt:MyQueue.Arn}}".into()));
+    }
+
+    /// A sequence with 3+ elements must produce a sentinel via `make_getatt`,
+    /// joining the extra parts with ".".
+    #[test]
+    fn test_getatt_sequence_three_elements_uses_make_getatt() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("MyResource".into()),
+            Value::String("SomeNested".into()),
+            Value::String("Attr".into()),
+        ]);
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        // make_getatt("MyResource", "SomeNested.Attr") = "{{getatt:MyResource.SomeNested.Attr}}"
+        assert_eq!(
+            result,
+            Value::String("{{getatt:MyResource.SomeNested.Attr}}".into()),
+            "3-element sequence must join tail with '.' via make_getatt"
+        );
     }
 }

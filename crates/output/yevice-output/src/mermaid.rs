@@ -33,11 +33,47 @@ impl ArchitectureRenderer for MermaidRenderer {
         let topology = &cost.topology;
 
         // Build a deterministic ID → sanitized Mermaid ID map.
-        let id_map: HashMap<&LogicalId, String> = topology
-            .nodes
-            .iter()
-            .map(|n| (&n.logical_id, sanitize_id(n.logical_id.as_str())))
-            .collect();
+        // If two distinct logical IDs sanitize to the same string, append
+        // `_2`, `_3`, … (in topology.nodes order) to make them unique.
+        // Nodes whose sanitized form is already unique get no suffix.
+        let id_map: HashMap<&LogicalId, String> = {
+            // First pass: collect raw sanitized IDs in order.
+            let raw: Vec<(&LogicalId, String)> = topology
+                .nodes
+                .iter()
+                .map(|n| (&n.logical_id, sanitize_id(n.logical_id.as_str())))
+                .collect();
+
+            // Count how many times each raw sanitized ID appears.
+            let mut occurrence_count: HashMap<&str, usize> = HashMap::new();
+            for (_, raw_id) in &raw {
+                *occurrence_count.entry(raw_id.as_str()).or_insert(0) += 1;
+            }
+
+            // Second pass: assign unique IDs.
+            // For IDs that appear more than once, maintain a per-base counter
+            // so the second occurrence gets `_2`, the third `_3`, etc.
+            let mut assigned_counter: HashMap<String, usize> = HashMap::new();
+            let mut result: HashMap<&LogicalId, String> = HashMap::new();
+            for (lid, raw_id) in &raw {
+                if occurrence_count[raw_id.as_str()] == 1 {
+                    // No collision — use as-is.
+                    result.insert(lid, raw_id.clone());
+                } else {
+                    // Collision — append counter starting from 1; first gets no
+                    // suffix, subsequent ones get `_2`, `_3`, …
+                    let cnt = assigned_counter.entry(raw_id.clone()).or_insert(0);
+                    *cnt += 1;
+                    let unique_id = if *cnt == 1 {
+                        raw_id.clone()
+                    } else {
+                        format!("{raw_id}_{cnt}")
+                    };
+                    result.insert(lid, unique_id);
+                }
+            }
+            result
+        };
 
         // Build children map: parent_id → children (in topology.nodes Vec order).
         // Only record a parent relationship when the parent exists in the topology.
@@ -173,6 +209,10 @@ fn connection_type_label(ct: &ConnectionType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yevice_core::cost::ArchitectureCost;
+    use yevice_core::resource::{Connection, ConnectionType, Provider};
+    use yevice_core::topology::{Topology, TopologyNode};
+    use yevice_core::types::{LogicalId, ResourceType};
 
     #[test]
     fn sanitize_id_replaces_non_alphanumeric() {
@@ -185,5 +225,87 @@ mod tests {
     fn escape_mermaid_label_replaces_double_quote() {
         assert_eq!(escape_mermaid_label(r#"A "B" C"#), "A #quot;B#quot; C");
         assert_eq!(escape_mermaid_label("plain"), "plain");
+    }
+
+    fn make_leaf_node(logical_id: &str) -> TopologyNode {
+        TopologyNode {
+            logical_id: LogicalId::new(logical_id),
+            resource_type: ResourceType::new("aws_lambda_function"),
+            provider: Provider::Aws,
+            service_id: "aws.lambda".to_string(),
+            label: None,
+            group: None,
+        }
+    }
+
+    fn minimal_cost(topology: Topology) -> ArchitectureCost {
+        use yevice_core::types::Region;
+        ArchitectureCost {
+            name: "test".into(),
+            resources: vec![],
+            bindings: vec![],
+            region: Region::new("ap-northeast-1"),
+            topology,
+        }
+    }
+
+    /// Two logical IDs that differ only by `-` vs `_` must map to distinct
+    /// Mermaid IDs, and an edge between them must be correctly wired.
+    #[test]
+    fn colliding_sanitized_ids_get_unique_suffixes() {
+        let node_a = make_leaf_node("my-resource"); // sanitizes to "my_resource"
+        let node_b = make_leaf_node("my_resource"); // also "my_resource" → collision
+
+        let conn = Connection {
+            source: LogicalId::new("my-resource"),
+            target: LogicalId::new("my_resource"),
+            connection_type: ConnectionType::DataFlow,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        };
+
+        let topology = Topology {
+            nodes: vec![node_a, node_b],
+            connections: vec![conn],
+        };
+        let cost = minimal_cost(topology);
+        let output = MermaidRenderer.render(&cost).unwrap();
+
+        // The two nodes must have different IDs in the output.
+        // First occurrence keeps "my_resource", second gets "my_resource_2".
+        assert!(
+            output.contains("my_resource["),
+            "first node should be 'my_resource': {output}"
+        );
+        assert!(
+            output.contains("my_resource_2["),
+            "second node should be 'my_resource_2': {output}"
+        );
+
+        // The edge must wire the two distinct IDs, not use the same ID twice.
+        assert!(
+            output.contains("my_resource -->|DataFlow| my_resource_2")
+                || output.contains("my_resource_2 -->|DataFlow| my_resource"),
+            "edge must connect the two distinct IDs: {output}"
+        );
+    }
+
+    /// Nodes with no collision must keep their plain sanitized ID (no suffix).
+    #[test]
+    fn non_colliding_ids_have_no_suffix() {
+        let node_a = make_leaf_node("alpha");
+        let node_b = make_leaf_node("beta");
+        let topology = Topology {
+            nodes: vec![node_a, node_b],
+            connections: vec![],
+        };
+        let cost = minimal_cost(topology);
+        let output = MermaidRenderer.render(&cost).unwrap();
+        assert!(output.contains("alpha["), "alpha should have no suffix: {output}");
+        assert!(output.contains("beta["), "beta should have no suffix: {output}");
+        assert!(!output.contains("alpha_2"), "alpha must not get a suffix: {output}");
+        assert!(!output.contains("beta_2"), "beta must not get a suffix: {output}");
     }
 }

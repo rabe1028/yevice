@@ -540,6 +540,47 @@ fn nested_ref_no_duplicates() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// aws_s3_bucket_notification: Notification edge direction (#2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s3_bucket_notification_produces_bucket_to_lambda_edge() {
+    // s3_notification.tf has:
+    //   aws_s3_bucket.my_bucket
+    //   aws_lambda_function.my_lambda
+    //   aws_s3_bucket_notification.bucket_notif  (bucket = my_bucket, lambda = my_lambda)
+    //
+    // Expected: Notification edge from aws_s3_bucket_my_bucket → aws_lambda_function_my_lambda
+    let dir = FixtureDir::new("s3-notif", &["s3_notification.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let notif_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::Notification
+            && c.source.as_str() == "aws_s3_bucket_my_bucket"
+            && c.target.as_str() == "aws_lambda_function_my_lambda"
+    });
+    assert!(
+        notif_edge.is_some(),
+        "expected Notification edge from aws_s3_bucket_my_bucket to aws_lambda_function_my_lambda; connections = {:?}",
+        arch.connections,
+    );
+
+    // The notification config resource itself must NOT be a source.
+    let wrong_src = arch
+        .connections
+        .iter()
+        .any(|c| c.source.as_str() == "aws_s3_bucket_notification_bucket_notif");
+    assert!(
+        !wrong_src,
+        "aws_s3_bucket_notification must not be an edge source; connections = {:?}",
+        arch.connections,
+    );
+}
+
 #[test]
 fn nested_ref_spec_json_has_no_resource_ref() {
     // Verify that ResourceRef values nested in objects do not leak into the

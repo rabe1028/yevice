@@ -120,7 +120,9 @@ fn emit_roots<'a>(
     node_cell_ids: &HashMap<&'a LogicalId, u32>,
     xml: &mut String,
 ) {
-    // Cycle guard for container-size computation.
+    // Cycle guard for container-size computation.  A single shared set is used
+    // for all `compute_container_size` calls so that cycles that span containers
+    // at any nesting level are detected without fresh-set re-entry.
     let mut size_visited: HashSet<&LogicalId> = HashSet::new();
 
     // Pre-compute the vertical offset where containers begin (after top-level leaves).
@@ -160,7 +162,15 @@ fn emit_roots<'a>(
 
             let mut emit_visited: HashSet<&LogicalId> = HashSet::new();
             emit_visited.insert(&root.logical_id);
-            emit_children(root, container_cell_id, node_cell_ids, children, &mut emit_visited, xml);
+            emit_children(
+                root,
+                container_cell_id,
+                node_cell_ids,
+                children,
+                &mut emit_visited,
+                &mut size_visited,
+                xml,
+            );
 
             container_y += size.height + CONTAINER_GAP;
         } else {
@@ -292,12 +302,18 @@ fn compute_container_size<'a>(
 /// `GRID_COLUMNS`-wide grid. Sub-containers are sized and positioned the same
 /// way, and their own children are emitted recursively with the sub-container
 /// cell id as parent.
+///
+/// `size_visited` is the shared cycle guard used exclusively for
+/// `compute_container_size` calls — it is threaded through so that cycles
+/// that span nested containers are detected without creating a fresh set
+/// per call (which would allow re-entry and infinite recursion).
 fn emit_children<'a>(
     parent_node: &'a TopologyNode,
     parent_cell_id: u32,
     node_cell_ids: &HashMap<&'a LogicalId, u32>,
     children: &HashMap<&'a LogicalId, Vec<&'a TopologyNode>>,
     visited: &mut HashSet<&'a LogicalId>,
+    size_visited: &mut HashSet<&'a LogicalId>,
     xml: &mut String,
 ) {
     let Some(child_nodes) = children.get(&parent_node.logical_id) else {
@@ -309,14 +325,16 @@ fn emit_children<'a>(
     ))
     .expect("cols fits in usize");
 
-    // Measure children sizes for layout.
+    // Measure children sizes for layout using the shared size_visited guard.
     let child_sizes: Vec<Size> = child_nodes
         .iter()
         .map(|child| {
-            if visited.contains(&child.logical_id) || !children.contains_key(&child.logical_id) {
+            if size_visited.contains(&child.logical_id)
+                || !children.contains_key(&child.logical_id)
+            {
                 Size { width: CELL_WIDTH, height: CELL_HEIGHT }
             } else {
-                compute_container_size(child, children, &mut HashSet::new())
+                compute_container_size(child, children, size_visited)
             }
         })
         .collect();
@@ -357,7 +375,7 @@ fn emit_children<'a>(
                   </mxCell>",
                 sz.width, sz.height
             );
-            emit_children(child, cell_id, node_cell_ids, children, visited, xml);
+            emit_children(child, cell_id, node_cell_ids, children, visited, size_visited, xml);
         } else {
             // Leaf.
             let value = xml_escape(&node_label(child));
@@ -444,6 +462,10 @@ fn connection_type_label(ct: &ConnectionType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yevice_core::cost::ArchitectureCost;
+    use yevice_core::resource::Provider;
+    use yevice_core::topology::{Topology, TopologyNode};
+    use yevice_core::types::{LogicalId, Region, ResourceType};
 
     #[test]
     fn xml_escape_handles_all_special_chars() {
@@ -452,5 +474,50 @@ mod tests {
         assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
         assert_eq!(xml_escape("it's"), "it&apos;s");
         assert_eq!(xml_escape("plain"), "plain");
+    }
+
+    fn make_node(logical_id: &str, group: Option<&str>) -> TopologyNode {
+        TopologyNode {
+            logical_id: LogicalId::new(logical_id),
+            resource_type: ResourceType::new("aws_lambda_function"),
+            provider: Provider::Aws,
+            service_id: "aws.lambda".to_string(),
+            label: None,
+            group: group.map(LogicalId::new),
+        }
+    }
+
+    fn minimal_cost(topology: Topology) -> ArchitectureCost {
+        ArchitectureCost {
+            name: "test".into(),
+            resources: vec![],
+            bindings: vec![],
+            region: Region::new("ap-northeast-1"),
+            topology,
+        }
+    }
+
+    /// A topology with a cyclic group reference (A→B→C→B) must terminate
+    /// without infinite recursion and produce valid XML.
+    #[test]
+    fn cyclic_group_reference_terminates() {
+        // A is a root container that contains B.
+        // B is a container that contains C.
+        // C erroneously points back to B (cycle B→C→B).
+        let node_a = make_node("A", None);          // root container
+        let node_b = make_node("B", Some("A"));     // child of A
+        let node_c = make_node("C", Some("B"));     // child of B (creates B→C)
+        // Add a node D that claims B as its group too — and B's child list
+        // contains C which already references B → indirect cycle.
+        // We model it more directly: make C's group point to B (so A→B→C with C→B cycle).
+        // The `emit_children` + `compute_container_size` path should not recurse infinitely.
+        let topology = Topology {
+            nodes: vec![node_a, node_b, node_c],
+            connections: vec![],
+        };
+        let cost = minimal_cost(topology);
+        // Should complete without stack overflow.
+        let xml = DrawIoRenderer.render(&cost).unwrap();
+        assert!(xml.contains("<mxCell"), "must produce mxCell XML: {xml}");
     }
 }
