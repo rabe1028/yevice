@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost},
     expr::Expr,
     resource::Provider,
@@ -8,7 +9,7 @@ use yevice_core::{
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
 
-use super::lambda::egress_cost_expr;
+use crate::common::egress_cost_expr;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub enum Ec2Os {
@@ -25,8 +26,6 @@ pub struct Ec2Spec {
 }
 
 pub struct Ec2Service;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for Ec2Service {
     type Spec = Ec2Spec;
@@ -80,6 +79,3 @@ impl Service for Ec2Service {
         })
     }
 }
-
-// silence unused
-const _: f64 = HOURS_PER_MONTH;

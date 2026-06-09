@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  SNS subscription edges.
+  - AWS::SNS::Topic with inline Subscription list -> Lambda (Notification edge)
+  - AWS::SNS::Subscription resource (standalone) -> SQS (Notification edge)
+  The SNS->Lambda notification is visualisation-only (AwsNotificationRule only handles S3 source).
+
+Resources:
+  MyTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: my-topic
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt SubscriberFunction.Arn
+
+  SubscriberFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sns-subscriber
+      MemorySize: 128
+      Timeout: 30
+      Runtime: python3.12
+
+  AnotherTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: another-topic
+
+  SubscriberQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+
+  QueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AnotherTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SubscriberQueue.Arn

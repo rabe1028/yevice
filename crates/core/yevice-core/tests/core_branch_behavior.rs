@@ -49,11 +49,13 @@ fn violation(severity: Severity) -> Violation {
 fn has_errors_is_true_only_when_an_error_violation_is_present() {
     let with_error = ValidationResult {
         violations: vec![violation(Severity::Warning), violation(Severity::Error)],
+        skipped: Vec::new(),
     };
     assert!(with_error.has_errors());
 
     let without_error = ValidationResult {
         violations: vec![violation(Severity::Warning), violation(Severity::Info)],
+        skipped: Vec::new(),
     };
     assert!(!without_error.has_errors());
 }
@@ -62,11 +64,13 @@ fn has_errors_is_true_only_when_an_error_violation_is_present() {
 fn has_warnings_is_true_only_when_a_warning_violation_is_present() {
     let with_warning = ValidationResult {
         violations: vec![violation(Severity::Info), violation(Severity::Warning)],
+        skipped: Vec::new(),
     };
     assert!(with_warning.has_warnings());
 
     let without_warning = ValidationResult {
         violations: vec![violation(Severity::Error), violation(Severity::Info)],
+        skipped: Vec::new(),
     };
     assert!(!without_warning.has_warnings());
 }
@@ -117,6 +121,17 @@ fn validate_capacity_skips_constraints_whose_variable_is_unprovided() {
             .violations
             .is_empty()
     );
+}
+
+#[test]
+fn validate_capacity_records_skipped_when_variable_is_missing() {
+    let models = vec![model(10.0, Severity::Error)];
+    // "x" is not provided -> constraint is skipped and recorded.
+    let result = validate_capacity(&models, &Params::new());
+    assert!(result.violations.is_empty());
+    assert_eq!(result.skipped.len(), 1);
+    assert_eq!(result.skipped[0].resource, LogicalId::new("svc"));
+    assert_eq!(result.skipped[0].dimension, "dim");
 }
 
 #[test]
@@ -182,6 +197,7 @@ fn architecture(resources: Vec<ResourceCost>, bindings: Vec<VariableBinding>) ->
         resources,
         bindings,
         region: Region::new("test"),
+        topology: yevice_core::Topology::default(),
     }
 }
 

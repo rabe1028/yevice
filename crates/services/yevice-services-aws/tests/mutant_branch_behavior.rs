@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use yevice_core::{
-    capacity::{QuotaType, RegionQuotas, Severity},
+    capacity::{QuotaType, Quotas, Severity},
     evaluate::{Params, evaluate},
     expr::Expr,
     types::{LogicalId, ResourceType, VariableName},
@@ -11,12 +11,19 @@ use yevice_pricing::{
     error::PricingError,
 };
 use yevice_service_api::Service;
-use yevice_services_aws::services::{
-    batch::{BatchEbsConfig, BatchJobDefinitionSpec, BatchLaunchType, BatchService},
-    dynamodb::{DynamoDbBillingMode, DynamoDbService, DynamoDbSpec},
-    kinesis::{KinesisService, KinesisSpec, KinesisStreamMode},
-    lambda::{LambdaService, LambdaSpec},
-    rds::{RdsEngine, RdsService, RdsSpec},
+use yevice_services_aws::{
+    quotas::{
+        DYNAMODB_MAX_RCU_PER_TABLE, DYNAMODB_MAX_WCU_PER_TABLE, KINESIS_MAX_MB_PER_SEC_PER_SHARD,
+        KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD, KINESIS_MAX_SHARDS_PER_STREAM,
+        LAMBDA_CONCURRENT_EXECUTIONS,
+    },
+    services::{
+        batch::{BatchEbsConfig, BatchJobDefinitionSpec, BatchLaunchType, BatchService},
+        dynamodb::{DynamoDbBillingMode, DynamoDbService, DynamoDbSpec},
+        kinesis::{KinesisService, KinesisSpec, KinesisStreamMode},
+        lambda::{LambdaService, LambdaSpec},
+        rds::{RdsEngine, RdsService, RdsSpec},
+    },
 };
 
 struct BranchCatalog;
@@ -72,16 +79,14 @@ fn params<const N: usize>(entries: [(VariableName, f64); N]) -> Params {
     HashMap::from(entries)
 }
 
-fn test_quotas() -> RegionQuotas {
-    RegionQuotas {
-        lambda_concurrent_executions: 77.0,
-        dynamodb_max_wcu_per_table: 100.0,
-        dynamodb_max_rcu_per_table: 130.0,
-        dynamodb_max_tables: 230.0,
-        kinesis_max_shards_per_stream: 50.0,
-        kinesis_max_records_per_sec_per_shard: 250.0,
-        kinesis_max_mb_per_sec_per_shard: 2.5,
-    }
+fn test_quotas() -> Quotas {
+    Quotas::default()
+        .with(LAMBDA_CONCURRENT_EXECUTIONS, 77.0)
+        .with(DYNAMODB_MAX_WCU_PER_TABLE, 100.0)
+        .with(DYNAMODB_MAX_RCU_PER_TABLE, 130.0)
+        .with(KINESIS_MAX_SHARDS_PER_STREAM, 50.0)
+        .with(KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD, 250.0)
+        .with(KINESIS_MAX_MB_PER_SEC_PER_SHARD, 2.5)
 }
 
 #[test]

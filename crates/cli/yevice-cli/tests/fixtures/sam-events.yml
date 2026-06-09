@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  SAM function Events (SQS and Kinesis types) — tests EventSource edge extraction.
+  - SqsFunction with Events.MyQueue (Type: SQS)
+  - KinesisFunction with Events.MyStream (Type: Kinesis)
+  - DynamoDB stream as event source via Events.MyTable (Type: DynamoDB)
+  Also includes an AWS::Lambda::EventSourceMapping for the same SQS queue
+  to verify deduplication (only one edge should be produced for that pair).
+
+Resources:
+  MyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+
+  SqsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sqs-consumer
+      MemorySize: 128
+      Timeout: 30
+      Events:
+        MyQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MyQueue.Arn
+            BatchSize: 10
+
+  MyStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+      RetentionPeriodHours: 24
+
+  KinesisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: kinesis-consumer
+      MemorySize: 256
+      Timeout: 60
+      Events:
+        MyStream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt MyStream.Arn
+            BatchSize: 100
+            ParallelizationFactor: 2
+
+  MyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  DynamoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dynamo-consumer
+      MemorySize: 128
+      Timeout: 30
+      Events:
+        MyTable:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt MyTable.StreamArn
+            BatchSize: 50

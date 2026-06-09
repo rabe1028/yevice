@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
@@ -8,7 +9,7 @@ use yevice_core::{
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
 
-use super::lambda::egress_cost_expr;
+use crate::common::egress_cost_expr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EcsFargateSpec {
@@ -16,8 +17,6 @@ pub struct EcsFargateSpec {
 }
 
 pub struct EcsFargateService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for EcsFargateService {
     type Spec = EcsFargateSpec;
@@ -107,8 +106,6 @@ impl Service for EcsFargateService {
         })
     }
 }
-
-const _: f64 = HOURS_PER_MONTH;
 
 #[cfg(test)]
 mod tests {

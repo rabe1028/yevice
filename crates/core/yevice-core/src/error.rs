@@ -4,4 +4,6 @@ use thiserror::Error;
 pub enum CoreError {
     #[error("undefined variable: {0}")]
     UndefinedVariable(String),
+    #[error("division by zero in cost expression")]
+    DivisionByZero,
 }

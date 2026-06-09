@@ -1,6 +1,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 use yevice_core::{
-    capacity::{CapacityModel, RegionQuotas},
+    capacity::{CapacityModel, Quotas},
     cost::ResourceCost,
     resource::{Provider, ResourceShell},
     types::{LogicalId, ResourceType},
@@ -33,7 +33,7 @@ pub trait Service: Send + Sync {
         &self,
         _id: &LogicalId,
         _spec: &Self::Spec,
-        _quotas: &RegionQuotas,
+        _quotas: &Quotas,
     ) -> Option<CapacityModel> {
         None
     }
@@ -56,7 +56,7 @@ pub trait AnyService: Send + Sync {
         &self,
         id: &LogicalId,
         shell: &ResourceShell,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Option<CapacityModel>;
 }
 
@@ -90,9 +90,20 @@ impl<S: Service + 'static> AnyService for ServiceAdapter<S> {
         &self,
         id: &LogicalId,
         shell: &ResourceShell,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Option<CapacityModel> {
-        let spec: S::Spec = shell.decode().ok()?;
+        let spec: S::Spec = match shell.decode() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    service_id = self.0.id(),
+                    resource = %id,
+                    error = %e,
+                    "failed to decode spec for capacity; skipping"
+                );
+                return None;
+            }
+        };
         self.0.build_capacity(id, &spec, quotas)
     }
 }

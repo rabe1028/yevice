@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    capacity::{CapacityModel, Constraint, QuotaType, RegionQuotas, Severity},
+    HOURS_PER_MONTH,
+    capacity::{CapacityModel, Constraint, QuotaType, Quotas, Severity},
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::{Expr, Tier},
     resource::Provider,
@@ -8,6 +9,11 @@ use yevice_core::{
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
+
+use crate::quotas::{
+    DEFAULT_DYNAMODB_MAX_WCU_PER_TABLE, DEFAULT_DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT,
+    DYNAMODB_MAX_WCU_PER_TABLE, DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DynamoDbBillingMode {
@@ -26,8 +32,6 @@ pub struct DynamoDbSpec {
 }
 
 pub struct DynamoDbService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for DynamoDbService {
     type Spec = DynamoDbSpec;
@@ -217,8 +221,12 @@ impl Service for DynamoDbService {
         &self,
         id: &LogicalId,
         spec: &DynamoDbSpec,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Option<CapacityModel> {
+        let max_wcu = quotas
+            .get(DYNAMODB_MAX_WCU_PER_TABLE)
+            .unwrap_or(DEFAULT_DYNAMODB_MAX_WCU_PER_TABLE);
+
         match &spec.billing_mode {
             DynamoDbBillingMode::Provisioned {
                 write_capacity_units,
@@ -238,11 +246,11 @@ impl Service for DynamoDbService {
                                 .into(),
                     });
 
-                    if *wcu > quotas.dynamodb_max_wcu_per_table * 0.8 {
+                    if *wcu > max_wcu * 0.8 {
                         constraints.push(Constraint {
                             dimension: "wcu_quota".into(),
                             required: Expr::constant(*wcu),
-                            limit: quotas.dynamodb_max_wcu_per_table,
+                            limit: max_wcu,
                             quota_type: QuotaType::Soft,
                             severity: Severity::Warning,
                             message_template:
@@ -281,7 +289,9 @@ impl Service for DynamoDbService {
                 constraints: vec![Constraint {
                     dimension: "peak_writes_per_sec".into(),
                     required: Expr::variable(id.var("peak_writes_per_sec")),
-                    limit: 40_000.0,
+                    limit: quotas
+                        .get(DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT)
+                        .unwrap_or(DEFAULT_DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT),
                     quota_type: QuotaType::Soft,
                     severity: Severity::Warning,
                     message_template:

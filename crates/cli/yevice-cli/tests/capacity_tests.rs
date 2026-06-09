@@ -6,14 +6,15 @@ mod common;
 use common::{Params, VariableName, build_arch, load_fixture};
 
 use yevice_cfn::{convert, parser};
-use yevice_core::capacity::{RegionQuotas, Severity, validate_capacity};
+use yevice_core::capacity::{Quotas, Severity, validate_capacity};
 use yevice_service_api::{CfnAdapterRegistry, ServiceCatalog, TfAdapterRegistry};
 use yevice_services_aws::AwsPricingCatalog;
+use yevice_services_aws::quotas::LAMBDA_CONCURRENT_EXECUTIONS;
 
 fn build_capacity(
     name: &str,
     resources: &std::collections::HashMap<String, parser::CfnResource>,
-    quotas: &RegionQuotas,
+    quotas: &Quotas,
 ) -> Vec<yevice_core::capacity::CapacityModel> {
     let tmpl = parser::CfnTemplate {
         parameters: std::collections::HashMap::new(),
@@ -33,7 +34,7 @@ fn build_capacity(
 #[test]
 fn test_lambda_capacity_model_exists() {
     let resources = load_fixture("serverless-rest-api.yml");
-    let quotas = RegionQuotas::default();
+    let quotas = Quotas::default();
     let models = build_capacity("serverless-rest-api", &resources, &quotas);
 
     let lambda_models: Vec<_> = models
@@ -58,10 +59,7 @@ fn test_lambda_capacity_model_exists() {
 #[test]
 fn test_lambda_concurrency_violation_detected() {
     let resources = load_fixture("serverless-rest-api.yml");
-    let quotas = RegionQuotas {
-        lambda_concurrent_executions: 100.0,
-        ..RegionQuotas::default()
-    };
+    let quotas = Quotas::default().with(LAMBDA_CONCURRENT_EXECUTIONS, 100.0);
     let models = build_capacity("serverless-rest-api", &resources, &quotas);
     let arch = build_arch("serverless-rest-api", &resources, false);
 
@@ -100,7 +98,7 @@ fn test_lambda_concurrency_violation_detected() {
 #[test]
 fn test_lambda_concurrency_within_quota_passes() {
     let resources = load_fixture("serverless-rest-api.yml");
-    let quotas = RegionQuotas::default(); // 1000 concurrent default
+    let quotas = Quotas::default(); // uses default fallback (1000 concurrent)
     let models = build_capacity("serverless-rest-api", &resources, &quotas);
     let arch = build_arch("serverless-rest-api", &resources, false);
 
@@ -137,7 +135,7 @@ fn test_lambda_concurrency_within_quota_passes() {
 #[test]
 fn test_dynamodb_provisioned_capacity_model() {
     let resources = load_fixture("provisioned-dynamodb.yml");
-    let quotas = RegionQuotas::default();
+    let quotas = Quotas::default();
     let models = build_capacity("provisioned-dynamodb", &resources, &quotas);
 
     let ddb_models: Vec<_> = models
@@ -160,7 +158,7 @@ fn test_dynamodb_provisioned_capacity_model() {
 #[test]
 fn test_kinesis_provisioned_capacity_model() {
     let resources = load_fixture("streaming-pipeline.yml");
-    let quotas = RegionQuotas::default();
+    let quotas = Quotas::default();
     let models = build_capacity("streaming-pipeline", &resources, &quotas);
 
     let kinesis_models: Vec<_> = models
@@ -189,7 +187,7 @@ fn test_kinesis_provisioned_capacity_model() {
 #[test]
 fn test_kinesis_shard_throughput_violation() {
     let resources = load_fixture("streaming-pipeline.yml");
-    let quotas = RegionQuotas::default(); // 1 MB/sec/shard, 1000 records/sec/shard
+    let quotas = Quotas::default(); // uses default fallback (1 MB/sec/shard, 1000 records/sec/shard)
     let models = build_capacity("streaming-pipeline", &resources, &quotas);
 
     let mut params = Params::new();

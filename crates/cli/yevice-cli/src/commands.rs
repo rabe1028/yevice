@@ -2,21 +2,26 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
+use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
+use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
+use yevice_solver::{EnumerationSolver, Solver, SolverError};
 
 use yevice_cfn::convert as cfn_convert;
 use yevice_cfn::parser;
 use yevice_core::bindings::{BindingsFile, derive_bindings, to_variable_bindings};
-use yevice_core::capacity::{self, RegionQuotas, Severity};
+use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
-use yevice_core::resource::Architecture;
+use yevice_core::resource::{Architecture, Provider};
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::types::VariableName;
-use yevice_pricing::{PriceCatalog, gcp_hardcoded_pricing};
-use yevice_service_api::{CfnAdapterRegistry, ServiceCatalog, TfAdapterRegistry};
-use yevice_services_aws::AwsPricingCatalog;
-use yevice_services_gcp::GcpPricingCatalog;
+use yevice_service_api::{
+    CfnAdapterRegistry, MultiProviderCatalog, ProviderPlugin, Registration, ServiceCatalog,
+    TfAdapterRegistry,
+};
+use yevice_services_aws::AwsPlugin;
+use yevice_services_gcp::GcpPlugin;
+use yevice_wrangler::CloudflarePlugin;
 
 const DEFAULT_ARCHITECTURE_NAME: &str = "default";
 
@@ -37,21 +42,6 @@ enum TfProvider {
 
 struct ParsedInput {
     architecture: Architecture,
-    tf_provider: Option<TfProvider>,
-}
-
-enum PricingCatalogSelection {
-    Aws(AwsPricingCatalog),
-    Gcp(GcpPricingCatalog),
-}
-
-impl PricingCatalogSelection {
-    fn as_catalog(&self) -> &dyn PriceCatalog {
-        match self {
-            Self::Aws(catalog) => catalog,
-            Self::Gcp(catalog) => catalog,
-        }
-    }
 }
 
 fn resolve_cfn_template(
@@ -83,13 +73,28 @@ fn resolve_cfn_template(
     })
 }
 
+/// Returns the list of all provider plugins. Both `build_registries` and
+/// `build_pricing_resolver` iterate over this single source of truth.
+fn provider_plugins() -> Vec<Box<dyn ProviderPlugin>> {
+    vec![
+        Box::new(AwsPlugin),
+        Box::new(GcpPlugin),
+        Box::new(CloudflarePlugin),
+    ]
+}
+
 fn build_registries() -> (ServiceCatalog, CfnAdapterRegistry, TfAdapterRegistry) {
     let mut catalog = ServiceCatalog::new();
     let mut cfn_adapters = CfnAdapterRegistry::new();
     let mut tf_adapters = TfAdapterRegistry::new();
-    yevice_services_aws::register(&mut catalog, &mut cfn_adapters, &mut tf_adapters);
-    yevice_services_gcp::register(&mut catalog, &mut tf_adapters);
-    yevice_wrangler::register(&mut catalog);
+    for plugin in provider_plugins() {
+        let mut reg = Registration {
+            catalog: &mut catalog,
+            cfn_adapters: &mut cfn_adapters,
+            tf_adapters: &mut tf_adapters,
+        };
+        plugin.register(&mut reg);
+    }
     (catalog, cfn_adapters, tf_adapters)
 }
 
@@ -101,6 +106,7 @@ pub fn generate(
     name: &str,
     output_path: &str,
     region: &str,
+    provider_regions: &HashMap<Provider, String>,
     input_format: Option<InputFormat>,
     strict: bool,
     list_price: bool,
@@ -119,9 +125,14 @@ pub fn generate(
         &cfn_adapters,
         &tf_adapters,
     )?;
-    let pricing = select_pricing_catalog(format, parsed_input.tf_provider, region, list_price)?;
+    let pricing = build_pricing_resolver(
+        &parsed_input.architecture,
+        region,
+        provider_regions,
+        list_price,
+    );
     let mut cost_model = catalog
-        .build_cost_model(&parsed_input.architecture, pricing.as_catalog(), strict)
+        .build_cost_model(&parsed_input.architecture, &pricing, strict)
         .context("failed to build cost model")?;
 
     if format == InputFormat::Cfn
@@ -165,48 +176,10 @@ pub fn evaluate(cost_model_path: &str, params_path: &str, breakdown: bool) -> Re
     println!("\n{}: Monthly Cost Estimate", result.name);
 
     if breakdown {
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
-        table.set_header(vec!["Resource / Component", "Monthly Cost (USD)"]);
-
-        for r in &result.resources {
-            table.add_row(vec![
-                Cell::new(&r.label).fg(Color::Cyan),
-                Cell::new(format!("${:.2}", r.monthly_cost)).fg(Color::Cyan),
-            ]);
-            for (name, cost) in &r.component_costs {
-                table.add_row(vec![
-                    Cell::new(format!("  └─ {name}")),
-                    Cell::new(format!("${cost:.4}")),
-                ]);
-            }
-        }
-
-        table.add_row(vec![
-            Cell::new("TOTAL").fg(Color::Green),
-            Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
-        ]);
-
+        let table = crate::render::render_eval_breakdown_table(&result);
         println!("{table}");
     } else {
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
-        table.set_header(vec!["Resource", "Type", "Monthly Cost (USD)"]);
-
-        for r in &result.resources {
-            table.add_row(vec![
-                Cell::new(&r.label),
-                Cell::new(&r.resource_type),
-                Cell::new(format!("${:.2}", r.monthly_cost)),
-            ]);
-        }
-
-        table.add_row(vec![
-            Cell::new("TOTAL").fg(Color::Green),
-            Cell::new(""),
-            Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
-        ]);
-
+        let table = crate::render::render_eval_table(&result);
         println!("{table}");
     }
 
@@ -224,92 +197,7 @@ pub fn compare(cost_model_paths: &[String], params_path: &str, breakdown: bool) 
         results.push(result);
     }
 
-    // Summary table
-    let mut summary = Table::new();
-    summary.load_preset(UTF8_FULL);
-
-    let mut header = vec![Cell::new("Architecture")];
-    for r in &results {
-        header.push(Cell::new(&r.name));
-    }
-    summary.set_header(header);
-
-    // Total row
-    let mut total_row = vec![Cell::new("Total Monthly Cost").fg(Color::Green)];
-    for r in &results {
-        total_row.push(Cell::new(format!("${:.2}", r.total_monthly_cost)));
-    }
-    summary.add_row(total_row);
-
-    // Collect all unique resource types across architectures
-    let mut all_labels: Vec<String> = Vec::new();
-    for r in &results {
-        for res in &r.resources {
-            if !all_labels.contains(&res.label) {
-                all_labels.push(res.label.clone());
-            }
-        }
-    }
-
-    for label in &all_labels {
-        let mut row = vec![Cell::new(label)];
-        for r in &results {
-            let cost = r
-                .resources
-                .iter()
-                .find(|res| &res.label == label)
-                .map_or_else(
-                    || "-".to_string(),
-                    |res| format!("${:.2}", res.monthly_cost),
-                );
-            row.push(Cell::new(cost));
-        }
-        summary.add_row(row);
-
-        // Breakdown: component rows
-        if breakdown {
-            // Collect all component names across all architectures for this resource label
-            let mut all_component_names: Vec<String> = Vec::new();
-            for r in &results {
-                if let Some(res) = r.resources.iter().find(|res| &res.label == label) {
-                    for (name, _) in &res.component_costs {
-                        if !all_component_names.contains(name) {
-                            all_component_names.push(name.clone());
-                        }
-                    }
-                }
-            }
-            for comp_name in &all_component_names {
-                let mut comp_row = vec![Cell::new(format!("  └─ {comp_name}"))];
-                for r in &results {
-                    let comp_cost = r
-                        .resources
-                        .iter()
-                        .find(|res| &res.label == label)
-                        .and_then(|res| res.component_costs.iter().find(|(n, _)| n == comp_name))
-                        .map_or_else(|| "-".to_string(), |(_, v)| format!("${v:.4}"));
-                    comp_row.push(Cell::new(comp_cost));
-                }
-                summary.add_row(comp_row);
-            }
-        }
-    }
-
-    // Difference row (if exactly 2 architectures)
-    if results.len() == 2 {
-        let diff = results[1].total_monthly_cost - results[0].total_monthly_cost;
-        let diff_str = if diff >= 0.0 {
-            format!("+${diff:.2}")
-        } else {
-            format!("-${:.2}", diff.abs())
-        };
-        let color = if diff > 0.0 { Color::Red } else { Color::Green };
-        summary.add_row(vec![
-            Cell::new("Difference"),
-            Cell::new("-"),
-            Cell::new(diff_str).fg(color),
-        ]);
-    }
+    let summary = crate::render::render_compare_table(&results, breakdown);
 
     println!("\nArchitecture Cost Comparison");
     println!("{summary}");
@@ -326,6 +214,10 @@ pub fn sensitivity(
     steps: usize,
     breakdown: bool,
 ) -> Result<()> {
+    if steps == 0 {
+        bail!("--steps must be at least 1");
+    }
+
     let arch = load_cost_model(cost_model_path)?;
     let base_params = load_params(params_path)?;
 
@@ -342,15 +234,8 @@ pub fn sensitivity(
         .map(|r| r.label.clone())
         .collect();
 
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.set_header(vec![
-        Cell::new(var_name),
-        Cell::new("Total Monthly Cost"),
-        Cell::new("Delta from Base"),
-    ]);
-
     // When breakdown is true, collect step results for a second table.
+    let mut sensitivity_rows: Vec<crate::render::SensitivityRow> = Vec::new();
     let mut breakdown_rows: Vec<(f64, Vec<f64>)> = Vec::new();
 
     for i in 0..=steps {
@@ -361,23 +246,11 @@ pub fn sensitivity(
         match evaluate_architecture(&arch, &params) {
             Ok(result) => {
                 let delta = result.total_monthly_cost - base_cost;
-                let delta_str = if delta >= 0.0 {
-                    format!("+${delta:.2}")
-                } else {
-                    format!("-${:.2}", delta.abs())
-                };
-                let color = if delta > 0.0 {
-                    Color::Red
-                } else if delta < 0.0 {
-                    Color::Green
-                } else {
-                    Color::White
-                };
-                table.add_row(vec![
-                    Cell::new(format_number(value)),
-                    Cell::new(format!("${:.2}", result.total_monthly_cost)),
-                    Cell::new(delta_str).fg(color),
-                ]);
+                sensitivity_rows.push(crate::render::SensitivityRow::Ok {
+                    value,
+                    total: result.total_monthly_cost,
+                    delta,
+                });
 
                 if breakdown {
                     let costs: Vec<f64> = resource_labels
@@ -394,11 +267,10 @@ pub fn sensitivity(
                 }
             }
             Err(e) => {
-                table.add_row(vec![
-                    Cell::new(format_number(value)),
-                    Cell::new(format!("ERROR: {e}")),
-                    Cell::new("-"),
-                ]);
+                sensitivity_rows.push(crate::render::SensitivityRow::Err {
+                    value,
+                    message: e.to_string(),
+                });
                 if breakdown {
                     breakdown_rows.push((value, vec![0.0; resource_labels.len()]));
                 }
@@ -406,10 +278,12 @@ pub fn sensitivity(
         }
     }
 
+    let table = crate::render::render_sensitivity_table(var_name, &sensitivity_rows);
+
     println!("\nSensitivity Analysis: {var_name}");
     println!(
         "Base value: {}",
-        format_number(
+        crate::render::format_number(
             base_params
                 .get(&VariableName::new(var_name))
                 .copied()
@@ -421,22 +295,11 @@ pub fn sensitivity(
 
     if breakdown && !resource_labels.is_empty() {
         println!("\nResource Breakdown by Step:");
-        let mut bd_table = Table::new();
-        bd_table.load_preset(UTF8_FULL);
-        let mut bd_header = vec![Cell::new(var_name)];
-        for label in &resource_labels {
-            bd_header.push(Cell::new(label));
-        }
-        bd_table.set_header(bd_header);
-
-        for (value, costs) in &breakdown_rows {
-            let mut row = vec![Cell::new(format_number(*value))];
-            for cost in costs {
-                row.push(Cell::new(format!("${cost:.2}")));
-            }
-            bd_table.add_row(row);
-        }
-
+        let bd_table = crate::render::render_sensitivity_breakdown_table(
+            var_name,
+            &resource_labels,
+            &breakdown_rows,
+        );
         println!("{bd_table}");
     }
 
@@ -474,7 +337,7 @@ pub fn validate(
 
     let quotas = match quotas_path {
         Some(p) => load_quotas(p).context("failed to load quotas file")?,
-        None => RegionQuotas::default(),
+        None => catalog.default_quotas(region),
     };
 
     let capacity_models = catalog.build_capacity_models(&architecture, &quotas);
@@ -483,7 +346,7 @@ pub fn validate(
     // `Worker_requests` from `Queue_requests`) with any user-supplied bindings.
     // Without the architecture-derived ones, downstream user bindings that
     // depend on auto-derived variables would never resolve.
-    let mut all_bindings = derive_bindings(&architecture);
+    let mut all_bindings = derive_bindings(&architecture, catalog.connection_rules());
     if format == InputFormat::Cfn
         && let Some(path) = bindings_path
     {
@@ -501,34 +364,19 @@ pub fn validate(
         let json = serde_json::to_string_pretty(&result).context("failed to serialize")?;
         println!("{json}");
     } else if result.violations.is_empty() {
-        println!("All capacity constraints satisfied.");
-    } else {
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
-        table.set_header(vec![
-            Cell::new("Severity"),
-            Cell::new("Resource"),
-            Cell::new("Constraint"),
-            Cell::new("Required"),
-            Cell::new("Limit"),
-            Cell::new("Message"),
-        ]);
-
-        for v in &result.violations {
-            let color = match v.severity {
-                Severity::Error => Color::Red,
-                Severity::Warning => Color::Yellow,
-                Severity::Info => Color::Cyan,
-            };
-            table.add_row(vec![
-                Cell::new(v.severity.to_string()).fg(color),
-                Cell::new(v.resource.to_string()),
-                Cell::new(&v.dimension),
-                Cell::new(format!("{:.0}", v.required)),
-                Cell::new(format!("{:.0}", v.limit)),
-                Cell::new(&v.message),
-            ]);
+        if result.skipped.is_empty() {
+            println!("All capacity constraints satisfied.");
+        } else {
+            println!(
+                "No constraint violations found, but {} constraint(s) could not be evaluated (missing variables):",
+                result.skipped.len()
+            );
+            for s in &result.skipped {
+                println!("  - {} / {}: {}", s.resource, s.dimension, s.reason);
+            }
         }
+    } else {
+        let table = crate::render::render_validate_table(&result.violations);
 
         println!("\nCapacity Validation");
         println!("{table}");
@@ -544,10 +392,154 @@ pub fn validate(
             .filter(|v| v.severity == Severity::Warning)
             .count();
         println!("\n{errors} error(s), {warnings} warning(s)");
+
+        if !result.skipped.is_empty() {
+            println!(
+                "Note: {} constraint(s) were not evaluated (missing variables):",
+                result.skipped.len()
+            );
+            for s in &result.skipped {
+                println!("  - {} / {}: {}", s.resource, s.dimension, s.reason);
+            }
+        }
     }
 
     if result.has_errors() {
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Find the optimal decision-variable assignment that minimizes (or maximizes)
+/// the total cost of a cost model.
+///
+/// # Arguments
+///
+/// * `cost_model_path` – path to a JSON cost model produced by `generate`.
+/// * `params_path` – optional path to a usage-params YAML; values are treated
+///   as fixed (non-decision) variables.
+/// * `decisions` – each element is `"NAME=v1,v2,..."` specifying one decision
+///   variable and its candidate domain.
+/// * `direction` – `"min"` to minimize (default) or `"max"` to maximize.
+pub fn optimize(
+    cost_model_path: &str,
+    params_path: Option<&str>,
+    decisions: &[String],
+    direction: &str,
+) -> Result<()> {
+    let arch = load_cost_model(cost_model_path)?;
+    let objective = arch.total_expr();
+
+    let fixed_params = match params_path {
+        Some(p) => load_params(p)?,
+        None => Params::new(),
+    };
+
+    // Parse --decision NAME=v1,v2,...
+    let mut decision_variables: Vec<DecisionVariable> = Vec::new();
+    for spec in decisions {
+        let (name_part, values_part) = spec.split_once('=').with_context(|| {
+            format!("invalid --decision value '{spec}': expected NAME=v1,v2,...")
+        })?;
+        let name = VariableName::new(name_part.trim());
+        if values_part.trim().is_empty() {
+            bail!("decision variable '{name_part}' has an empty domain");
+        }
+        let domain: Vec<f64> = values_part
+            .split(',')
+            .map(|s| {
+                s.trim().parse::<f64>().with_context(|| {
+                    format!("invalid domain value '{s}' for decision variable '{name_part}'")
+                })
+            })
+            .collect::<Result<_>>()?;
+        decision_variables.push(DecisionVariable { name, domain });
+    }
+
+    // Every variable in the objective must be bound — either fixed via --params,
+    // chosen as a --decision, or derivable via a binding whose own inputs are
+    // themselves bound.  Compute the set via a fixed-point closure so that only
+    // bindings whose source variables are already satisfied propagate their
+    // targets into the bound set.  This prevents a binding whose source is
+    // missing from silently masking an unbound variable in the objective.
+    let mut bound: std::collections::HashSet<VariableName> = fixed_params.keys().cloned().collect();
+    for dv in &decision_variables {
+        bound.insert(dv.name.clone());
+    }
+    loop {
+        let mut progressed = false;
+        for b in arch.all_bindings() {
+            if bound.contains(&b.target) {
+                continue;
+            }
+            if b.expr.variables().iter().all(|v| bound.contains(v)) {
+                bound.insert(b.target.clone());
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    let unbound: Vec<String> = objective
+        .variables()
+        .into_iter()
+        .filter(|v| !bound.contains(v))
+        .map(|v| v.to_string())
+        .collect();
+    if !unbound.is_empty() {
+        bail!(
+            "cannot optimize: {} objective variable(s) are unbound; provide them via --params \
+             or as a --decision: {}",
+            unbound.len(),
+            unbound.join(", ")
+        );
+    }
+
+    let obj_direction = match direction {
+        "min" => ObjectiveDirection::Minimize,
+        "max" => ObjectiveDirection::Maximize,
+        other => bail!("unknown --direction value '{other}': valid values are min, max"),
+    };
+
+    let problem = OptimizationProblem {
+        objective,
+        direction: obj_direction,
+        decision_variables,
+        constraints: vec![],
+        fixed_params: fixed_params.into_iter().collect(),
+        bindings: arch.all_bindings().to_vec(),
+    };
+
+    let sol = match EnumerationSolver.solve(&problem) {
+        Ok(s) => s,
+        Err(SolverError::TooManyCombinations { count, limit }) => {
+            bail!(
+                "too many combinations to enumerate ({count} > {limit}). \
+                 Reduce the domain sizes passed to --decision."
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    println!(
+        "\nOptimization Result ({}, direction={direction}):",
+        arch.name
+    );
+    if sol.feasible {
+        // Print each decision variable's chosen value.
+        for dv in &problem.decision_variables {
+            if let Some(&val) = sol.assignments.get(&dv.name) {
+                println!("  {} = {val}", dv.name);
+            }
+        }
+        println!(
+            "  objective (total monthly cost) = ${:.4}",
+            sol.objective_value
+        );
+    } else {
+        println!("  Result: INFEASIBLE — no combination satisfied all constraints.");
     }
 
     Ok(())
@@ -670,22 +662,15 @@ fn build_architecture_from_input(
                 &resolved_template,
                 cfn_adapters,
             );
-            Ok(ParsedInput {
-                architecture,
-                tf_provider: None,
-            })
+            Ok(ParsedInput { architecture })
         }
         InputFormat::Tf => {
             let resolved = resolve_tf_input(Path::new(template_path))?;
             let tf_provider = detect_tf_provider(&resolved);
-            match tf_provider {
-                TfProvider::Mixed => {
-                    bail!("mixed Terraform providers are not supported in a single input")
-                }
-                TfProvider::Unknown => bail!(
+            if tf_provider == TfProvider::Unknown {
+                bail!(
                     "unable to detect a supported Terraform provider from {template_path}. Expected resources with aws_ or google_ prefixes."
-                ),
-                TfProvider::Aws | TfProvider::Gcp => {}
+                );
             }
 
             let architecture = yevice_tf::build_architecture(
@@ -694,10 +679,7 @@ fn build_architecture_from_input(
                 &resolved,
                 tf_adapters,
             );
-            Ok(ParsedInput {
-                architecture,
-                tf_provider: Some(tf_provider),
-            })
+            Ok(ParsedInput { architecture })
         }
         InputFormat::Wrangler => {
             let wrangler_path = resolve_wrangler_input_path(Path::new(template_path))?;
@@ -715,10 +697,7 @@ fn build_architecture_from_input(
                 architecture.name = name_override.to_string();
             }
 
-            Ok(ParsedInput {
-                architecture,
-                tf_provider: None,
-            })
+            Ok(ParsedInput { architecture })
         }
     }
 }
@@ -816,51 +795,84 @@ fn detect_tf_provider(resolved: &yevice_tf::ResolvedConfig) -> TfProvider {
     }
 }
 
-fn select_pricing_catalog(
-    format: InputFormat,
-    tf_provider: Option<TfProvider>,
-    region: &str,
-    list_price: bool,
-) -> Result<PricingCatalogSelection> {
-    // Note: `list_price` only affects AWS pricing. GCP free tiers are encoded
-    // as code constants and are not currently toggleable.
-    match format {
-        InputFormat::Cfn | InputFormat::Wrangler => Ok(PricingCatalogSelection::Aws(
-            AwsPricingCatalog::auto(region).with_list_price(list_price),
-        )),
-        InputFormat::Tf => match tf_provider.context("Terraform provider was not detected")? {
-            TfProvider::Aws => Ok(PricingCatalogSelection::Aws(
-                AwsPricingCatalog::auto(region).with_list_price(list_price),
-            )),
-            TfProvider::Gcp => Ok(PricingCatalogSelection::Gcp(GcpPricingCatalog(
-                gcp_hardcoded_pricing(region),
-            ))),
-            TfProvider::Mixed => {
-                bail!("mixed Terraform providers are not supported in a single input")
-            }
-            TfProvider::Unknown => bail!(
-                "unable to select pricing for Terraform input without an aws_ or google_ resource"
-            ),
-        },
+/// Parse a `PROVIDER=REGION` string into a `(Provider, String)` pair.
+///
+/// The provider name must be one of `aws`, `gcp`, or `cloudflare`.
+/// Returns an error for unknown provider names.
+pub fn parse_provider_region(s: &str) -> Result<(Provider, String)> {
+    let (provider_str, region_str) = s
+        .split_once('=')
+        .with_context(|| format!("invalid --provider-region value '{s}': expected PROVIDER=REGION (e.g. gcp=asia-northeast1)"))?;
+    let provider = provider_from_str(provider_str.trim())
+        .with_context(|| format!("unknown provider '{provider_str}' in --provider-region '{s}'"))?;
+    Ok((provider, region_str.trim().to_string()))
+}
+
+/// Reverse-map a provider name string to a [`Provider`] variant.
+///
+/// Accepts the same strings that [`Provider::as_str`] produces.
+fn provider_from_str(s: &str) -> Result<Provider> {
+    match s {
+        "aws" => Ok(Provider::Aws),
+        "gcp" => Ok(Provider::Gcp),
+        "cloudflare" => Ok(Provider::Cloudflare),
+        other => bail!("unknown provider '{other}': valid values are aws, gcp, cloudflare"),
     }
 }
 
-fn load_quotas(path: &str) -> Result<RegionQuotas> {
+/// Build a per-provider pricing resolver from the providers present in `arch`.
+///
+/// Iterates over all registered provider plugins and, for each provider that
+/// appears in the architecture, inserts the plugin's pricing catalog into the
+/// resolver. The `Provider::Other` variant has no corresponding plugin and is
+/// handled separately with a [`yevice_pricing::NoopCatalog`].
+///
+/// `provider_regions` allows overriding the region used for a specific
+/// provider's pricing catalog. Providers not present in the map fall back to
+/// `default_region`, preserving full backward compatibility.
+fn build_pricing_resolver(
+    arch: &Architecture,
+    default_region: &str,
+    provider_regions: &HashMap<Provider, String>,
+    list_price: bool,
+) -> MultiProviderCatalog {
+    let mut resolver = MultiProviderCatalog::new();
+
+    for plugin in provider_plugins() {
+        if arch.has_provider(plugin.provider()) {
+            let region = provider_regions
+                .get(&plugin.provider())
+                .map_or(default_region, String::as_str);
+            resolver.insert(
+                plugin.provider(),
+                plugin.pricing_catalog(region, list_price),
+            );
+        }
+    }
+
+    // Provider::Other has no dedicated plugin; use a no-op catalog.
+    if arch.has_provider(Provider::Other) {
+        resolver.insert(Provider::Other, Box::new(yevice_pricing::NoopCatalog));
+    }
+
+    resolver
+}
+
+fn load_quotas(path: &str) -> Result<Quotas> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-    let quotas: RegionQuotas =
+    let quotas: Quotas =
         serde_yaml_ng::from_str(&content).context("failed to parse quotas file")?;
-    Ok(quotas)
-}
-
-fn format_number(n: f64) -> String {
-    if n >= 1_000_000.0 {
-        format!("{:.1}M", n / 1_000_000.0)
-    } else if n >= 1_000.0 {
-        format!("{:.1}K", n / 1_000.0)
-    } else {
-        format!("{n:.2}")
+    let legacy: Vec<&str> = quotas.keys().filter(|k| !k.contains('.')).collect();
+    if !legacy.is_empty() {
+        bail!(
+            "quota file '{path}' uses non-namespaced keys ({}); quota files now use \
+             provider-namespaced keys such as 'aws.lambda.concurrent_executions'. \
+             Please migrate these keys.",
+            legacy.join(", ")
+        );
     }
+    Ok(quotas)
 }
 
 /// Simulate cost over time with varying load patterns.
@@ -891,7 +903,7 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
     // (arch_name, total_monthly, hourly_costs, base_resource_costs)
     // base_resource_costs: Vec<(label, monthly_cost)> evaluated at base_params (for breakdown)
-    let mut arch_results: Vec<(String, f64, Vec<(u32, f64)>, Vec<(String, f64)>)> = Vec::new();
+    let mut arch_results: Vec<crate::render::SimulationArchResult> = Vec::new();
 
     for path in cost_model_paths {
         let arch = load_cost_model(path)?;
@@ -947,37 +959,8 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
     }
 
     // Print hourly breakdown table
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-
-    let mut header = vec![Cell::new("Hour"), Cell::new("Multiplier")];
-    for (name, _, _, _) in &arch_results {
-        header.push(Cell::new(format!("{name} (rate/mo)")));
-    }
-    table.set_header(header);
-
-    for hour in 0..24 {
-        let mult = profile.multiplier_at(hour);
-        let mut row = vec![
-            Cell::new(format!("{hour:02}:00")),
-            Cell::new(format!("{mult:.2}x")),
-        ];
-        for (_, _, hourly, _) in &arch_results {
-            let cost = hourly
-                .iter()
-                .find(|(h, _)| *h == hour)
-                .map_or(0.0, |(_, c)| *c);
-            row.push(Cell::new(format!("${cost:.2}")));
-        }
-        table.add_row(row);
-    }
-
-    // Total row
-    let mut total_row = vec![Cell::new("MONTHLY TOTAL").fg(Color::Green), Cell::new("")];
-    for (_, total, _, _) in &arch_results {
-        total_row.push(Cell::new(format!("${total:.2}")).fg(Color::Green));
-    }
-    table.add_row(total_row);
+    let table =
+        crate::render::render_simulate_table(&arch_results, |hour| profile.multiplier_at(hour));
 
     println!("\nLoad Simulation ({} days/month)", profile.days_per_month);
     println!("{table}");
@@ -1016,27 +999,8 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
         if !all_labels.is_empty() {
             println!("\nResource Breakdown (base params estimate):");
-            let mut bd_table = Table::new();
-            bd_table.load_preset(UTF8_FULL);
-
-            let mut bd_header = vec![Cell::new("Resource")];
-            for (name, _, _, _) in &arch_results {
-                bd_header.push(Cell::new(name));
-            }
-            bd_table.set_header(bd_header);
-
-            for label in &all_labels {
-                let mut row = vec![Cell::new(label)];
-                for (_, _, _, res_costs) in &arch_results {
-                    let cost = res_costs
-                        .iter()
-                        .find(|(l, _)| l == label)
-                        .map_or_else(|| "-".to_string(), |(_, c)| format!("${c:.2}"));
-                    row.push(Cell::new(cost));
-                }
-                bd_table.add_row(row);
-            }
-
+            let bd_table =
+                crate::render::render_simulate_breakdown_table(&arch_results, &all_labels);
             println!("{bd_table}");
         }
     }
@@ -1086,14 +1050,20 @@ fn load_simulation_profile(path: &str) -> Result<SimulationProfile> {
         match v {
             serde_yaml_ng::Value::Mapping(sub_map) => {
                 for (sub_k, sub_v) in sub_map {
-                    if let Some(sub_key) = sub_k.as_str() {
-                        let val = extract_f64(&sub_v);
-                        base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
-                    }
+                    let Some(sub_key) = sub_k.as_str() else {
+                        tracing::warn!(key = ?sub_k, "non-string key in profile base_params mapping; skipping");
+                        continue;
+                    };
+                    let val = extract_f64(&sub_v).with_context(|| {
+                        format!("profile base_param '{k}_{sub_key}': invalid value")
+                    })?;
+                    base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
                 }
             }
             _ => {
-                base_params.insert(VariableName::new(k), extract_f64(&v));
+                let val = extract_f64(&v)
+                    .with_context(|| format!("profile base_param '{k}': invalid value"))?;
+                base_params.insert(VariableName::new(k), val);
             }
         }
     }
@@ -1202,6 +1172,38 @@ fn download_pricing(url: &str) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Render an architecture diagram from a generated cost-model JSON file.
+///
+/// - `cost_model_path`: path to a cost-model JSON file produced by `generate`.
+/// - `format`: one of `"drawio"`, `"mermaid"`, or `"json"`.
+/// - `output`: optional file path; if `None` the diagram is written to stdout.
+pub fn diagram(cost_model_path: &str, format: &str, output: Option<&str>) -> Result<()> {
+    let cost = load_cost_model(cost_model_path)?;
+
+    let rendered: String = match format {
+        "drawio" => DrawIoRenderer
+            .render(&cost)
+            .context("draw.io rendering failed")?,
+        "mermaid" => MermaidRenderer
+            .render(&cost)
+            .context("mermaid rendering failed")?,
+        "json" => JsonRenderer
+            .render(&cost)
+            .context("json rendering failed")?,
+        other => bail!("unknown diagram format '{other}'. Valid choices: drawio, mermaid, json"),
+    };
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &rendered)
+                .with_context(|| format!("failed to write diagram to {path}"))?;
+        }
+        None => println!("{rendered}"),
+    }
+
+    Ok(())
+}
+
 fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read cost model: {path}"))?;
@@ -1238,16 +1240,18 @@ fn load_params(path: &str) -> Result<Params> {
             serde_yaml_ng::Value::Mapping(sub_map) => {
                 for (sub_k, sub_v) in sub_map {
                     let Some(sub_key) = sub_k.as_str() else {
+                        tracing::warn!(key = ?sub_k, "non-string key in params mapping; skipping");
                         continue;
                     };
-                    let val = extract_f64(&sub_v);
+                    let val = extract_f64(&sub_v)
+                        .with_context(|| format!("param '{k}_{sub_key}': invalid value"))?;
                     let full_name = format!("{k}_{sub_key}");
                     params.insert(VariableName::new(full_name), val);
                 }
             }
             // Flat: key is the full variable name
             _ => {
-                let val = extract_f64(&v);
+                let val = extract_f64(&v).with_context(|| format!("param '{k}': invalid value"))?;
                 params.insert(VariableName::new(k), val);
             }
         }
@@ -1256,11 +1260,15 @@ fn load_params(path: &str) -> Result<Params> {
     Ok(params)
 }
 
-fn extract_f64(v: &serde_yaml_ng::Value) -> f64 {
+fn extract_f64(v: &serde_yaml_ng::Value) -> anyhow::Result<f64> {
     match v {
-        serde_yaml_ng::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        serde_yaml_ng::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
-        _ => 0.0,
+        serde_yaml_ng::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| anyhow::anyhow!("cannot interpret number {v:?} as f64")),
+        serde_yaml_ng::Value::String(s) => s
+            .parse::<f64>()
+            .with_context(|| format!("cannot interpret string {v:?} as f64")),
+        _ => anyhow::bail!("cannot interpret value {v:?} as a number"),
     }
 }
 
@@ -1400,5 +1408,428 @@ mod tests {
             locals: HashMap::new(),
         };
         assert_eq!(detect_tf_provider(&unknown), TfProvider::Unknown);
+    }
+
+    // --- parse_provider_region tests ---
+
+    #[test]
+    fn parses_gcp_provider_region() {
+        let (provider, region) = parse_provider_region("gcp=asia-northeast1").unwrap();
+        assert_eq!(provider, Provider::Gcp);
+        assert_eq!(region, "asia-northeast1");
+    }
+
+    #[test]
+    fn parses_aws_provider_region() {
+        let (provider, region) = parse_provider_region("aws=us-east-1").unwrap();
+        assert_eq!(provider, Provider::Aws);
+        assert_eq!(region, "us-east-1");
+    }
+
+    #[test]
+    fn parses_cloudflare_provider_region() {
+        let (provider, region) = parse_provider_region("cloudflare=global").unwrap();
+        assert_eq!(provider, Provider::Cloudflare);
+        assert_eq!(region, "global");
+    }
+
+    #[test]
+    fn parse_provider_region_trims_whitespace() {
+        let (provider, region) = parse_provider_region("gcp = asia-northeast1").unwrap();
+        assert_eq!(provider, Provider::Gcp);
+        assert_eq!(region, "asia-northeast1");
+    }
+
+    #[test]
+    fn parse_provider_region_rejects_unknown_provider() {
+        let err = parse_provider_region("azure=eastus").unwrap_err();
+        assert!(
+            err.to_string().contains("azure"),
+            "error should mention the unknown provider name"
+        );
+    }
+
+    #[test]
+    fn parse_provider_region_rejects_missing_equals() {
+        let err = parse_provider_region("gcp-asia-northeast1").unwrap_err();
+        assert!(
+            err.to_string().contains("PROVIDER=REGION"),
+            "error should describe expected format"
+        );
+    }
+
+    // --- empty domain --decision tests (#4) ---
+
+    /// `NAME=` (empty values_part) must be detected before split and return an
+    /// actionable error message.
+    #[test]
+    fn empty_domain_spec_returns_error() {
+        // Build a minimal cost model file so we can call optimize.
+        // We only care that parsing the decision spec fails before the solver.
+        // Use a temp dir with a trivial cost model JSON.
+        use std::fs;
+        let dir = temp_dir("empty-domain");
+        let cost_model = serde_json::json!({
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &["MyVar=".to_string()],
+            "min",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty domain"),
+            "expected 'empty domain' error, got: {msg}"
+        );
+    }
+
+    /// `NAME=  ` (whitespace-only values_part) must also return empty-domain error.
+    #[test]
+    fn whitespace_only_domain_spec_returns_error() {
+        use std::fs;
+        let dir = temp_dir("ws-domain");
+        let cost_model = serde_json::json!({
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &["MyVar=  ".to_string()],
+            "min",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty domain"),
+            "expected 'empty domain' error, got: {msg}"
+        );
+    }
+
+    // --- direction parsing tests (#7) ---
+
+    fn empty_cost_model_json(name: &str) -> serde_json::Value {
+        // A cost model with no resources — total_expr() = Sum([]) = constant 0,
+        // which has no variables, so the "unbound" check passes immediately.
+        serde_json::json!({
+            "name": name,
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        })
+    }
+
+    #[test]
+    fn direction_min_is_accepted() {
+        use std::fs;
+        let dir = temp_dir("dir-min");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("dir-min")).unwrap(),
+        )
+        .unwrap();
+
+        // No decisions needed for an empty objective.
+        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min");
+        assert!(result.is_ok(), "min direction must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn direction_max_is_accepted() {
+        use std::fs;
+        let dir = temp_dir("dir-max");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("dir-max")).unwrap(),
+        )
+        .unwrap();
+
+        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "max");
+        assert!(result.is_ok(), "max direction must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn direction_unknown_returns_error() {
+        use std::fs;
+        let dir = temp_dir("dir-bad");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("dir-bad")).unwrap(),
+        )
+        .unwrap();
+
+        let err =
+            super::optimize(cost_model_path.to_str().unwrap(), None, &[], "sideways").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sideways"),
+            "error must mention the invalid direction value: {msg}"
+        );
+    }
+
+    // --- load_quotas validation tests ---
+
+    /// Non-namespaced key (no `.`) must cause `load_quotas` to bail with a
+    /// message that names the offending key.
+    #[test]
+    fn load_quotas_rejects_non_namespaced_keys() {
+        use std::fs;
+        let dir = temp_dir("quotas-legacy");
+        let quota_file = dir.join("quotas.yaml");
+        fs::write(&quota_file, "lambda_concurrent_executions: 50\n").unwrap();
+
+        let err = load_quotas(quota_file.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lambda_concurrent_executions"),
+            "error must name the non-namespaced key; got: {msg}"
+        );
+        assert!(
+            msg.contains("non-namespaced"),
+            "error must mention 'non-namespaced'; got: {msg}"
+        );
+    }
+
+    /// Namespaced keys (containing `.`) must be accepted without error.
+    #[test]
+    fn load_quotas_accepts_namespaced_keys() {
+        use std::fs;
+        let dir = temp_dir("quotas-namespaced");
+        let quota_file = dir.join("quotas.yaml");
+        fs::write(&quota_file, "aws.lambda.concurrent_executions: 50\n").unwrap();
+
+        let quotas = load_quotas(quota_file.to_str().unwrap()).unwrap();
+        assert_eq!(
+            quotas.get("aws.lambda.concurrent_executions"),
+            Some(50.0),
+            "namespaced quota value must be loaded correctly"
+        );
+    }
+
+    // --- #3 optimize unbound-check closure tests ---
+
+    /// When a binding's source variable is not provided, the binding target
+    /// must NOT be treated as bound.  If the objective references the binding
+    /// target, optimize() must return an actionable "unbound" error that
+    /// names the missing source variable — not INFEASIBLE from the solver.
+    #[test]
+    fn optimize_unbound_source_gives_unbound_error_not_infeasible() {
+        use std::fs;
+        // Cost model:
+        //   resource "Widget" with expr = Variable("Widget_derived_cost")
+        //   binding:  target="Widget_derived_cost"
+        //             expr = Variable("Widget_source_input") * Constant(0.01)
+        //
+        // If Widget_source_input is NOT provided as a param or decision,
+        // the closure must leave Widget_derived_cost unbound, causing an
+        // actionable error.  The old flat approach would mark Widget_derived_cost
+        // bound regardless of whether Widget_source_input is present.
+        let cost_model = serde_json::json!({
+            "name": "closure-test",
+            "resources": [{
+                "logical_id": "Widget",
+                "resource_type": "AWS::Unknown",
+                "label": "Widget",
+                "expr": { "type": "Variable", "name": "Widget_derived_cost" },
+                "required_variables": [
+                    { "name": "Widget_derived_cost", "description": "derived", "unit": "USD" }
+                ]
+            }],
+            "bindings": [{
+                "target": "Widget_derived_cost",
+                "expr": {
+                    "type": "Product",
+                    "exprs": [
+                        { "type": "Variable", "name": "Widget_source_input" },
+                        { "type": "Constant", "value": 0.01 }
+                    ]
+                },
+                "description": "source * price",
+                "source": "test"
+            }],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+
+        let dir = temp_dir("closure-unbound");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        // No params, no decisions → Widget_source_input is missing.
+        // Must get an unbound error mentioning Widget_source_input (the missing source),
+        // not an INFEASIBLE result from the solver.
+        let err = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unbound") || msg.contains("Widget_source_input"),
+            "expected unbound error mentioning Widget_source_input, got: {msg}"
+        );
+        assert!(
+            !msg.contains("INFEASIBLE"),
+            "must not report INFEASIBLE when source variable is missing, got: {msg}"
+        );
+    }
+
+    /// When the missing source variable is supplied as a decision variable,
+    /// optimize() must solve successfully.
+    #[test]
+    fn optimize_with_source_as_decision_solves_successfully() {
+        use std::fs;
+        let cost_model = serde_json::json!({
+            "name": "closure-test-ok",
+            "resources": [{
+                "logical_id": "Widget",
+                "resource_type": "AWS::Unknown",
+                "label": "Widget",
+                "expr": { "type": "Variable", "name": "Widget_derived_cost" },
+                "required_variables": [
+                    { "name": "Widget_derived_cost", "description": "derived", "unit": "USD" }
+                ]
+            }],
+            "bindings": [{
+                "target": "Widget_derived_cost",
+                "expr": {
+                    "type": "Product",
+                    "exprs": [
+                        { "type": "Variable", "name": "Widget_source_input" },
+                        { "type": "Constant", "value": 0.01 }
+                    ]
+                },
+                "description": "source * price",
+                "source": "test"
+            }],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+
+        let dir = temp_dir("closure-ok");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        // Provide Widget_source_input as a decision variable.
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &["Widget_source_input=100,200".to_string()],
+            "min",
+        );
+        assert!(
+            result.is_ok(),
+            "optimize must succeed when source variable is provided: {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_pricing_resolver_uses_per_provider_region() {
+        use yevice_core::resource::{Architecture, Resource, ResourceShell};
+        use yevice_core::types::{LogicalId, Region, ResourceType};
+
+        // Build a minimal architecture that contains only a GCP resource so we
+        // can verify that build_pricing_resolver accepts an overridden region
+        // per provider without panicking.
+        let shell = ResourceShell::new("gcp.cloud_run", Provider::Gcp, &serde_json::json!({}));
+        let resource = Resource {
+            logical_id: LogicalId::new("MyService"),
+            resource_type: ResourceType::new("google_cloud_run_v2_service"),
+            shell,
+            group: None,
+        };
+        let arch = Architecture {
+            name: "test-arch".to_string(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![resource],
+            connections: Vec::new(),
+        };
+
+        let default_region = "ap-northeast-1";
+        let mut provider_regions: HashMap<Provider, String> = HashMap::new();
+        provider_regions.insert(Provider::Gcp, "asia-northeast1".to_string());
+
+        // build_pricing_resolver should complete without panicking.
+        // The overridden GCP region is used internally; we confirm the arch
+        // is recognised as having GCP present.
+        let _resolver = build_pricing_resolver(&arch, default_region, &provider_regions, false);
+        assert!(arch.has_provider(Provider::Gcp));
+    }
+
+    // --- #8 sensitivity steps=0 guard ---
+
+    /// `sensitivity` with `steps=0` must return an error before computing
+    /// `step_size`, not silently produce NaN output.
+    #[test]
+    fn sensitivity_steps_zero_returns_error() {
+        use std::fs;
+        let dir = temp_dir("sensitivity-zero-steps");
+
+        // Minimal cost model with one constant resource so evaluate succeeds.
+        let cost_model = serde_json::json!({
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        // Minimal params file.
+        let params_path = dir.join("params.yaml");
+        fs::write(&params_path, "").unwrap();
+
+        let err = super::sensitivity(
+            cost_model_path.to_str().unwrap(),
+            params_path.to_str().unwrap(),
+            "SomeVar",
+            0.0,
+            1000.0,
+            0, // steps = 0 must be rejected
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--steps") || msg.contains("steps"),
+            "error must mention '--steps'; got: {msg}"
+        );
+        assert!(
+            msg.contains('1') || msg.contains("at least"),
+            "error must say at least 1; got: {msg}"
+        );
     }
 }

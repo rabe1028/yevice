@@ -4,7 +4,7 @@ use thiserror::Error;
 pub enum TfError {
     #[error("failed to parse Terraform config: {0}")]
     ParseError(String),
-    #[error("IO error: {0}")]
+    #[error("IO error")]
     Io(#[from] std::io::Error),
     #[error("missing required attribute {attr} for resource {resource}")]
     MissingAttribute { resource: String, attr: String },

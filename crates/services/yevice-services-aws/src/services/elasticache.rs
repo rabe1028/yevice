@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::ResourceCost,
     expr::Expr,
     resource::Provider,
@@ -15,8 +16,6 @@ pub struct ElastiCacheSpec {
 }
 
 pub struct ElastiCacheService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for ElastiCacheService {
     type Spec = ElastiCacheSpec;
@@ -52,5 +51,3 @@ impl Service for ElastiCacheService {
         })
     }
 }
-
-const _: f64 = HOURS_PER_MONTH;

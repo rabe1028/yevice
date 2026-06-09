@@ -1,0 +1,1444 @@
+//! AWS-specific [`ConnectionRule`] implementations.
+//!
+//! These rules encode the AWS binding logic that was previously embedded
+//! inside `yevice-core`. Core only walks the graph; these rules supply
+//! the AWS service-id knowledge (e.g. `"aws.sqs"`, `"aws.lambda"`).
+
+use yevice_core::bindings::{ConnectionRule, scale_description, scale_expr, scaled_binding};
+use yevice_core::cost::{Expr, VariableBinding};
+use yevice_core::resource::{Architecture, Connection, ConnectionType};
+use yevice_core::types::{LogicalId, VariableName};
+
+// ---------------------------------------------------------------------------
+// Private helper — mirrors the old `source_rate_var` in core
+// ---------------------------------------------------------------------------
+
+fn source_rate_var(
+    arch: &Architecture,
+    id: &LogicalId,
+    hint: Option<&str>,
+) -> Option<(VariableName, &'static str)> {
+    let service_id = arch.find_resource(id).map(|r| r.shell.service_id.as_str());
+    match service_id {
+        Some("aws.sqs") => Some((id.var("requests"), "SQS")),
+        Some("aws.kinesis") => Some((id.var("put_records"), "Kinesis")),
+        Some("aws.dynamodb") => Some((id.var("write_request_units"), "DynamoDB")),
+        Some("aws.lambda") => Some((id.var("requests"), "Lambda")),
+        Some("aws.s3") => Some((id.var("put_requests"), "S3")),
+        Some("aws.eventbridge_rule") => Some((id.var("events"), "EventBridge")),
+        Some("aws.eventbridge_scheduler") => Some((id.var("invocations"), "EventBridge Scheduler")),
+        Some("aws.sns") => Some((id.var("deliveries"), "SNS")),
+        _ => match hint {
+            Some("sqs") => Some((id.var("requests"), "SQS")),
+            Some("kinesis") => Some((id.var("put_records"), "Kinesis")),
+            Some("dynamodb") => Some((id.var("write_request_units"), "DynamoDB")),
+            Some("lambda") => Some((id.var("requests"), "Lambda")),
+            Some("s3") => Some((id.var("put_requests"), "S3")),
+            Some("eventbridge_rule") => Some((id.var("events"), "EventBridge")),
+            Some("eventbridge_scheduler") => Some((id.var("invocations"), "EventBridge Scheduler")),
+            Some("sns") => Some((id.var("deliveries"), "SNS")),
+            _ => None,
+        },
+    }
+}
+
+/// Resolve the source rate variable for a connection, applying the `source_hint`
+/// fallback. Shared by every rule's "skip if no known source" guard.
+fn conn_source_rate(
+    conn: &Connection,
+    arch: &Architecture,
+) -> Option<(VariableName, &'static str)> {
+    source_rate_var(arch, &conn.source, conn.source_hint.as_deref())
+}
+
+/// Number of notification subscribers a topic fans out to (its outbound
+/// Notification edges), floored at 1.
+fn sns_subscriber_count(topic: &LogicalId, arch: &Architecture) -> usize {
+    arch.connections
+        .iter()
+        .filter(|c| &c.source == topic && matches!(c.connection_type, ConnectionType::Notification))
+        .count()
+        .max(1)
+}
+
+// ---------------------------------------------------------------------------
+// EventSource rule  (SQS / Kinesis / DDB Stream → Lambda)
+// ---------------------------------------------------------------------------
+
+pub struct AwsEventSourceRule;
+
+impl ConnectionRule for AwsEventSourceRule {
+    fn derive(&self, conn: &Connection, arch: &Architecture) -> Vec<VariableBinding> {
+        if !matches!(conn.connection_type, ConnectionType::EventSource) {
+            return Vec::new();
+        }
+
+        let batch_size = conn.batch_size.unwrap_or(1.0);
+        let parallelization = conn.parallelization_factor.unwrap_or(1.0);
+        let Some((source_var, source_type)) = conn_source_rate(conn, arch) else {
+            return Vec::new();
+        };
+
+        let base_expr = Expr::ceil(Expr::div(
+            Expr::variable(source_var.clone()),
+            Expr::constant(batch_size),
+        ));
+        let expr = scale_expr(base_expr, parallelization);
+        let description = scale_description(
+            format!("ceil({source_var} / {batch_size})"),
+            parallelization,
+        );
+
+        vec![VariableBinding {
+            target: conn.target.var("requests"),
+            expr,
+            description,
+            source: format!(
+                "{source_type} -> Lambda ({} -> {}, batch={batch_size})",
+                conn.source, conn.target
+            ),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invocation rule  (Lambda / SF Express → Lambda / StepFunctions)
+// ---------------------------------------------------------------------------
+
+pub struct AwsInvocationRule;
+
+impl ConnectionRule for AwsInvocationRule {
+    fn derive(&self, conn: &Connection, arch: &Architecture) -> Vec<VariableBinding> {
+        if !matches!(conn.connection_type, ConnectionType::Invocation) {
+            return Vec::new();
+        }
+
+        let factor = conn.factor.unwrap_or(1.0);
+        let Some((source_var, source_type)) = conn_source_rate(conn, arch) else {
+            return Vec::new();
+        };
+
+        let target_resource = arch.find_resource(&conn.target);
+        let target_service_id = target_resource.map(|r| r.shell.service_id.as_str());
+        let workflow_type =
+            target_resource.and_then(|r| r.shell.metadata.get("workflow_type").map(String::as_str));
+
+        let (target_var, target_type) = match target_service_id {
+            Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
+            Some("aws.step_functions") => match workflow_type {
+                Some("express") => (conn.target.var("requests"), "Step Functions"),
+                _ => (conn.target.var("transitions"), "Step Functions"),
+            },
+            Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
+            _ => return Vec::new(),
+        };
+
+        vec![scaled_binding(
+            target_var,
+            &source_var,
+            factor,
+            format!(
+                "{source_type} -> {target_type} ({} -> {})",
+                conn.source, conn.target
+            ),
+        )]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DataFlow rule  (Lambda → DynamoDB / SNS / SQS)
+// ---------------------------------------------------------------------------
+
+pub struct AwsDataFlowRule;
+
+impl ConnectionRule for AwsDataFlowRule {
+    fn derive(&self, conn: &Connection, arch: &Architecture) -> Vec<VariableBinding> {
+        if !matches!(conn.connection_type, ConnectionType::DataFlow) {
+            return Vec::new();
+        }
+
+        let factor = conn.factor.unwrap_or(1.0);
+        let Some((source_var, source_type)) = conn_source_rate(conn, arch) else {
+            return Vec::new();
+        };
+
+        let target_resource = arch.find_resource(&conn.target);
+        let target_service_id = target_resource.map(|r| r.shell.service_id.as_str());
+        let billing_mode =
+            target_resource.and_then(|r| r.shell.metadata.get("billing_mode").map(String::as_str));
+
+        match target_service_id {
+            Some("aws.dynamodb") if billing_mode == Some("on_demand") => {
+                vec![scaled_binding(
+                    conn.target.var("write_request_units"),
+                    &source_var,
+                    factor,
+                    format!(
+                        "{source_type} -> DynamoDB ({} -> {})",
+                        conn.source, conn.target
+                    ),
+                )]
+            }
+            Some("aws.sns") => {
+                let n = sns_subscriber_count(&conn.target, arch);
+                vec![scaled_binding(
+                    conn.target.var("deliveries"),
+                    &source_var,
+                    factor * n as f64,
+                    format!("{source_type} -> SNS ({} -> {})", conn.source, conn.target),
+                )]
+            }
+            Some("aws.sqs") => vec![scaled_binding(
+                conn.target.var("requests"),
+                &source_var,
+                factor,
+                format!("{source_type} -> SQS ({} -> {})", conn.source, conn.target),
+            )],
+            Some("aws.s3") => vec![scaled_binding(
+                conn.target.var("put_requests"),
+                &source_var,
+                factor,
+                format!("{source_type} -> S3 ({} -> {})", conn.source, conn.target),
+            )],
+            Some("aws.kinesis") => vec![scaled_binding(
+                conn.target.var("put_records"),
+                &source_var,
+                factor,
+                format!(
+                    "{source_type} -> Kinesis ({} -> {})",
+                    conn.source, conn.target
+                ),
+            )],
+            _ => Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notification rule  (S3 → Lambda / SQS)
+// ---------------------------------------------------------------------------
+
+pub struct AwsNotificationRule;
+
+impl ConnectionRule for AwsNotificationRule {
+    fn derive(&self, conn: &Connection, arch: &Architecture) -> Vec<VariableBinding> {
+        if !matches!(conn.connection_type, ConnectionType::Notification) {
+            return Vec::new();
+        }
+
+        let factor = conn.factor.unwrap_or(1.0);
+        let Some((source_var, source_type)) = conn_source_rate(conn, arch) else {
+            return Vec::new();
+        };
+
+        let target_service_id = arch
+            .find_resource(&conn.target)
+            .map(|r| r.shell.service_id.as_str());
+
+        match source_type {
+            "S3" => {
+                let (target_var, target_type) = match target_service_id {
+                    Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
+                    Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
+                    Some("aws.sns") => (conn.target.var("deliveries"), "SNS"),
+                    _ => return Vec::new(),
+                };
+                // When S3 notifies an SNS topic, `deliveries` must equal
+                // s3_rate × N (where N is the topic's subscriber count) so
+                // that the downstream SNS→subscriber rule (which divides by N)
+                // delivers exactly s3_rate to each subscriber.
+                let effective_factor = if target_service_id == Some("aws.sns") {
+                    factor * sns_subscriber_count(&conn.target, arch) as f64
+                } else {
+                    factor
+                };
+                vec![scaled_binding(
+                    target_var,
+                    &source_var,
+                    effective_factor,
+                    format!(
+                        "{source_type} -> {target_type} ({} -> {})",
+                        conn.source, conn.target
+                    ),
+                )]
+            }
+            "SNS" => {
+                let (target_var, target_type) = match target_service_id {
+                    Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
+                    Some("aws.sqs") => (conn.target.var("requests"), "SQS"),
+                    _ => return Vec::new(),
+                };
+                // SNS `deliveries` is the total across all subscribers.
+                // Divide by the subscriber count so each target receives the
+                // per-subscriber rate rather than the aggregated total.
+                let per_subscriber_factor =
+                    factor / sns_subscriber_count(&conn.source, arch) as f64;
+                vec![scaled_binding(
+                    target_var,
+                    &source_var,
+                    per_subscriber_factor,
+                    format!(
+                        "{source_type} -> {target_type} ({} -> {})",
+                        conn.source, conn.target
+                    ),
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry helper
+// ---------------------------------------------------------------------------
+
+/// Build the full set of AWS connection rules in the canonical dispatch order:
+/// `[EventSource, Invocation, DataFlow, Notification]`.
+///
+/// Pass the returned `Vec` to [`yevice_core::bindings::derive_bindings`] or
+/// store it in the `ServiceCatalog`.
+pub fn aws_connection_rules() -> Vec<Box<dyn ConnectionRule>> {
+    vec![
+        Box::new(AwsEventSourceRule),
+        Box::new(AwsInvocationRule),
+        Box::new(AwsDataFlowRule),
+        Box::new(AwsNotificationRule),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Tests (migrated from yevice-core::bindings)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yevice_core::bindings::derive_bindings;
+    use yevice_core::evaluate::Params;
+    use yevice_core::resource::{Architecture, Provider, Resource, ResourceShell};
+    use yevice_core::types::{LogicalId, Region, ResourceType, VariableName};
+
+    fn params_from(pairs: &[(&str, f64)]) -> Params {
+        pairs
+            .iter()
+            .map(|(k, v)| (VariableName::new(*k), *v))
+            .collect()
+    }
+
+    fn all_rules() -> Vec<Box<dyn ConnectionRule>> {
+        aws_connection_rules()
+    }
+
+    fn make_resource(logical_id: &str, service_id: &str) -> Resource {
+        Resource {
+            logical_id: LogicalId::new(logical_id),
+            resource_type: ResourceType::new("AWS::Unknown"),
+            shell: ResourceShell::new(service_id, Provider::Aws, &serde_json::json!({})),
+            group: None,
+        }
+    }
+
+    fn make_resource_with_meta(
+        logical_id: &str,
+        service_id: &str,
+        meta_key: &str,
+        meta_val: &str,
+    ) -> Resource {
+        Resource {
+            logical_id: LogicalId::new(logical_id),
+            resource_type: ResourceType::new("AWS::Unknown"),
+            shell: ResourceShell::new(service_id, Provider::Aws, &serde_json::json!({}))
+                .with_metadata(meta_key, meta_val),
+            group: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // EventSource
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_event_source_sqs_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Queue", "aws.sqs"),
+                make_resource("Worker", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Queue"),
+                target: LogicalId::new("Worker"),
+                connection_type: ConnectionType::EventSource,
+                batch_size: Some(10.0),
+                parallelization_factor: Some(1.0),
+                factor: None,
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        let b = &bindings[0];
+        assert_eq!(b.target, LogicalId::new("Worker").var("requests"));
+
+        let params = params_from(&[("Queue_requests", 1000.0)]);
+        let result = yevice_core::evaluate::evaluate(&b.expr, &params).unwrap();
+        // ceil(1000 / 10) = 100
+        assert_eq!(result, 100.0);
+    }
+
+    #[test]
+    fn test_event_source_with_parallelization() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Stream", "aws.kinesis"),
+                make_resource("Processor", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Stream"),
+                target: LogicalId::new("Processor"),
+                connection_type: ConnectionType::EventSource,
+                batch_size: Some(1.0),
+                parallelization_factor: Some(3.0),
+                factor: None,
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        let params = params_from(&[("Stream_put_records", 500.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        // ceil(500/1) * 3 = 1500
+        assert_eq!(result, 1500.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Invocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invocation_lambda_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Caller", "aws.lambda"),
+                make_resource("Callee", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Caller"),
+                target: LogicalId::new("Callee"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(2.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        let params = params_from(&[("Caller_requests", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 200.0);
+    }
+
+    #[test]
+    fn test_invocation_lambda_to_step_functions_standard() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Trigger", "aws.lambda"),
+                make_resource("Workflow", "aws.step_functions"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Trigger"),
+                target: LogicalId::new("Workflow"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        // Standard Step Functions → transitions (not requests)
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Workflow").var("transitions")
+        );
+    }
+
+    #[test]
+    fn test_invocation_lambda_to_step_functions_express() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Trigger", "aws.lambda"),
+                make_resource_with_meta(
+                    "Workflow",
+                    "aws.step_functions",
+                    "workflow_type",
+                    "express",
+                ),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Trigger"),
+                target: LogicalId::new("Workflow"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        // Express Step Functions → requests
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Workflow").var("requests")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // DataFlow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dataflow_lambda_to_dynamodb_on_demand() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Writer", "aws.lambda"),
+                make_resource_with_meta("Table", "aws.dynamodb", "billing_mode", "on_demand"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Writer"),
+                target: LogicalId::new("Table"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Table").var("write_request_units")
+        );
+        let params = params_from(&[("Writer_requests", 300.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 300.0);
+    }
+
+    #[test]
+    fn test_dataflow_lambda_to_sns() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Publisher", "aws.lambda"),
+                make_resource("Topic", "aws.sns"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Publisher"),
+                target: LogicalId::new("Topic"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Topic").var("deliveries")
+        );
+    }
+
+    /// Lambda→SNS where the topic has 2 Notification subscribers.
+    /// deliveries binding must be lambda_rate × factor × N (N=2) so that each
+    /// downstream SNS→subscriber rule (deliveries / N) delivers lambda_rate.
+    #[test]
+    fn test_dataflow_lambda_to_sns_two_subscribers_scales_deliveries() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Publisher", "aws.lambda"),
+                make_resource("Topic", "aws.sns"),
+                make_resource("HandlerA", "aws.lambda"),
+                make_resource("HandlerB", "aws.lambda"),
+            ],
+            connections: vec![
+                // Lambda → SNS (DataFlow)
+                Connection {
+                    source: LogicalId::new("Publisher"),
+                    target: LogicalId::new("Topic"),
+                    connection_type: ConnectionType::DataFlow,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                // Topic has 2 Notification subscribers
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerA"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerB"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+
+        // DataFlow binding: Topic_deliveries = Publisher_requests × factor × N
+        let deliveries_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Topic").var("deliveries"))
+            .expect("Topic_deliveries binding should exist");
+
+        let lambda_rate = 1_000.0_f64;
+        let params = params_from(&[("Publisher_requests", lambda_rate)]);
+        let deliveries =
+            yevice_core::evaluate::evaluate(&deliveries_binding.expr, &params).unwrap();
+        // factor=1.0, N=2 → deliveries = 1000 × 2 = 2000
+        assert_eq!(
+            deliveries,
+            lambda_rate * 2.0,
+            "Topic_deliveries must be lambda_rate × N (N=2), got {deliveries}"
+        );
+
+        // End-to-end: each SNS→subscriber binding gets deliveries / N = lambda_rate
+        let handler_a_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("HandlerA").var("requests"))
+            .expect("HandlerA_requests binding should exist");
+        let handler_b_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("HandlerB").var("requests"))
+            .expect("HandlerB_requests binding should exist");
+
+        let deliveries_params = params_from(&[("Topic_deliveries", deliveries)]);
+        let result_a =
+            yevice_core::evaluate::evaluate(&handler_a_binding.expr, &deliveries_params).unwrap();
+        let result_b =
+            yevice_core::evaluate::evaluate(&handler_b_binding.expr, &deliveries_params).unwrap();
+        assert_eq!(
+            result_a, lambda_rate,
+            "HandlerA should receive lambda_rate, got {result_a}"
+        );
+        assert_eq!(
+            result_b, lambda_rate,
+            "HandlerB should receive lambda_rate, got {result_b}"
+        );
+    }
+
+    #[test]
+    fn test_dataflow_lambda_to_sqs() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Sender", "aws.lambda"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Sender"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Notification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_s3_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Bucket"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        let params = params_from(&[("Bucket_put_requests", 200.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 200.0);
+    }
+
+    #[test]
+    fn test_notification_s3_to_sqs() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Bucket"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4 EventBridge Invocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invocation_eventbridge_rule_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Rule", "aws.eventbridge_rule"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Rule"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        let params = params_from(&[("Rule_events", 50.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 50.0);
+    }
+
+    #[test]
+    fn test_invocation_eventbridge_rule_to_step_functions() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Rule", "aws.eventbridge_rule"),
+                make_resource("Workflow", "aws.step_functions"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Rule"),
+                target: LogicalId::new("Workflow"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(2.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        // Standard SF → transitions
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Workflow").var("transitions")
+        );
+        let params = params_from(&[("Rule_events", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 200.0);
+    }
+
+    #[test]
+    fn test_source_rate_var_eventbridge_hint() {
+        // Verify hint-based fallback for eventbridge_rule
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![make_resource("Handler", "aws.lambda")],
+            connections: vec![Connection {
+                source: LogicalId::new("UnknownSource"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: Some("eventbridge_rule".to_string()),
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #5 SNS Notification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_sns_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Topic", "aws.sns"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Topic"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        let params = params_from(&[("Topic_deliveries", 400.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 400.0);
+    }
+
+    #[test]
+    fn test_notification_sns_to_sqs() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Topic", "aws.sns"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Topic"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(3.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+        let params = params_from(&[("Topic_deliveries", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 300.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // SNS fan-out: per-subscriber rate (deliveries / N)
+    // -----------------------------------------------------------------------
+
+    /// Single subscriber (N=1): behaviour must be identical to the pre-fix path.
+    #[test]
+    fn test_notification_sns_single_subscriber_unchanged() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Topic", "aws.sns"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Topic"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        // N=1 → per-subscriber factor = 1.0/1 = 1.0, result unchanged
+        let params = params_from(&[("Topic_deliveries", 1_000_000.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 1_000_000.0);
+    }
+
+    /// Two subscribers (Lambda + SQS): each target should receive deliveries / 2.
+    #[test]
+    fn test_notification_sns_two_subscribers_per_subscriber_rate() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Topic", "aws.sns"),
+                make_resource("Handler", "aws.lambda"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("Handler"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("Queue"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 2);
+
+        let handler_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Handler").var("requests"))
+            .expect("Handler_requests binding should exist");
+        let queue_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Queue").var("requests"))
+            .expect("Queue_requests binding should exist");
+
+        // 1M publishes × 2 subscribers → deliveries = 2M
+        // Each subscriber should see 2M / 2 = 1M requests
+        let params = params_from(&[("Topic_deliveries", 2_000_000.0)]);
+        let handler_result =
+            yevice_core::evaluate::evaluate(&handler_binding.expr, &params).unwrap();
+        let queue_result = yevice_core::evaluate::evaluate(&queue_binding.expr, &params).unwrap();
+        assert_eq!(
+            handler_result, 1_000_000.0,
+            "Handler should receive deliveries/2, got {handler_result}"
+        );
+        assert_eq!(
+            queue_result, 1_000_000.0,
+            "Queue should receive deliveries/2, got {queue_result}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #7 Lambda→S3 DataFlow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dataflow_lambda_to_s3() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Writer", "aws.lambda"),
+                make_resource("Bucket", "aws.s3"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Writer"),
+                target: LogicalId::new("Bucket"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Bucket").var("put_requests")
+        );
+        let params = params_from(&[("Writer_requests", 250.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 250.0);
+    }
+
+    #[test]
+    fn test_dataflow_lambda_to_s3_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Processor", "aws.lambda"),
+                make_resource("OutputBucket", "aws.s3"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Processor"),
+                target: LogicalId::new("OutputBucket"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(5.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("OutputBucket").var("put_requests")
+        );
+        let params = params_from(&[("Processor_requests", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 500.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1 EventBridge Rule → SQS Invocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invocation_eventbridge_rule_to_sqs() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Rule", "aws.eventbridge_rule"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Rule"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+        let params = params_from(&[("Rule_events", 200.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 200.0);
+    }
+
+    #[test]
+    fn test_invocation_eventbridge_rule_to_sqs_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Rule", "aws.eventbridge_rule"),
+                make_resource("Queue", "aws.sqs"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Rule"),
+                target: LogicalId::new("Queue"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(3.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
+        let params = params_from(&[("Rule_events", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 300.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2 S3 Notification → SNS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_s3_to_sns() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Topic", "aws.sns"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Bucket"),
+                target: LogicalId::new("Topic"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Topic").var("deliveries")
+        );
+        let params = params_from(&[("Bucket_put_requests", 500.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 500.0);
+    }
+
+    #[test]
+    fn test_notification_s3_to_sns_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Topic", "aws.sns"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Bucket"),
+                target: LogicalId::new("Topic"),
+                connection_type: ConnectionType::Notification,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(2.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Topic").var("deliveries")
+        );
+        let params = params_from(&[("Bucket_put_requests", 300.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 600.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // S3→SNS with multiple subscribers
+    // -----------------------------------------------------------------------
+
+    /// S3→SNS where the topic has 2 subscribers.
+    /// deliveries binding must be s3_rate × factor × N (N=2) so that the
+    /// downstream SNS→subscriber rule (deliveries / N) delivers s3_rate to each.
+    #[test]
+    fn test_notification_s3_to_sns_two_subscribers_scales_deliveries() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Bucket", "aws.s3"),
+                make_resource("Topic", "aws.sns"),
+                make_resource("HandlerA", "aws.lambda"),
+                make_resource("HandlerB", "aws.lambda"),
+            ],
+            connections: vec![
+                // S3 → SNS notification
+                Connection {
+                    source: LogicalId::new("Bucket"),
+                    target: LogicalId::new("Topic"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                // Topic has 2 subscribers
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerA"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("Topic"),
+                    target: LogicalId::new("HandlerB"),
+                    connection_type: ConnectionType::Notification,
+                    batch_size: None,
+                    parallelization_factor: None,
+                    factor: Some(1.0),
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+
+        // Find the S3→SNS binding (Topic_deliveries)
+        let s3_sns_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Topic").var("deliveries"))
+            .expect("Topic_deliveries binding should exist");
+
+        // With factor=1.0 and N=2 subscribers, deliveries = s3_rate × 1.0 × 2
+        let params = params_from(&[("Bucket_put_requests", 1000.0)]);
+        let result = yevice_core::evaluate::evaluate(&s3_sns_binding.expr, &params).unwrap();
+        assert_eq!(
+            result, 2000.0,
+            "S3→SNS deliveries must be s3_rate × N (N=2), got {result}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fan-in (migrated from core)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fan_in_bindings_are_summed() {
+        let arch = Architecture {
+            name: "fan-in".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Worker", "aws.lambda"),
+                make_resource("QueueA", "aws.sqs"),
+                make_resource("QueueB", "aws.sqs"),
+            ],
+            connections: vec![
+                Connection {
+                    source: LogicalId::new("QueueA"),
+                    target: LogicalId::new("Worker"),
+                    connection_type: ConnectionType::EventSource,
+                    batch_size: Some(1.0),
+                    parallelization_factor: Some(1.0),
+                    factor: None,
+                    source_hint: None,
+                },
+                Connection {
+                    source: LogicalId::new("QueueB"),
+                    target: LogicalId::new("Worker"),
+                    connection_type: ConnectionType::EventSource,
+                    batch_size: Some(1.0),
+                    parallelization_factor: Some(1.0),
+                    factor: None,
+                    source_hint: None,
+                },
+            ],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+
+        let worker_binding = bindings
+            .iter()
+            .find(|b| b.target == LogicalId::new("Worker").var("requests"))
+            .expect("Worker_requests binding should exist");
+
+        // With QueueA_requests=300 and QueueB_requests=200, summed result must be 500
+        let params = params_from(&[("QueueA_requests", 300.0), ("QueueB_requests", 200.0)]);
+        let result = yevice_core::evaluate::evaluate(&worker_binding.expr, &params).unwrap();
+        assert_eq!(
+            result, 500.0,
+            "fan-in bindings must sum, not overwrite — got {result}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1 EventBridge Scheduler as Invocation source
+    // -----------------------------------------------------------------------
+
+    /// EventBridge Scheduler → Lambda: source-rate variable must be
+    /// `Scheduler_invocations`, not silent no-binding.
+    #[test]
+    fn test_invocation_eventbridge_scheduler_to_lambda() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Scheduler", "aws.eventbridge_scheduler"),
+                make_resource("Handler", "aws.lambda"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Scheduler"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1, "expected exactly one binding");
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+        let params = params_from(&[("Scheduler_invocations", 100.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 100.0);
+    }
+
+    /// hint-based fallback for eventbridge_scheduler must also bind.
+    #[test]
+    fn test_source_rate_var_eventbridge_scheduler_hint() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![make_resource("Handler", "aws.lambda")],
+            connections: vec![Connection {
+                source: LogicalId::new("UnknownScheduler"),
+                target: LogicalId::new("Handler"),
+                connection_type: ConnectionType::Invocation,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: Some("eventbridge_scheduler".to_string()),
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1, "hint-based scheduler binding missing");
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Handler").var("requests")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2 Lambda → Kinesis DataFlow
+    // -----------------------------------------------------------------------
+
+    /// Lambda → Kinesis DataFlow: target variable must be `Stream_put_records`.
+    #[test]
+    fn test_dataflow_lambda_to_kinesis() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Producer", "aws.lambda"),
+                make_resource("Stream", "aws.kinesis"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Producer"),
+                target: LogicalId::new("Stream"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(1.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1, "expected exactly one DataFlow binding");
+        assert_eq!(
+            bindings[0].target,
+            LogicalId::new("Stream").var("put_records")
+        );
+        let params = params_from(&[("Producer_requests", 500.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 500.0);
+    }
+
+    /// Lambda → Kinesis DataFlow with factor > 1.
+    #[test]
+    fn test_dataflow_lambda_to_kinesis_with_factor() {
+        let arch = Architecture {
+            name: "test".into(),
+            region: Region::new("ap-northeast-1"),
+            resources: vec![
+                make_resource("Producer", "aws.lambda"),
+                make_resource("Stream", "aws.kinesis"),
+            ],
+            connections: vec![Connection {
+                source: LogicalId::new("Producer"),
+                target: LogicalId::new("Stream"),
+                connection_type: ConnectionType::DataFlow,
+                batch_size: None,
+                parallelization_factor: None,
+                factor: Some(3.0),
+                source_hint: None,
+            }],
+        };
+
+        let bindings = derive_bindings(&arch, &all_rules());
+        assert_eq!(bindings.len(), 1);
+        let params = params_from(&[("Producer_requests", 200.0)]);
+        let result = yevice_core::evaluate::evaluate(&bindings[0].expr, &params).unwrap();
+        assert_eq!(result, 600.0);
+    }
+}

@@ -2,14 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    cost::{CostComponent, Expr, ResourceCost, VariableInfo},
+    HOURS_PER_MONTH,
+    cost::{CostComponent, Expr, ResourceCost, VariableInfo, VariableKind},
     resource::Provider,
     types::{LogicalId, ResourceType},
 };
 use yevice_pricing::{PriceCatalog, Sku};
 use yevice_service_api::{CostError, service::Service};
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcpCloudSqlSpec {
@@ -90,6 +89,7 @@ impl Service for GcpCloudSqlService {
                 name: id.var("storage_gb"),
                 description: "Allocated storage".into(),
                 unit: "GB".into(),
+                kind: VariableKind::Usage,
             }],
         })
     }
@@ -135,6 +135,9 @@ pub(crate) fn parse_sql_tier(tier: &str) -> (f64, f64) {
                 (1.0, 3.75)
             }
         }
-        _ => (1.0, 3.75),
+        _ => {
+            tracing::warn!(tier = %tier, "unknown Cloud SQL tier; using default vCPU/RAM");
+            (1.0, 3.75)
+        }
     }
 }

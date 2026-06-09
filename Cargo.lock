@@ -1077,6 +1077,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "thiserror",
+ "tracing",
  "yevice-core",
  "yevice-service-api",
 ]
@@ -1095,10 +1096,12 @@ dependencies = [
  "ureq",
  "yevice-cfn",
  "yevice-core",
+ "yevice-output",
  "yevice-pricing",
  "yevice-service-api",
  "yevice-services-aws",
  "yevice-services-gcp",
+ "yevice-solver",
  "yevice-tf",
  "yevice-wrangler",
 ]
@@ -1111,6 +1114,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "yevice-output"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "yevice-core",
 ]
 
 [[package]]
@@ -1161,12 +1173,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "yevice-solver"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "yevice-core",
+]
+
+[[package]]
 name = "yevice-tf"
 version = "0.1.0"
 dependencies = [
  "hcl-rs",
  "serde_json",
  "thiserror",
+ "tracing",
  "yevice-core",
  "yevice-pricing",
  "yevice-service-api",

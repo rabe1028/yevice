@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
@@ -64,8 +65,6 @@ pub struct RdsSpec {
 }
 
 pub struct RdsService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for RdsService {
     type Spec = RdsSpec;
@@ -172,5 +171,3 @@ impl Service for RdsService {
         }
     }
 }
-
-const _: f64 = HOURS_PER_MONTH;

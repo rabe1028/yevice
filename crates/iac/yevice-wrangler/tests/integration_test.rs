@@ -2,8 +2,9 @@
 
 use std::path::PathBuf;
 
+use yevice_core::resource::Provider;
 use yevice_pricing::{PriceCatalog, PriceRecord, Sku, error::PricingError};
-use yevice_service_api::ServiceCatalog;
+use yevice_service_api::{PriceCatalogResolver, ServiceCatalog};
 use yevice_wrangler::{parser, services::CloudflareWorkerSpec};
 
 fn fixtures_dir() -> PathBuf {
@@ -26,6 +27,15 @@ impl PriceCatalog for EmptyCatalog {
             service: sku.as_str().to_string(),
             region: "global".to_string(),
         })
+    }
+}
+
+impl PriceCatalogResolver for EmptyCatalog {
+    fn resolve(&self, _provider: Provider) -> Option<&dyn PriceCatalog> {
+        // Cloudflare services compute prices inline; the catalog is never
+        // looked up.  Return `Some(self)` for all providers so the cost-model
+        // loop doesn't skip Cloudflare resources.
+        Some(self as &dyn PriceCatalog)
     }
 }
 

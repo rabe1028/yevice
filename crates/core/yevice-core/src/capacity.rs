@@ -69,10 +69,21 @@ pub struct Violation {
     pub message: String,
 }
 
+/// A constraint that was skipped because its required expression could not be
+/// evaluated (e.g. a variable was not provided in the current params).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedConstraint {
+    pub resource: LogicalId,
+    pub dimension: String,
+    pub reason: String,
+}
+
 /// Result of capacity validation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
     pub violations: Vec<Violation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedConstraint>,
 }
 
 impl ValidationResult {
@@ -95,12 +106,21 @@ pub fn validate_capacity(
     params: &crate::evaluate::Params,
 ) -> ValidationResult {
     let mut violations = Vec::new();
+    let mut skipped = Vec::new();
 
     for model in models {
         for constraint in &model.constraints {
+            // Skip when a required variable was not provided.
             let required = match crate::evaluate::evaluate(&constraint.required, params) {
                 Ok(v) => v,
-                Err(_) => continue, // Variable not provided, skip
+                Err(e) => {
+                    skipped.push(SkippedConstraint {
+                        resource: model.logical_id.clone(),
+                        dimension: constraint.dimension.clone(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
             };
 
             if required > constraint.limit {
@@ -129,34 +149,53 @@ pub fn validate_capacity(
         Severity::Info => 2,
     });
 
-    ValidationResult { violations }
-}
-
-// ---- Default AWS Quotas ----
-
-/// Default quota values for ap-northeast-1.
-/// Users can override via quotas.yaml.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegionQuotas {
-    pub lambda_concurrent_executions: f64,
-    pub dynamodb_max_wcu_per_table: f64,
-    pub dynamodb_max_rcu_per_table: f64,
-    pub dynamodb_max_tables: f64,
-    pub kinesis_max_shards_per_stream: f64,
-    pub kinesis_max_records_per_sec_per_shard: f64,
-    pub kinesis_max_mb_per_sec_per_shard: f64,
-}
-
-impl Default for RegionQuotas {
-    fn default() -> Self {
-        Self {
-            lambda_concurrent_executions: 1000.0,
-            dynamodb_max_wcu_per_table: 40_000.0,
-            dynamodb_max_rcu_per_table: 40_000.0,
-            dynamodb_max_tables: 2500.0,
-            kinesis_max_shards_per_stream: 200.0,
-            kinesis_max_records_per_sec_per_shard: 1000.0,
-            kinesis_max_mb_per_sec_per_shard: 1.0,
-        }
+    ValidationResult {
+        violations,
+        skipped,
     }
+}
+
+// ---- Provider-agnostic Quotas ----
+
+/// Provider-agnostic service quotas, keyed by a namespaced string such as
+/// `"aws.lambda.concurrent_executions"`. Quota keys are owned by the
+/// provider crates that produce and consume them; core only stores them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Quotas(std::collections::HashMap<String, f64>);
+
+impl Quotas {
+    pub fn get(&self, key: &str) -> Option<f64> {
+        self.0.get(key).copied()
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, value: f64) {
+        self.0.insert(key.into(), value);
+    }
+
+    #[must_use]
+    pub fn with(mut self, key: impl Into<String>, value: f64) -> Self {
+        self.insert(key, value);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterate over the quota keys.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    /// Merge another set of quotas into this one; values in `other` win on key collision.
+    pub fn merge_from(&mut self, other: Quotas) {
+        self.0.extend(other.0);
+    }
+}
+
+/// Supplies provider-specific default quotas for a region. Implemented by
+/// service crates; core never hardcodes provider quota values.
+pub trait QuotaProvider: Send + Sync {
+    fn default_quotas(&self, region: &str) -> Quotas;
 }

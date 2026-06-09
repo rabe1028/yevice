@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
-    capacity::{CapacityModel, Constraint, QuotaType, RegionQuotas, Severity},
+    capacity::{CapacityModel, Constraint, QuotaType, Quotas, Severity},
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::{Expr, Tier},
     resource::Provider,
@@ -8,6 +8,9 @@ use yevice_core::{
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
+
+use crate::common::egress_cost_expr;
+use crate::quotas::{DEFAULT_LAMBDA_CONCURRENT_EXECUTIONS, LAMBDA_CONCURRENT_EXECUTIONS};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LambdaSpec {
@@ -32,27 +35,6 @@ const SKU_FREE_REQUESTS: Sku = Sku::new("aws.lambda.free_tier_requests");
 const SKU_FREE_GB_SEC: Sku = Sku::new("aws.lambda.free_tier_gb_seconds");
 
 pub struct LambdaService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
-
-pub fn egress_cost_expr(
-    id: &LogicalId,
-    pricing: &dyn PriceCatalog,
-) -> Result<(Expr, VariableInfo), CostError> {
-    let egress_record = pricing.lookup(&Sku::new("aws.data_transfer.egress_tiers"))?;
-    let egress_tiers = egress_record.as_tiered().map_err(CostError::Pricing)?;
-    let expr = Expr::tiered(
-        egress_tiers.to_vec(),
-        Expr::variable(id.var("data_transfer_out_gb")),
-    );
-    let info = VariableInfo::new(
-        id,
-        "data_transfer_out_gb",
-        "Data transfer out per month",
-        "GB",
-    );
-    Ok((expr, info))
-}
 
 impl Service for LambdaService {
     type Spec = LambdaSpec;
@@ -155,7 +137,7 @@ impl Service for LambdaService {
         &self,
         id: &LogicalId,
         _spec: &LambdaSpec,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Option<CapacityModel> {
         let concurrent = Expr::product(vec![
             Expr::variable(id.var("peak_requests_per_sec")),
@@ -168,7 +150,9 @@ impl Service for LambdaService {
             constraints: vec![Constraint {
                 dimension: "concurrent_executions".into(),
                 required: concurrent,
-                limit: quotas.lambda_concurrent_executions,
+                limit: quotas
+                    .get(LAMBDA_CONCURRENT_EXECUTIONS)
+                    .unwrap_or(DEFAULT_LAMBDA_CONCURRENT_EXECUTIONS),
                 quota_type: QuotaType::Soft,
                 severity: Severity::Error,
                 message_template: "Concurrent executions {required} exceeds account quota {limit}"
@@ -177,6 +161,3 @@ impl Service for LambdaService {
         })
     }
 }
-
-// Silence unused warning
-const _: f64 = HOURS_PER_MONTH;

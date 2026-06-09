@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use hcl::{Body, Structure};
 
@@ -11,6 +14,16 @@ pub enum TfValue {
     Bool(bool),
     VarRef(String),
     LocalRef(String),
+    /// A cross-resource reference: `<resource_type>.<name>.<attr>`.
+    ResourceRef {
+        resource_type: String,
+        name: String,
+        attr: String,
+    },
+    /// A nested object (map) whose values may themselves contain references.
+    Object(BTreeMap<String, Box<TfValue>>),
+    /// A nested array whose elements may themselves contain references.
+    Array(Vec<TfValue>),
     Unknown,
 }
 
@@ -38,6 +51,16 @@ impl TfValue {
 
     pub fn is_concrete(&self) -> bool {
         matches!(self, Self::String(_) | Self::Number(_) | Self::Bool(_))
+    }
+
+    /// Returns `true` if this value or any nested value contains a `ResourceRef`.
+    pub fn contains_resource_ref(&self) -> bool {
+        match self {
+            Self::ResourceRef { .. } => true,
+            Self::Object(map) => map.values().any(|v| v.contains_resource_ref()),
+            Self::Array(vec) => vec.iter().any(TfValue::contains_resource_ref),
+            _ => false,
+        }
     }
 }
 
@@ -199,21 +222,64 @@ fn parse_variable_block(body: &Body) -> TfVariable {
 }
 
 pub fn expr_to_tf_value(expr: &hcl::expr::Expression) -> TfValue {
-    use hcl::expr::{Expression, TraversalOperator};
+    use std::collections::BTreeMap;
+
+    use hcl::expr::{Expression, ObjectKey, TraversalOperator};
 
     match expr {
         Expression::String(value) => TfValue::String(value.clone()),
         Expression::Number(value) => value.as_f64().map_or(TfValue::Unknown, TfValue::Number),
         Expression::Bool(value) => TfValue::Bool(*value),
-        Expression::Traversal(traversal) => {
-            if let Expression::Variable(variable) = &traversal.expr
-                && let Some(TraversalOperator::GetAttr(attr)) = traversal.operators.first()
-            {
-                return match variable.as_ref() {
-                    "var" => TfValue::VarRef(attr.as_ref().to_string()),
-                    "local" => TfValue::LocalRef(attr.as_ref().to_string()),
-                    _ => TfValue::Unknown,
+        Expression::Array(elements) => {
+            let items: Vec<TfValue> = elements.iter().map(expr_to_tf_value).collect();
+            TfValue::Array(items)
+        }
+        Expression::Object(obj) => {
+            let mut map: BTreeMap<String, Box<TfValue>> = BTreeMap::new();
+            for (key, val_expr) in obj {
+                let key_str = match key {
+                    ObjectKey::Identifier(ident) => ident.as_str().to_string(),
+                    ObjectKey::Expression(e) => match e {
+                        Expression::String(s) => s.clone(),
+                        other => format!("{other}"),
+                    },
+                    _ => format!("{key}"),
                 };
+                map.insert(key_str, Box::new(expr_to_tf_value(val_expr)));
+            }
+            TfValue::Object(map)
+        }
+        Expression::Traversal(traversal) => {
+            if let Expression::Variable(variable) = &traversal.expr {
+                let var_name = variable.as_ref();
+                // Collect only GetAttr segments from the operators list.
+                let attrs: Vec<&str> = traversal
+                    .operators
+                    .iter()
+                    .filter_map(|op| {
+                        if let TraversalOperator::GetAttr(a) = op {
+                            Some(a.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                match (var_name, attrs.as_slice()) {
+                    // var.<name>  →  VarRef
+                    ("var", [name]) => return TfValue::VarRef((*name).to_string()),
+                    // local.<name>  →  LocalRef
+                    ("local", [name]) => return TfValue::LocalRef((*name).to_string()),
+                    // <resource_type>.<name>.<attr...>  →  ResourceRef
+                    (resource_type, [name, rest @ ..]) if !rest.is_empty() => {
+                        return TfValue::ResourceRef {
+                            resource_type: resource_type.to_string(),
+                            name: (*name).to_string(),
+                            attr: rest.join("."),
+                        };
+                    }
+                    _ => {}
+                }
             }
             TfValue::Unknown
         }

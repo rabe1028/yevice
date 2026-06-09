@@ -84,7 +84,10 @@ pub fn evaluate(expr: &Expr, params: &Params) -> Result<f64, CoreError> {
         } => {
             let n = evaluate(numerator, params)?;
             let d = evaluate(denominator, params)?;
-            if d == 0.0 { Ok(0.0) } else { Ok(n / d) }
+            if d == 0.0 {
+                return Err(CoreError::DivisionByZero);
+            }
+            Ok(n / d)
         }
     }
 }
@@ -131,10 +134,16 @@ pub fn evaluate_architecture(
         let component_costs: Vec<(String, f64)> = rc
             .components
             .iter()
-            .filter_map(|c| {
-                evaluate(&c.expr, &effective_params)
-                    .ok()
-                    .map(|v| (c.name.clone(), v))
+            .filter_map(|c| match evaluate(&c.expr, &effective_params) {
+                Ok(v) => Some((c.name.clone(), v)),
+                Err(e) => {
+                    tracing::warn!(
+                        component = %c.name,
+                        error = %e,
+                        "component cost could not be evaluated; omitted from breakdown (total derived from top-level expression)"
+                    );
+                    None
+                }
             })
             .collect();
 
@@ -175,21 +184,48 @@ pub fn resolve_bindings(
     base_params: &Params,
 ) -> Result<Params, CoreError> {
     let mut params = base_params.clone();
+    // Targets whose expression can never evaluate (e.g. division by zero), as
+    // distinct from those merely waiting on a not-yet-resolved variable.
+    let mut unresolvable: std::collections::HashSet<VariableName> =
+        std::collections::HashSet::new();
 
     let max_passes = bindings.len() + 1;
     for _ in 0..max_passes {
         let mut progressed = false;
         for binding in bindings {
-            if params.contains_key(&binding.target) {
+            if params.contains_key(&binding.target) || unresolvable.contains(&binding.target) {
                 continue;
             }
-            if let Ok(value) = evaluate(&binding.expr, &params) {
-                params.insert(binding.target.clone(), value);
-                progressed = true;
+            match evaluate(&binding.expr, &params) {
+                Ok(value) => {
+                    params.insert(binding.target.clone(), value);
+                    progressed = true;
+                }
+                // A missing variable may be produced by a later binding; retry next pass.
+                Err(CoreError::UndefinedVariable(_)) => {}
+                // A structural error (e.g. division by zero) will never resolve; warn once.
+                Err(e) => {
+                    tracing::warn!(
+                        target = %binding.target,
+                        error = %e,
+                        "binding expression cannot be evaluated; skipping"
+                    );
+                    unresolvable.insert(binding.target.clone());
+                }
             }
         }
         if !progressed {
             break;
+        }
+    }
+
+    // Warn about bindings still unresolved because a required variable was never provided.
+    for binding in bindings {
+        if !params.contains_key(&binding.target) && !unresolvable.contains(&binding.target) {
+            tracing::warn!(
+                target = %binding.target,
+                "binding could not be resolved with current params (missing variable)"
+            );
         }
     }
 
@@ -207,6 +243,22 @@ mod tests {
 
     fn params_from(pairs: &[(&str, f64)]) -> Params {
         pairs.iter().map(|(k, v)| (var(k), *v)).collect()
+    }
+
+    #[test]
+    fn test_div_by_zero_returns_err() {
+        let expr = Expr::div(Expr::constant(10.0), Expr::constant(0.0));
+        let result = evaluate(&expr, &Params::new());
+        assert!(
+            matches!(result, Err(CoreError::DivisionByZero)),
+            "expected DivisionByZero error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_div_nonzero() {
+        let expr = Expr::div(Expr::constant(10.0), Expr::constant(2.0));
+        assert_eq!(evaluate(&expr, &Params::new()).unwrap(), 5.0);
     }
 
     #[test]

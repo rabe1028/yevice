@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  S3 NotificationConfiguration edges:
+  - S3 -> Lambda (LambdaConfigurations)
+  - S3 -> SQS   (QueueConfigurations)
+  - S3 -> SNS   (TopicConfigurations)
+
+Resources:
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: input-bucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt ProcessorFunction.Arn
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt NotifyQueue.Arn
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Topic: !Ref NotifyTopic
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: s3-processor
+      MemorySize: 128
+      Timeout: 30
+      Runtime: python3.12
+
+  NotifyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+
+  NotifyTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: s3-notifications

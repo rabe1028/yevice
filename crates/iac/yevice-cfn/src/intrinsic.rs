@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde_yaml_ng::Value;
 
 use crate::error::CfnError;
+use crate::sentinel;
 
 /// Context for resolving `CloudFormation` intrinsic functions.
 pub struct ResolveContext {
@@ -114,7 +115,7 @@ fn resolve_ref(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     }
 
     // If it's a resource logical ID, return as-is (we can't resolve resource IDs statically)
-    Ok(Value::String(format!("{{{{ref:{name}}}}}")))
+    Ok(Value::String(sentinel::make_ref(name)))
 }
 
 fn resolve_sub(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
@@ -136,10 +137,14 @@ fn resolve_sub(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
                 Value::Mapping(m) => {
                     let mut map = HashMap::new();
                     for (k, v) in m {
-                        if let (Value::String(key), resolved) = (k, resolve(v, ctx)?)
-                            && let Some(s) = resolved.as_str()
-                        {
-                            map.insert(key.clone(), s.to_string());
+                        if let Value::String(key) = k {
+                            let resolved = resolve(v, ctx)?;
+                            // If the resolved value is a string, use it; otherwise
+                            // insert an empty string so that ${Key} is replaced with
+                            // "" rather than being left as a bare variable name that
+                            // would fall through to the resource-ref sentinel path.
+                            let s = resolved.as_str().map_or_else(String::new, str::to_string);
+                            map.insert(key.clone(), s);
                         }
                     }
                     map
@@ -173,14 +178,24 @@ fn substitute_variables(
                 }
                 var_name.push(ch);
             }
-            // Try local vars first, then parameters
-            if let Some(val) = local_vars.get(&var_name) {
+            // ${!Literal} is the documented Fn::Sub escape for a literal ${Literal}.
+            if let Some(literal) = var_name.strip_prefix('!') {
+                use std::fmt::Write;
+                let _ = write!(result, "${{{literal}}}");
+            } else if let Some(val) = local_vars.get(&var_name) {
                 result.push_str(val);
             } else if let Some(val) = ctx.parameters.get(&var_name) {
                 result.push_str(val);
-            } else {
+            } else if var_name.starts_with("AWS::") {
+                // Pseudo-parameter (e.g. AWS::Region) — leave verbatim
                 use std::fmt::Write;
                 let _ = write!(result, "${{{var_name}}}");
+            } else if let Some((logical, attr)) = var_name.split_once('.') {
+                // Resource attribute reference: ${Resource.Attr} → GetAtt sentinel
+                result.push_str(&sentinel::make_getatt(logical, attr));
+            } else {
+                // Bare resource reference: ${Resource} → Ref sentinel
+                result.push_str(&sentinel::make_ref(&var_name));
             }
         } else {
             result.push(c);
@@ -311,6 +326,7 @@ fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> 
         .filter_map(|v| match v {
             Value::String(s) => Some(s.clone()),
             Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
             _ => None,
         })
         .collect();
@@ -320,16 +336,36 @@ fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> 
 
 fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     // !GetAtt cannot be fully resolved statically.
-    // Return a placeholder.
+    // Return a sentinel placeholder when we have enough information (logical_id + attr),
+    // otherwise pass the value through unmodified so downstream consumers can
+    // recognise it as unresolved rather than silently dropping it.
     let _ = ctx;
     match value {
-        Value::String(s) => Ok(Value::String(format!("{{{{getatt:{s}}}}}"))),
+        Value::String(s) => {
+            // Dot-notation form: "LogicalId.Attr"
+            if let Some((logical_id, attr)) = s.split_once('.') {
+                return Ok(Value::String(sentinel::make_getatt(logical_id, attr)));
+            }
+            // No dot: cannot construct a valid sentinel (no attr present).
+            // Return the value as-is so downstream sees an unresolved reference.
+            tracing::warn!(value = %s, "!GetAtt string has no dot separator — treating as unresolved");
+            Ok(value.clone())
+        }
         Value::Sequence(seq) => {
-            let parts: Vec<String> = seq
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            Ok(Value::String(format!("{{{{getatt:{}}}}}", parts.join("."))))
+            let parts: Vec<&str> = seq.iter().filter_map(|v| v.as_str()).collect();
+            match parts.as_slice() {
+                [logical_id, attr] => Ok(Value::String(sentinel::make_getatt(logical_id, attr))),
+                [logical_id, rest @ ..] if !rest.is_empty() => {
+                    // More than 2 elements: join remaining parts with "." as the attr.
+                    let attr = rest.join(".");
+                    Ok(Value::String(sentinel::make_getatt(logical_id, &attr)))
+                }
+                _ => {
+                    // Empty or single-element sequence: unresolvable, pass through.
+                    tracing::warn!(parts = ?parts, "!GetAtt sequence has fewer than 2 elements — treating as unresolved");
+                    Ok(value.clone())
+                }
+            }
         }
         _ => Ok(value.clone()),
     }
@@ -406,5 +442,275 @@ mod tests {
         let val = Value::String("SharedVpcId".into());
         let result = resolve_import_value(&val, &ctx).unwrap();
         assert_eq!(result, Value::String("vpc-12345".into()));
+    }
+
+    // --- GetAtt edge cases (#5) ---
+
+    /// A dot-notation GetAtt must produce the correct sentinel.
+    #[test]
+    fn test_getatt_dot_notation_produces_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("MyBucket.Arn".into());
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{getatt:MyBucket.Arn}}".into()),
+            "dot-notation GetAtt must produce sentinel"
+        );
+    }
+
+    /// A string with no dot must NOT produce a sentinel — it must be passed
+    /// through as-is (unresolved).
+    #[test]
+    fn test_getatt_no_dot_passes_through() {
+        let ctx = make_ctx();
+        let val = Value::String("MyBucketNoAttr".into());
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        // Must return the original value unchanged (no sentinel generated).
+        assert_eq!(
+            result,
+            Value::String("MyBucketNoAttr".into()),
+            "GetAtt without dot must be a pass-through, not a sentinel"
+        );
+        // And specifically must NOT contain the getatt sentinel format.
+        assert!(
+            !result.as_str().unwrap_or("").contains("{{getatt:"),
+            "no-dot GetAtt must not produce a getatt sentinel: {result:?}"
+        );
+    }
+
+    /// A sequence with exactly 2 elements must produce the correct sentinel.
+    #[test]
+    fn test_getatt_sequence_two_elements_produces_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("MyQueue".into()),
+            Value::String("Arn".into()),
+        ]);
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        assert_eq!(result, Value::String("{{getatt:MyQueue.Arn}}".into()));
+    }
+
+    /// A sequence with 3+ elements must produce a sentinel via `make_getatt`,
+    /// joining the extra parts with ".".
+    #[test]
+    fn test_getatt_sequence_three_elements_uses_make_getatt() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("MyResource".into()),
+            Value::String("SomeNested".into()),
+            Value::String("Attr".into()),
+        ]);
+        let result = resolve_get_att(&val, &ctx).unwrap();
+        // make_getatt("MyResource", "SomeNested.Attr") = "{{getatt:MyResource.SomeNested.Attr}}"
+        assert_eq!(
+            result,
+            Value::String("{{getatt:MyResource.SomeNested.Attr}}".into()),
+            "3-element sequence must join tail with '.' via make_getatt"
+        );
+    }
+
+    // --- Sub sentinel-isation (#1) ---
+
+    /// `!Sub '${Fn.Arn}'` (bare resource.attr) must produce a getatt sentinel,
+    /// not the literal `${{HandlerFunction.Arn}}`.
+    #[test]
+    fn test_sub_resource_attr_becomes_getatt_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("${HandlerFunction.Arn}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{getatt:HandlerFunction.Arn}}".into()),
+            "!Sub '${{Resource.Attr}}' must produce a getatt sentinel"
+        );
+    }
+
+    /// `!Sub '${MyQueue}'` (bare resource ref, not in parameters) must produce
+    /// a ref sentinel, not the literal `${{MyQueue}}`.
+    #[test]
+    fn test_sub_resource_ref_becomes_ref_sentinel() {
+        let ctx = make_ctx();
+        // "MyQueue" is not a parameter in make_ctx(), so it must sentinel-ise.
+        let val = Value::String("${MyQueue}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{ref:MyQueue}}".into()),
+            "!Sub '${{Resource}}' must produce a ref sentinel"
+        );
+    }
+
+    /// `!Sub '${AWS::Region}'` must remain verbatim — pseudo-parameters are
+    /// never sentinel-ised.
+    #[test]
+    fn test_sub_pseudo_parameter_stays_verbatim() {
+        let ctx = make_ctx();
+        let val = Value::String("${AWS::Region}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("${AWS::Region}".into()),
+            "!Sub '${{AWS::Region}}' must remain verbatim (no sentinel)"
+        );
+    }
+
+    /// An embedded `!Sub` such as `'arn:...:${MyQueue}/p'` puts the sentinel
+    /// inside a longer string. The whole result is still a single string (not a
+    /// standalone sentinel), which is expected — edge extraction requires a
+    /// whole-string sentinel.
+    #[test]
+    fn test_sub_embedded_resource_ref_is_not_standalone_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("arn:aws:sqs:us-east-1:123456789012:${MyQueue}/suffix".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        let s = result.as_str().unwrap();
+        // The sentinel is embedded, not the whole string.
+        assert!(
+            s.contains("{{ref:MyQueue}}"),
+            "embedded ref should contain the sentinel: {s}"
+        );
+        assert_ne!(
+            s, "{{ref:MyQueue}}",
+            "embedded ref must NOT be a standalone sentinel"
+        );
+    }
+
+    // --- Fn::Sub ${!Literal} escape (#2) ---
+
+    /// `${!NotAVar}` must resolve to the literal `${NotAVar}` (no sentinel).
+    #[test]
+    fn test_sub_bang_escape_produces_literal() {
+        let ctx = make_ctx();
+        let val = Value::String("foo-${!NotAVar}-bar".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("foo-${NotAVar}-bar".into()),
+            "!Sub '${{!Literal}}' must produce literal '${{Literal}}', not a sentinel"
+        );
+    }
+
+    /// The escape must NOT produce any sentinel marker.
+    #[test]
+    fn test_sub_bang_escape_does_not_sentinel() {
+        let ctx = make_ctx();
+        let val = Value::String("${!SomeVar}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        let s = result.as_str().unwrap();
+        assert!(
+            !s.contains("{{ref:"),
+            "escaped variable must not produce a ref sentinel: {s}"
+        );
+        assert!(
+            !s.contains("{{getatt:"),
+            "escaped variable must not produce a getatt sentinel: {s}"
+        );
+        assert_eq!(s, "${SomeVar}");
+    }
+
+    /// Normal `${Resource}` refs alongside `${!Escaped}` must both work correctly.
+    #[test]
+    fn test_sub_bang_escape_mixed_with_resource_ref() {
+        let ctx = make_ctx();
+        // MyQueue is not a parameter in make_ctx(), so it becomes a ref sentinel.
+        let val = Value::String("${MyQueue}-${!NotAVar}".into());
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("{{ref:MyQueue}}-${NotAVar}".into()),
+            "resource ref must sentinel-ise while escaped var stays literal"
+        );
+    }
+
+    // --- resolve_join Bool support (#5) ---
+
+    /// `!Join` with a Bool element must include it in the result string.
+    #[test]
+    fn test_join_includes_bool_elements() {
+        let ctx = make_ctx();
+        // Join [":", [true, "suffix"]]  →  "true:suffix"
+        let val = Value::Sequence(vec![
+            Value::String(":".into()),
+            Value::Sequence(vec![
+                Value::Bool(true),
+                Value::String("suffix".into()),
+                Value::Bool(false),
+            ]),
+        ]);
+        let result = resolve_join(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("true:suffix:false".into()),
+            "Bool elements must be included in !Join result"
+        );
+    }
+
+    /// `!Join` with only a Bool element must not produce an empty string.
+    #[test]
+    fn test_join_bool_only_element() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String(String::new()),
+            Value::Sequence(vec![Value::Bool(false)]),
+        ]);
+        let result = resolve_join(&val, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::String("false".into()),
+            "single Bool element must not be silently dropped"
+        );
+    }
+
+    // --- resolve_sub 2-arg non-string local var (#6) ---
+
+    /// 2-arg `!Sub` where a local var resolves to a non-string (e.g. Number)
+    /// must substitute the key with empty string, NOT produce a `{{ref:Key}}`
+    /// sentinel.
+    #[test]
+    fn test_sub_two_arg_non_string_local_var_becomes_empty_not_sentinel() {
+        let ctx = make_ctx();
+        // Template: "${NumVar}-suffix"
+        // vars mapping: NumVar -> !Ref InstanceType resolves to "t3.micro" (a string).
+        // But we want to test a Number value: use a Number literal in the mapping.
+        let val = Value::Sequence(vec![
+            Value::String("prefix-${NumVar}-suffix".into()),
+            Value::Mapping({
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(
+                    Value::String("NumVar".into()),
+                    Value::Number(serde_yaml_ng::value::Number::from(42_i64)),
+                );
+                m
+            }),
+        ]);
+        let result = resolve_sub(&val, &ctx).unwrap();
+        let s = result.as_str().unwrap();
+        // NumVar resolves to a Number, which is not a string — must be inserted
+        // as empty string, producing "prefix--suffix", NOT "prefix-{{ref:NumVar}}-suffix".
+        assert!(
+            !s.contains("{{ref:NumVar}}"),
+            "non-string local var must not produce a ref sentinel: {s}"
+        );
+        assert_eq!(
+            s, "prefix--suffix",
+            "non-string local var must become empty: {s}"
+        );
+    }
+
+    /// 2-arg `!Sub` where a local var resolves to a string must still work normally.
+    #[test]
+    fn test_sub_two_arg_string_local_var_substituted_correctly() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("hello-${Name}".into()),
+            Value::Mapping({
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(Value::String("Name".into()), Value::String("world".into()));
+                m
+            }),
+        ]);
+        let result = resolve_sub(&val, &ctx).unwrap();
+        assert_eq!(result, Value::String("hello-world".into()));
     }
 }

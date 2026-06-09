@@ -1,16 +1,16 @@
 //! `ServiceCatalog` — the central registry for all service plugins.
 
 use yevice_core::{
-    bindings::derive_bindings,
-    capacity::{CapacityModel, RegionQuotas},
+    bindings::{ConnectionRule, derive_bindings},
+    capacity::{CapacityModel, QuotaProvider, Quotas},
     cost::ArchitectureCost,
     resource::Architecture,
     types::ArchitectureName,
 };
-use yevice_pricing::catalog::PriceCatalog;
 
 use crate::{
     error::CostError,
+    pricing_resolver::PriceCatalogResolver,
     service::{AnyService, Service, ServiceAdapter},
 };
 
@@ -21,6 +21,8 @@ use crate::{
 #[derive(Default)]
 pub struct ServiceCatalog {
     services: std::collections::HashMap<String, Box<dyn AnyService>>,
+    connection_rules: Vec<Box<dyn ConnectionRule>>,
+    quota_providers: Vec<Box<dyn QuotaProvider>>,
 }
 
 impl ServiceCatalog {
@@ -29,19 +31,61 @@ impl ServiceCatalog {
     }
 
     /// Register a typed service implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a service with the same `service_id` has already been registered.
     pub fn register<S: Service + 'static>(&mut self, service: S) {
-        self.services
-            .insert(service.id().to_string(), Box::new(ServiceAdapter(service)));
+        let id = service.id().to_string();
+        assert!(
+            !self.services.contains_key(&id),
+            "duplicate service registration for service_id '{id}'"
+        );
+        self.services.insert(id, Box::new(ServiceAdapter(service)));
+    }
+
+    /// Register a single connection rule.
+    pub fn register_connection_rule(&mut self, rule: Box<dyn ConnectionRule>) {
+        self.connection_rules.push(rule);
+    }
+
+    /// Register multiple connection rules at once.
+    pub fn register_connection_rules(&mut self, rules: Vec<Box<dyn ConnectionRule>>) {
+        self.connection_rules.extend(rules);
+    }
+
+    /// Return a slice of all registered connection rules.
+    pub fn connection_rules(&self) -> &[Box<dyn ConnectionRule>] {
+        &self.connection_rules
+    }
+
+    /// Register a quota provider.
+    pub fn register_quota_provider(&mut self, p: Box<dyn QuotaProvider>) {
+        self.quota_providers.push(p);
+    }
+
+    /// Merge default quotas from all registered providers for the given region.
+    /// Later-registered providers win on key conflicts.
+    pub fn default_quotas(&self, region: &str) -> Quotas {
+        let mut merged = Quotas::default();
+        for provider in &self.quota_providers {
+            merged.merge_from(provider.default_quotas(region));
+        }
+        merged
     }
 
     /// Build a cost model for the given architecture.
     ///
     /// Resources whose service_id has no registered service are silently
     /// skipped (or cause an error if `strict` is `true`).
+    ///
+    /// The `pricing` resolver is called per-resource with the resource's
+    /// provider. If no catalog is registered for that provider the resource is
+    /// skipped (or an error is returned when `strict` is `true`).
     pub fn build_cost_model(
         &self,
         arch: &Architecture,
-        pricing: &dyn PriceCatalog,
+        pricing: &dyn PriceCatalogResolver,
         strict: bool,
     ) -> Result<ArchitectureCost, CostError> {
         let mut resource_costs = Vec::new();
@@ -59,11 +103,23 @@ impl ServiceCatalog {
                 continue;
             };
 
+            let Some(catalog) = pricing.resolve(resource.shell.provider) else {
+                if strict {
+                    return Err(CostError::NoPricingCatalog(resource.shell.provider));
+                }
+                tracing::warn!(
+                    resource = %resource.logical_id,
+                    provider = ?resource.shell.provider,
+                    "no pricing catalog for provider; skipping"
+                );
+                continue;
+            };
+
             match service.build_cost(
                 &resource.logical_id,
                 &resource.resource_type,
                 &resource.shell,
-                pricing,
+                catalog,
             ) {
                 Ok(cost) => resource_costs.push(cost),
                 Err(e) => {
@@ -79,13 +135,14 @@ impl ServiceCatalog {
             }
         }
 
-        let bindings = derive_bindings(arch);
+        let bindings = derive_bindings(arch, &self.connection_rules);
 
         Ok(ArchitectureCost {
             name: ArchitectureName::new(&arch.name),
             resources: resource_costs,
             bindings,
             region: arch.region.clone(),
+            topology: arch.topology(),
         })
     }
 
@@ -93,7 +150,7 @@ impl ServiceCatalog {
     pub fn build_capacity_models(
         &self,
         arch: &Architecture,
-        quotas: &RegionQuotas,
+        quotas: &Quotas,
     ) -> Vec<CapacityModel> {
         let mut models = Vec::new();
         for resource in &arch.resources {
@@ -106,5 +163,48 @@ impl ServiceCatalog {
             }
         }
         models
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use yevice_core::{cost::ResourceCost, resource::Provider, types::LogicalId};
+    use yevice_pricing::catalog::PriceCatalog;
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct DummySpec;
+
+    struct DummyService;
+
+    impl Service for DummyService {
+        type Spec = DummySpec;
+
+        fn id(&self) -> &'static str {
+            "test.dummy"
+        }
+
+        fn provider(&self) -> Provider {
+            Provider::Other
+        }
+
+        fn build_cost(
+            &self,
+            _id: &LogicalId,
+            _resource_type: &yevice_core::types::ResourceType,
+            _spec: &Self::Spec,
+            _pricing: &dyn PriceCatalog,
+        ) -> Result<ResourceCost, crate::CostError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn duplicate_service_registration_panics() {
+        let mut catalog = ServiceCatalog::new();
+        catalog.register(DummyService);
+        catalog.register(DummyService);
     }
 }

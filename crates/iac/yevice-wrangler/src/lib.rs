@@ -5,10 +5,12 @@
 
 pub mod error;
 pub mod parser;
+pub mod plugin;
 pub mod services;
 
 pub use error::WranglerError;
 pub use parser::{parse_wrangler, parse_wrangler_str};
+pub use plugin::CloudflarePlugin;
 
 /// Register all Cloudflare services into the given catalog.
 pub fn register(catalog: &mut yevice_service_api::ServiceCatalog) {

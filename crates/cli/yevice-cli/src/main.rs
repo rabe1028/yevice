@@ -1,8 +1,12 @@
 mod commands;
+mod render;
 
-use anyhow::Result;
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
+use yevice_core::resource::Provider;
 
 #[derive(Parser)]
 #[command(
@@ -79,6 +83,13 @@ enum Commands {
         /// calculated. Product-included allocations are still applied.
         #[arg(long)]
         list_price: bool,
+
+        /// Override the pricing region for a specific provider.
+        /// Format: PROVIDER=REGION (e.g. `gcp=asia-northeast1`).
+        /// May be repeated for multiple providers.
+        /// Providers not listed fall back to --region.
+        #[arg(long = "provider-region", value_name = "PROVIDER=REGION")]
+        provider_region: Vec<String>,
     },
 
     /// Evaluate a generated cost model with usage parameters.
@@ -194,6 +205,52 @@ enum Commands {
         #[arg(short, long, default_value = "pricing-data")]
         output_dir: String,
     },
+
+    /// Render an architecture diagram from a generated cost-model JSON file.
+    Diagram {
+        /// Path to cost model file (JSON) produced by `generate`.
+        cost_model: String,
+
+        /// Diagram output format.
+        #[arg(long, default_value = "drawio")]
+        format: String,
+
+        /// Output file path. Writes to stdout if omitted.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Find the optimal variable assignment that minimizes (or maximizes) total cost.
+    Optimize {
+        /// Path to cost model file (JSON) produced by `generate`.
+        cost_model: String,
+
+        /// Path to usage parameters file (YAML/JSON) for fixed (non-decision) variables.
+        #[arg(short, long)]
+        params: Option<String>,
+
+        /// Decision variable with its candidate domain: NAME=v1,v2,...
+        /// May be repeated for multiple decision variables.
+        #[arg(long = "decision", value_name = "NAME=v1,v2,...")]
+        decision: Vec<String>,
+
+        /// Optimization direction: `min` to minimize cost (default), `max` to maximize.
+        #[arg(long = "direction", default_value = "min", value_name = "min|max")]
+        direction: String,
+    },
+}
+
+/// Parse a list of `PROVIDER=REGION` strings into a `HashMap<Provider, String>`.
+///
+/// Delegates per-entry parsing to [`commands::parse_provider_region`].
+fn parse_provider_regions(specs: &[String]) -> Result<HashMap<Provider, String>> {
+    let mut map = HashMap::new();
+    for spec in specs {
+        let (provider, region) = commands::parse_provider_region(spec)
+            .with_context(|| format!("failed to parse --provider-region '{spec}'"))?;
+        map.insert(provider, region);
+    }
+    Ok(map)
 }
 
 fn main() -> Result<()> {
@@ -212,18 +269,23 @@ fn main() -> Result<()> {
             name,
             output,
             list_price,
-        } => commands::generate(
-            &template,
-            parameters.as_deref(),
-            imports.as_deref(),
-            bindings.as_deref(),
-            &name,
-            &output,
-            &cli.region,
-            cli.input_format.to_command_format(),
-            cli.strict,
-            list_price,
-        ),
+            provider_region,
+        } => {
+            let provider_regions = parse_provider_regions(&provider_region)?;
+            commands::generate(
+                &template,
+                parameters.as_deref(),
+                imports.as_deref(),
+                bindings.as_deref(),
+                &name,
+                &output,
+                &cli.region,
+                &provider_regions,
+                cli.input_format.to_command_format(),
+                cli.strict,
+                list_price,
+            )
+        }
         Commands::Eval {
             cost_model,
             params,
@@ -272,5 +334,16 @@ fn main() -> Result<()> {
         Commands::UpdatePricing { output_dir } => {
             commands::update_pricing(&cli.region, &output_dir)
         }
+        Commands::Diagram {
+            cost_model,
+            format,
+            output,
+        } => commands::diagram(&cost_model, &format, output.as_deref()),
+        Commands::Optimize {
+            cost_model,
+            params,
+            decision,
+            direction,
+        } => commands::optimize(&cost_model, params.as_deref(), &decision, &direction),
     }
 }

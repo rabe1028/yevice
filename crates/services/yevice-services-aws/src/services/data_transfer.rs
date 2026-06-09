@@ -17,7 +17,7 @@ use yevice_service_api::{Service, error::CostError};
 /// - Internet egress (data transfer out to the internet), priced with the
 ///   shared tiered SKU `aws.data_transfer.egress_tiers` (first GB free, then
 ///   $0.114/GB to 10 TB, etc.). This intentionally reuses the same tier table
-///   that `lambda::egress_cost_expr` consumes, so the model is not duplicated.
+///   that `common::egress_cost_expr` consumes, so the model is not duplicated.
 /// - Inter-region transfer out (e.g. Tokyo -> Osaka ap-northeast-3), a flat
 ///   per-GB rate via `aws.data_transfer.inter_region_price_per_gb`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -44,7 +44,7 @@ impl Service for DataTransferService {
         pricing: &dyn PriceCatalog,
     ) -> Result<ResourceCost, CostError> {
         // Internet egress: reuse the shared tiered SKU rather than redefining
-        // the tier table (complements lambda::egress_cost_expr).
+        // the tier table (complements common::egress_cost_expr).
         let egress_record = pricing.lookup(&Sku::new("aws.data_transfer.egress_tiers"))?;
         let egress_tiers = egress_record.as_tiered().map_err(CostError::Pricing)?;
         let internet_egress = Expr::tiered(

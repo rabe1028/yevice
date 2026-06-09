@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use yevice_core::{
+    HOURS_PER_MONTH,
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
@@ -12,8 +13,6 @@ use yevice_service_api::{Service, error::CostError};
 pub struct NatGatewaySpec {}
 
 pub struct NatGatewayService;
-
-const HOURS_PER_MONTH: f64 = 730.0;
 
 impl Service for NatGatewayService {
     type Spec = NatGatewaySpec;
@@ -64,5 +63,3 @@ impl Service for NatGatewayService {
         })
     }
 }
-
-const _: f64 = HOURS_PER_MONTH;

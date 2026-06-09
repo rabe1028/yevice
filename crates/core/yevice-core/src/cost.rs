@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::expr::{Expr, Tier};
+use crate::topology::Topology;
 use crate::types::{ArchitectureName, LogicalId, Region, ResourceType, VariableName};
 
 /// A named sub-component of a resource's cost.
@@ -25,12 +26,31 @@ pub struct ResourceCost {
     pub required_variables: Vec<VariableInfo>,
 }
 
+/// Indicates whether a variable is a usage (observed) input or a decision
+/// variable that the optimizer may choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VariableKind {
+    /// Observed usage input supplied by the user (default).
+    #[default]
+    Usage,
+    /// Decision variable: the optimizer selects its value from a domain.
+    Decision,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_usage(k: &VariableKind) -> bool {
+    *k == VariableKind::Usage
+}
+
 /// Metadata about a variable used in a cost expression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableInfo {
     pub name: VariableName,
     pub description: String,
     pub unit: String,
+    /// Whether this variable is a usage input or a decision variable.
+    #[serde(default, skip_serializing_if = "is_usage")]
+    pub kind: VariableKind,
 }
 
 impl VariableInfo {
@@ -39,6 +59,7 @@ impl VariableInfo {
             name: id.var(suffix),
             description: description.into(),
             unit: unit.into(),
+            kind: VariableKind::Usage,
         }
     }
 }
@@ -71,6 +92,10 @@ pub struct ArchitectureCost {
     pub bindings: Vec<VariableBinding>,
     /// Region.
     pub region: Region,
+    /// Architecture topology (all nodes + connections), persisted so diagram
+    /// and optimization consumers need not re-parse the source IaC.
+    #[serde(default)]
+    pub topology: Topology,
 }
 
 impl ArchitectureCost {
@@ -94,5 +119,26 @@ impl ArchitectureCost {
     /// Collects all variable bindings.
     pub fn all_bindings(&self) -> &[VariableBinding] {
         &self.bindings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn architecture_cost_without_topology_field_deserializes() {
+        // JSON that was produced before the `topology` field existed.
+        // Deserializing it must succeed and yield an empty (default) topology.
+        let json = r#"{
+            "name": "arch",
+            "resources": [],
+            "bindings": [],
+            "region": "ap-northeast-1"
+        }"#;
+
+        let cost: ArchitectureCost = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cost.name, ArchitectureName::new("arch"));
+        assert!(cost.topology.is_empty());
     }
 }

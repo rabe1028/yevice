@@ -33,9 +33,9 @@ pub enum CfnError {
         property: String,
     },
 
-    #[error("IO error: {0}")]
+    #[error("IO error")]
     Io(#[from] std::io::Error),
 
-    #[error("YAML parse error: {0}")]
+    #[error("YAML parse error")]
     Yaml(#[from] serde_yaml_ng::Error),
 }

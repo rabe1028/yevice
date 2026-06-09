@@ -110,10 +110,19 @@ impl CfnAdapterRegistry {
 
     /// Register an adapter. If the adapter handles multiple resource types,
     /// it is registered for each one (sharing the same `Arc`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any resource type handled by this adapter has already been registered.
     pub fn register(&mut self, adapter: impl CfnAdapter + 'static) {
         let arc: Arc<dyn CfnAdapter> = Arc::new(adapter);
         for rt in arc.handles() {
-            self.adapters.insert((*rt).to_string(), Arc::clone(&arc));
+            let key = (*rt).to_string();
+            assert!(
+                !self.adapters.contains_key(&key),
+                "duplicate CFN adapter registration for resource_type '{key}'"
+            );
+            self.adapters.insert(key, Arc::clone(&arc));
         }
     }
 
@@ -221,10 +230,19 @@ impl TfAdapterRegistry {
 
     /// Register an adapter. If the adapter handles multiple resource types,
     /// it is registered for each one (sharing the same `Arc`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if any resource type handled by this adapter has already been registered.
     pub fn register(&mut self, adapter: impl TfAdapter + 'static) {
         let arc: Arc<dyn TfAdapter> = Arc::new(adapter);
         for rt in arc.handles() {
-            self.adapters.insert((*rt).to_string(), Arc::clone(&arc));
+            let key = (*rt).to_string();
+            assert!(
+                !self.adapters.contains_key(&key),
+                "duplicate TF adapter registration for resource_type '{key}'"
+            );
+            self.adapters.insert(key, Arc::clone(&arc));
         }
     }
 
@@ -239,5 +257,50 @@ impl TfAdapterRegistry {
     pub fn convert(&self, raw: &RawTfResource) -> Option<Result<ResourceShell, IacError>> {
         let adapter = self.lookup(raw.resource_type.as_str())?;
         Some(adapter.convert(raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyCfnAdapter;
+
+    impl CfnAdapter for DummyCfnAdapter {
+        fn handles(&self) -> &[&'static str] {
+            &["AWS::Test::Resource"]
+        }
+
+        fn convert(&self, _raw: &RawCfnResource) -> Result<ResourceShell, IacError> {
+            unimplemented!()
+        }
+    }
+
+    struct DummyTfAdapter;
+
+    impl TfAdapter for DummyTfAdapter {
+        fn handles(&self) -> &[&'static str] {
+            &["test_resource"]
+        }
+
+        fn convert(&self, _raw: &RawTfResource) -> Result<ResourceShell, IacError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn duplicate_cfn_adapter_registration_panics() {
+        let mut registry = CfnAdapterRegistry::new();
+        registry.register(DummyCfnAdapter);
+        registry.register(DummyCfnAdapter);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn duplicate_tf_adapter_registration_panics() {
+        let mut registry = TfAdapterRegistry::new();
+        registry.register(DummyTfAdapter);
+        registry.register(DummyTfAdapter);
     }
 }
