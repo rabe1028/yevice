@@ -453,13 +453,19 @@ pub fn optimize(
         decision_variables.push(DecisionVariable { name, domain });
     }
 
-    // Every variable in the objective must be bound — either fixed via --params
-    // or chosen as a --decision. Otherwise the objective cannot be evaluated and
-    // the solver would (misleadingly) report INFEASIBLE. Surface it as a clear
-    // error instead, listing exactly what is missing.
+    // Every variable in the objective must be bound — either fixed via --params,
+    // chosen as a --decision, or derivable via a binding.  Otherwise the
+    // objective cannot be evaluated and the solver would (misleadingly) report
+    // INFEASIBLE.  Surface it as a clear error instead, listing exactly what is
+    // missing.
     let mut bound: std::collections::HashSet<VariableName> = fixed_params.keys().cloned().collect();
     for dv in &decision_variables {
         bound.insert(dv.name.clone());
+    }
+    // Binding targets are resolved at solve-time, so they count as "bound" for
+    // the purpose of this pre-flight check.
+    for b in arch.all_bindings() {
+        bound.insert(b.target.clone());
     }
     let unbound: Vec<String> = objective
         .variables()
@@ -488,6 +494,7 @@ pub fn optimize(
         decision_variables,
         constraints: vec![],
         fixed_params: fixed_params.into_iter().collect(),
+        bindings: arch.all_bindings().to_vec(),
     };
 
     let sol = match EnumerationSolver.solve(&problem) {

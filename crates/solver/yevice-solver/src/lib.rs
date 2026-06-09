@@ -10,7 +10,7 @@ pub mod error;
 use std::collections::HashMap;
 
 pub use error::SolverError;
-use yevice_core::evaluate::{self, Params};
+use yevice_core::evaluate::{self, Params, resolve_bindings};
 use yevice_core::optimize::{ObjectiveDirection, OptimizationProblem, Relation};
 use yevice_core::types::VariableName;
 
@@ -104,7 +104,13 @@ impl Solver for EnumerationSolver {
         let mut best: Option<Solution> = None;
 
         for assignment in candidates {
-            let params = build_params(problem, &assignment);
+            // Resolve bindings so derived variables are available before
+            // feasibility / objective evaluation.  Resolution errors are treated
+            // as infeasible (same policy as evaluation errors below).
+            let params = match effective_params(problem, &assignment) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
 
             // Evaluate and check all constraints; skip this combination on any
             // evaluation error (treat as infeasible).
@@ -177,6 +183,22 @@ fn build_params(problem: &OptimizationProblem, assignment: &HashMap<VariableName
     params
 }
 
+/// Build the effective `Params` for a given assignment by merging fixed params,
+/// decision variable values, and then resolving any bindings in the problem.
+///
+/// This mirrors the behaviour of `evaluate_architecture`, which calls
+/// `resolve_bindings` before evaluating resource expressions.  Bindings only
+/// fill in variables that are *not* already present (fixed or decision), so
+/// decision-variable values are never overwritten by a binding even if the
+/// decision variable is also a binding source.
+fn effective_params(
+    problem: &OptimizationProblem,
+    assignment: &HashMap<VariableName, f64>,
+) -> Result<Params, SolverError> {
+    let base = build_params(problem, assignment);
+    resolve_bindings(&problem.bindings, &base).map_err(SolverError::Eval)
+}
+
 /// Return `true` iff every constraint in the problem is satisfied by `params`.
 ///
 /// An evaluation error on any constraint's LHS is treated as a failure (the
@@ -204,7 +226,7 @@ fn solve_single(
     problem: &OptimizationProblem,
     assignment: HashMap<VariableName, f64>,
 ) -> Result<Solution, SolverError> {
-    let params = build_params(problem, &assignment);
+    let params = effective_params(problem, &assignment)?;
     if !is_feasible(problem, &params) {
         return Ok(Solution {
             assignments: HashMap::new(),
@@ -257,6 +279,7 @@ mod tests {
             decision_variables,
             constraints,
             fixed_params,
+            bindings: vec![],
         }
     }
 
@@ -500,5 +523,80 @@ mod tests {
         let sol = EnumerationSolver.solve(&problem).unwrap();
         assert!(sol.feasible);
         assert_eq!(sol.assignments[&var("x")], 2.0);
+    }
+
+    /// Binding: `derived = source * 2.0`.
+    /// `source` is provided via `fixed_params`; `derived` is referenced in the
+    /// objective.  Without binding resolution the solver would fail to evaluate
+    /// the objective and return infeasible.
+    #[test]
+    fn binding_target_resolved_from_fixed_source() {
+        use yevice_core::cost::VariableBinding;
+
+        // objective = derived  (binding: derived = source * 2)
+        // fixed_params: source = 5.0  →  derived = 10.0
+        let binding = VariableBinding {
+            target: var("derived"),
+            expr: Expr::product(vec![Expr::variable("source"), Expr::constant(2.0)]),
+            description: "derived = source * 2".into(),
+            source: "test".into(),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("source"), 5.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("derived"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible: binding must be resolved");
+        assert_eq!(sol.objective_value, 10.0);
+    }
+
+    /// Binding where the source is a decision variable.
+    /// `x` is a decision variable; `cost = x * price_per_unit` where
+    /// `price_per_unit` is derived via a binding from the fixed param `rate`.
+    #[test]
+    fn binding_source_is_decision_variable() {
+        use yevice_core::cost::VariableBinding;
+
+        // objective = x * price_per_unit
+        // binding: price_per_unit = x * rate   (price scales with x)
+        // fixed_params: rate = 3.0
+        // domain for x: {1.0, 2.0, 4.0}
+        // effective costs: x=1 → price=3, cost=3; x=2 → price=6, cost=12; x=4 → price=12, cost=48
+        // minimize → x=1
+        let binding = VariableBinding {
+            target: var("price_per_unit"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::variable("rate")]),
+            description: "price_per_unit = x * rate".into(),
+            source: "test".into(),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("rate"), 3.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("x"), Expr::variable("price_per_unit")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 4.0])],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            sol.feasible,
+            "expected feasible with decision-variable binding source"
+        );
+        assert_eq!(sol.assignments[&var("x")], 1.0, "x=1 minimises x*x*rate");
+        assert_eq!(sol.objective_value, 3.0); // 1 * (1 * 3)
     }
 }

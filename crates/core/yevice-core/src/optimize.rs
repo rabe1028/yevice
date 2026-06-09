@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cost::VariableBinding;
 use crate::expr::Expr;
 use crate::types::VariableName;
 
@@ -75,4 +76,8 @@ pub struct OptimizationProblem {
     /// Fixed (non-decision) variable values, e.g. usage parameters.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub fixed_params: HashMap<VariableName, f64>,
+    /// Variable bindings (derived-variable relationships) to resolve before
+    /// evaluating the objective/constraints, mirroring `evaluate_architecture`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<VariableBinding>,
 }
