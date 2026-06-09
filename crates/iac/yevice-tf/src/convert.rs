@@ -316,6 +316,44 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
         }
 
         // ---------------------------------------------------------------
+        // Special case: aws_sns_topic_subscription
+        // This resource is glue (topic → subscriber); it is not itself a
+        // node.  Produce one Notification edge: topic → endpoint (lambda /
+        // SQS / …).  When `endpoint` is a literal string (http, email, …)
+        // the ResourceRef pattern won't match and no edge is emitted.
+        // ---------------------------------------------------------------
+        if src_type == "aws_sns_topic_subscription" {
+            if let (
+                Some(TfValue::ResourceRef {
+                    resource_type: topic_type,
+                    name: topic_name,
+                    ..
+                }),
+                Some(TfValue::ResourceRef {
+                    resource_type: ep_type,
+                    name: ep_name,
+                    ..
+                }),
+            ) = (
+                src_resource.attrs.get("topic_arn"),
+                src_resource.attrs.get("endpoint"),
+            ) {
+                let topic_lid = logical_id_for(topic_type, topic_name);
+                let ep_lid = logical_id_for(ep_type, ep_name);
+                push_unique(
+                    &mut connections,
+                    &mut seen,
+                    &nodes,
+                    &topic_lid,
+                    &ep_lid,
+                    ConnectionType::Notification,
+                );
+            }
+            // Subscription itself is not a node — no further generic edges.
+            continue;
+        }
+
+        // ---------------------------------------------------------------
         // aws_s3_bucket_notification: Notification edges
         //
         // The `bucket` attribute holds a ResourceRef to the S3 bucket that
@@ -639,5 +677,178 @@ mod s3_notification_gating_tests {
         assert_eq!(conns[0].source.as_str(), "aws_s3_bucket_my_bucket");
         assert_eq!(conns[0].target.as_str(), "aws_lambda_function_fn_a");
         assert_eq!(conns[0].connection_type, ConnectionType::Notification);
+    }
+}
+
+#[cfg(test)]
+mod sns_subscription_tests {
+    use super::*;
+
+    fn node(resource_type: &str, name: &str) -> Resource {
+        let lid = logical_id_for(resource_type, name);
+        Resource {
+            logical_id: LogicalId::new(&lid),
+            resource_type: ResourceType::new(resource_type),
+            shell: ResourceShell::other(resource_type),
+            group: None,
+        }
+    }
+
+    fn subscription(
+        sub_name: &str,
+        topic_type: &str,
+        topic_name: &str,
+        endpoint: TfValue,
+    ) -> TfResource {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "topic_arn".to_string(),
+            TfValue::ResourceRef {
+                resource_type: topic_type.to_string(),
+                name: topic_name.to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+        attrs.insert("endpoint".to_string(), endpoint);
+        attrs.insert(
+            "protocol".to_string(),
+            TfValue::String("lambda".to_string()),
+        );
+        TfResource {
+            resource_type: "aws_sns_topic_subscription".to_string(),
+            name: sub_name.to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        }
+    }
+
+    /// Two subscriptions with ResourceRef endpoints must each produce a
+    /// Notification edge from the SNS topic to the respective subscriber.
+    #[test]
+    fn two_subscriptions_produce_two_notification_edges() {
+        let topic = node("aws_sns_topic", "my_topic");
+        let lambda = node("aws_lambda_function", "fn_a");
+        let queue = node("aws_sqs_queue", "q_a");
+
+        let sub_lambda = subscription(
+            "sub_lambda",
+            "aws_sns_topic",
+            "my_topic",
+            TfValue::ResourceRef {
+                resource_type: "aws_lambda_function".to_string(),
+                name: "fn_a".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+        let sub_sqs = subscription(
+            "sub_sqs",
+            "aws_sns_topic",
+            "my_topic",
+            TfValue::ResourceRef {
+                resource_type: "aws_sqs_queue".to_string(),
+                name: "q_a".to_string(),
+                attr: "arn".to_string(),
+            },
+        );
+
+        let tf_resources = vec![sub_lambda, sub_sqs];
+        let resources = vec![topic, lambda, queue];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert_eq!(
+            conns.len(),
+            2,
+            "expected 2 Notification edges; connections = {conns:?}",
+        );
+        let has_lambda_edge = conns.iter().any(|c| {
+            c.connection_type == ConnectionType::Notification
+                && c.source.as_str() == "aws_sns_topic_my_topic"
+                && c.target.as_str() == "aws_lambda_function_fn_a"
+        });
+        let has_sqs_edge = conns.iter().any(|c| {
+            c.connection_type == ConnectionType::Notification
+                && c.source.as_str() == "aws_sns_topic_my_topic"
+                && c.target.as_str() == "aws_sqs_queue_q_a"
+        });
+        assert!(
+            has_lambda_edge,
+            "missing topic→lambda Notification edge; connections = {conns:?}",
+        );
+        assert!(
+            has_sqs_edge,
+            "missing topic→sqs Notification edge; connections = {conns:?}",
+        );
+    }
+
+    /// A subscription whose `endpoint` is a literal string (e.g. http/email)
+    /// must NOT produce any edge.
+    #[test]
+    fn literal_endpoint_produces_no_edge() {
+        let topic = node("aws_sns_topic", "my_topic");
+
+        let sub_http = subscription(
+            "sub_http",
+            "aws_sns_topic",
+            "my_topic",
+            TfValue::String("https://example.com/hook".to_string()),
+        );
+
+        let tf_resources = vec![sub_http];
+        let resources = vec![topic];
+        let conns = build_connections(&tf_resources, &resources);
+
+        assert!(
+            conns.is_empty(),
+            "expected no edge for literal endpoint; connections = {conns:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tf_value_to_json_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// An Object whose values are all concrete scalars must convert to a
+    /// JSON object with the same keys and values.
+    #[test]
+    fn object_of_scalars_converts_to_json_object() {
+        let mut map: BTreeMap<String, Box<TfValue>> = BTreeMap::new();
+        map.insert(
+            "KEY".to_string(),
+            Box::new(TfValue::String("value".to_string())),
+        );
+        map.insert("NUM".to_string(), Box::new(TfValue::Number(42.0)));
+        let obj = TfValue::Object(map);
+
+        let json = tf_value_to_json(&obj).expect("Object of scalars must convert");
+        assert!(json.is_object(), "expected JSON object; got {json:?}");
+        assert_eq!(json["KEY"], serde_json::json!("value"));
+        assert_eq!(json["NUM"], serde_json::json!(42.0));
+    }
+
+    /// An Object that contains an unresolved VarRef must silently drop that
+    /// key and still return a JSON object for the remaining scalars.
+    #[test]
+    fn object_with_var_ref_drops_unresolved_key() {
+        let mut map: BTreeMap<String, Box<TfValue>> = BTreeMap::new();
+        map.insert(
+            "RESOLVED".to_string(),
+            Box::new(TfValue::String("ok".to_string())),
+        );
+        map.insert(
+            "UNRESOLVED".to_string(),
+            Box::new(TfValue::VarRef("some_var".to_string())),
+        );
+        let obj = TfValue::Object(map);
+
+        let json = tf_value_to_json(&obj).expect("Object must produce Some even with VarRef");
+        assert!(json.is_object());
+        assert_eq!(json["RESOLVED"], serde_json::json!("ok"));
+        assert!(
+            json.get("UNRESOLVED").is_none(),
+            "VarRef key must be dropped"
+        );
     }
 }
