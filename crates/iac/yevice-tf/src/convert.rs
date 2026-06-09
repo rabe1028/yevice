@@ -143,6 +143,21 @@ const COMPUTE_RESOURCE_TYPES: &[&str] = &["aws_sfn_state_machine", "aws_lambda_f
 /// Notification resource types: these → Lambda/SQS produce Notification edges.
 const NOTIFICATION_SOURCE_TYPES: &[&str] = &["aws_s3_bucket_notification"];
 
+/// Terraform blocks that describe deployment/configuration, not runtime data
+/// flow; references inside them must not become runtime connection edges.
+const NON_RUNTIME_BLOCKS: &[&str] = &[
+    "dead_letter_config",
+    "vpc_config",
+    "tracing_config",
+    "file_system_config",
+    "image_config",
+    "ephemeral_storage",
+    "logging_config",
+    "snap_start",
+    "timeouts",
+    "lifecycle",
+];
+
 /// Logical-id format used throughout this crate: `<resource_type>_<name>`.
 fn logical_id_for(resource_type: &str, name: &str) -> String {
     format!("{resource_type}_{name}")
@@ -338,7 +353,10 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
             collect_resource_refs(attr_val, &mut refs);
         }
 
-        for block_list in src_resource.blocks.values() {
+        for (block_name, block_list) in &src_resource.blocks {
+            if NON_RUNTIME_BLOCKS.contains(&block_name.as_str()) {
+                continue;
+            }
             for block_attrs in block_list {
                 for attr_val in block_attrs.values() {
                     collect_resource_refs(attr_val, &mut refs);

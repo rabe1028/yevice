@@ -679,6 +679,60 @@ fn lambda_to_dynamodb_produces_data_flow_edge_via_classify() {
 // #6: local ref — ResourceRef aliased through locals must produce edges
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// NON_RUNTIME_BLOCKS denylist: dead_letter_config et al. must not become edges
+// ---------------------------------------------------------------------------
+
+/// `dead_letter_config { target_arn = aws_sqs_queue.dlq.arn }` describes where
+/// failed async invocations are sent — it is a deployment configuration, not a
+/// runtime data-flow path.  The generic ref-collection loop must skip this block
+/// so that no Lambda→SQS(dlq) DataFlow edge is created.
+#[test]
+fn dead_letter_config_does_not_produce_data_flow_edge() {
+    let dir = FixtureDir::new("non-runtime-dlq", &["non_runtime_blocks.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let dlq_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_my_fn"
+            && c.target.as_str() == "aws_sqs_queue_dlq"
+    });
+    assert!(
+        dlq_edge.is_none(),
+        "unexpected DataFlow edge from aws_lambda_function_my_fn to aws_sqs_queue_dlq \
+         (dead_letter_config must be skipped); connections = {:?}",
+        arch.connections,
+    );
+}
+
+/// `environment { variables = { TABLE_ARN = aws_dynamodb_table.data_table.arn } }`
+/// is a runtime block — the denylist must NOT suppress it, so the Lambda→DynamoDB
+/// DataFlow edge must still be present.
+#[test]
+fn environment_block_still_produces_data_flow_edge() {
+    let dir = FixtureDir::new("non-runtime-env", &["non_runtime_blocks.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let table_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_my_fn"
+            && c.target.as_str() == "aws_dynamodb_table_data_table"
+    });
+    assert!(
+        table_edge.is_some(),
+        "expected DataFlow edge from aws_lambda_function_my_fn to \
+         aws_dynamodb_table_data_table (environment block must not be suppressed); \
+         connections = {:?}",
+        arch.connections,
+    );
+}
+
 /// `local.fn_arn = aws_lambda_function.fn.arn` is used as the
 /// `lambda_function_arn` inside an `aws_s3_bucket_notification` block.
 /// After the fix the local resolves to a ResourceRef and the notification
