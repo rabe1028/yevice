@@ -2,6 +2,7 @@ pub mod convert;
 pub mod error;
 pub mod intrinsic;
 pub mod parser;
+pub(crate) mod sentinel;
 
 pub use convert::build_architecture;
 pub use error::CfnError;

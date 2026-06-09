@@ -10,6 +10,7 @@ use yevice_core::{
 use yevice_service_api::{CfnAdapterRegistry, RawCfnResource};
 
 use crate::parser::{CfnResource, CfnTemplate};
+use crate::sentinel;
 
 /// Convert a resolved CFn template to an Architecture using the adapter registry.
 pub fn build_architecture(
@@ -175,16 +176,11 @@ fn extract_event_source_connection(
 
 fn extract_function_logical_id(props: &serde_yaml_ng::Mapping) -> Option<String> {
     let fn_name = props.get(YamlValue::String("FunctionName".into()))?;
-    if let Some(s) = fn_name.as_str() {
-        if let Some(rest) = s.strip_prefix("{{getatt:") {
-            return rest
-                .strip_suffix("}}")
-                .and_then(|s| s.split('.').next())
-                .map(String::from);
-        }
-        return Some(s.to_string());
+    let s = fn_name.as_str()?;
+    if let Some(cfn_ref) = sentinel::parse(s) {
+        return Some(cfn_ref.logical_id);
     }
-    None
+    Some(s.to_string())
 }
 
 fn extract_source_logical_id(
@@ -194,13 +190,12 @@ fn extract_source_logical_id(
     let source_arn = props.get(YamlValue::String("EventSourceArn".into()))?;
 
     if let Some(s) = source_arn.as_str() {
-        // Resolved !GetAtt: "{{getatt:QueueName.Arn}}"
-        if let Some(rest) = s.strip_prefix("{{getatt:") {
-            let logical_id = rest.strip_suffix("}}")?.split('.').next()?;
-            let source_type = detect_source_type(logical_id, resources)?;
-            return Some((logical_id.to_string(), source_type));
+        // Resolved sentinel: "{{ref:X}}" or "{{getatt:X.Attr}}"
+        if let Some(cfn_ref) = sentinel::parse(s) {
+            let source_type = detect_source_type(&cfn_ref.logical_id, resources)?;
+            return Some((cfn_ref.logical_id, source_type));
         }
-        // From ARN pattern
+        // From ARN pattern (literal ARN, not a sentinel)
         if s.contains(":sqs:") {
             return Some((arn_last_segment(s), "sqs".to_string()));
         }
@@ -242,16 +237,7 @@ fn arn_last_segment(arn: &str) -> String {
 /// - `"{{ref:X}}"` → `Some("X")`
 /// - `"{{getatt:X.Attr}}"` → `Some("X")`
 fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
-    if let Some(rest) = s.strip_prefix("{{ref:") {
-        return rest.strip_suffix("}}").map(String::from);
-    }
-    if let Some(rest) = s.strip_prefix("{{getatt:") {
-        return rest
-            .strip_suffix("}}")
-            .and_then(|inner| inner.split('.').next())
-            .map(String::from);
-    }
-    None
+    sentinel::parse(s).map(|r| r.logical_id)
 }
 
 /// Determine the containment parent for a CFn resource.

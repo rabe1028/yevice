@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde_yaml_ng::Value;
 
 use crate::error::CfnError;
+use crate::sentinel;
 
 /// Context for resolving `CloudFormation` intrinsic functions.
 pub struct ResolveContext {
@@ -114,7 +115,7 @@ fn resolve_ref(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     }
 
     // If it's a resource logical ID, return as-is (we can't resolve resource IDs statically)
-    Ok(Value::String(format!("{{{{ref:{name}}}}}")))
+    Ok(Value::String(sentinel::make_ref(name)))
 }
 
 fn resolve_sub(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
@@ -320,16 +321,31 @@ fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> 
 
 fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     // !GetAtt cannot be fully resolved statically.
-    // Return a placeholder.
+    // Return a sentinel placeholder.
     let _ = ctx;
     match value {
-        Value::String(s) => Ok(Value::String(format!("{{{{getatt:{s}}}}}"))),
+        Value::String(s) => {
+            // Dot-notation form: "LogicalId.Attr"
+            if let Some((logical_id, attr)) = s.split_once('.') {
+                return Ok(Value::String(sentinel::make_getatt(logical_id, attr)));
+            }
+            // No dot: encode as-is (degenerate case, logical_id only)
+            Ok(Value::String(format!("{{{{getatt:{s}}}}}")))
+        }
         Value::Sequence(seq) => {
-            let parts: Vec<String> = seq
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            Ok(Value::String(format!("{{{{getatt:{}}}}}", parts.join("."))))
+            let parts: Vec<&str> = seq.iter().filter_map(|v| v.as_str()).collect();
+            match parts.as_slice() {
+                [logical_id, attr] => {
+                    Ok(Value::String(sentinel::make_getatt(logical_id, attr)))
+                }
+                _ => {
+                    // Fallback for unusual multi-part sequences (>2 elements): join with dot.
+                    Ok(Value::String(format!(
+                        "{{{{getatt:{}}}}}",
+                        parts.join(".")
+                    )))
+                }
+            }
         }
         _ => Ok(value.clone()),
     }
