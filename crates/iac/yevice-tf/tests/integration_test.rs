@@ -462,3 +462,101 @@ fn connections_have_no_dangling_endpoints() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Nested Object/Array ResourceRef tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nested_object_ref_produces_data_flow_edge() {
+    // nested_ref.tf: aws_lambda_function.my_function has an environment block
+    // with variables = { TABLE_ARN = aws_dynamodb_table.my_table.arn }.
+    // The ResourceRef is nested inside Object(variables) inside the environment
+    // block — verify it still produces a DataFlow edge.
+    let dir = FixtureDir::new("nested-ref", &["nested_ref.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let data_flow_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_my_function"
+            && c.target.as_str() == "aws_dynamodb_table_my_table"
+    });
+    assert!(
+        data_flow_edge.is_some(),
+        "expected DataFlow edge from aws_lambda_function_my_function to \
+         aws_dynamodb_table_my_table (nested object ref); connections = {:?}",
+        arch.connections,
+    );
+}
+
+#[test]
+fn nested_array_ref_produces_data_flow_edge() {
+    // nested_ref.tf: aws_lambda_function.list_fn has an environment block with
+    // variables = { QUEUE_URLS = [aws_sqs_queue.my_queue.url] }.
+    // The ResourceRef is nested inside Array inside Object(variables) — verify
+    // it produces a DataFlow edge.
+    let dir = FixtureDir::new("nested-ref-array", &["nested_ref.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let data_flow_edge = arch.connections.iter().find(|c| {
+        c.connection_type == ConnectionType::DataFlow
+            && c.source.as_str() == "aws_lambda_function_list_fn"
+            && c.target.as_str() == "aws_sqs_queue_my_queue"
+    });
+    assert!(
+        data_flow_edge.is_some(),
+        "expected DataFlow edge from aws_lambda_function_list_fn to \
+         aws_sqs_queue_my_queue (nested array ref); connections = {:?}",
+        arch.connections,
+    );
+}
+
+#[test]
+fn nested_ref_no_duplicates() {
+    // Verify that nested refs do not produce duplicate edges.
+    let dir = FixtureDir::new("nested-ref-dedup", &["nested_ref.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    let mut seen = std::collections::HashSet::new();
+    for conn in &arch.connections {
+        let key = (
+            conn.source.as_str().to_string(),
+            conn.target.as_str().to_string(),
+            format!("{:?}", conn.connection_type),
+        );
+        assert!(
+            seen.insert(key.clone()),
+            "duplicate connection detected: {key:?}",
+        );
+    }
+}
+
+#[test]
+fn nested_ref_spec_json_has_no_resource_ref() {
+    // Verify that ResourceRef values nested in objects do not leak into the
+    // spec JSON (i.e. tf_value_to_json drops them, leaving only concrete values).
+    let dir = FixtureDir::new("nested-ref-spec", &["nested_ref.tf"]);
+    let config = parser::parse_tf_dir(dir.path()).unwrap();
+    let resolved = resolver::resolve_config(config, None).unwrap();
+    let (_, tf) = aws_registries();
+    let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
+
+    // Serialise the whole architecture to JSON and verify no raw ResourceRef
+    // tokens appear (they should be silently dropped by tf_value_to_json).
+    let json_str = serde_json::to_string(&arch).expect("serialisation must succeed");
+
+    // ResourceRef placeholders that must never appear in the output JSON.
+    assert!(
+        !json_str.contains("ResourceRef"),
+        "ResourceRef leaked into spec JSON: {json_str}",
+    );
+}

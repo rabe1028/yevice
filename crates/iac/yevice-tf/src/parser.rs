@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::{BTreeMap, HashMap}, path::Path};
 
 use hcl::{Body, Structure};
 
@@ -17,6 +17,10 @@ pub enum TfValue {
         name: String,
         attr: String,
     },
+    /// A nested object (map) whose values may themselves contain references.
+    Object(BTreeMap<String, Box<TfValue>>),
+    /// A nested array whose elements may themselves contain references.
+    Array(Vec<TfValue>),
     Unknown,
 }
 
@@ -44,6 +48,16 @@ impl TfValue {
 
     pub fn is_concrete(&self) -> bool {
         matches!(self, Self::String(_) | Self::Number(_) | Self::Bool(_))
+    }
+
+    /// Returns `true` if this value or any nested value contains a `ResourceRef`.
+    pub fn contains_resource_ref(&self) -> bool {
+        match self {
+            Self::ResourceRef { .. } => true,
+            Self::Object(map) => map.values().any(|v| v.contains_resource_ref()),
+            Self::Array(vec) => vec.iter().any(TfValue::contains_resource_ref),
+            _ => false,
+        }
     }
 }
 
@@ -205,12 +219,33 @@ fn parse_variable_block(body: &Body) -> TfVariable {
 }
 
 pub fn expr_to_tf_value(expr: &hcl::expr::Expression) -> TfValue {
-    use hcl::expr::{Expression, TraversalOperator};
+    use std::collections::BTreeMap;
+
+    use hcl::expr::{Expression, ObjectKey, TraversalOperator};
 
     match expr {
         Expression::String(value) => TfValue::String(value.clone()),
         Expression::Number(value) => value.as_f64().map_or(TfValue::Unknown, TfValue::Number),
         Expression::Bool(value) => TfValue::Bool(*value),
+        Expression::Array(elements) => {
+            let items: Vec<TfValue> = elements.iter().map(expr_to_tf_value).collect();
+            TfValue::Array(items)
+        }
+        Expression::Object(obj) => {
+            let mut map: BTreeMap<String, Box<TfValue>> = BTreeMap::new();
+            for (key, val_expr) in obj {
+                let key_str = match key {
+                    ObjectKey::Identifier(ident) => ident.as_str().to_string(),
+                    ObjectKey::Expression(e) => match e {
+                        Expression::String(s) => s.clone(),
+                        other => format!("{other}"),
+                    },
+                    _ => format!("{key}"),
+                };
+                map.insert(key_str, Box::new(expr_to_tf_value(val_expr)));
+            }
+            TfValue::Object(map)
+        }
         Expression::Traversal(traversal) => {
             if let Expression::Variable(variable) = &traversal.expr {
                 let var_name = variable.as_ref();

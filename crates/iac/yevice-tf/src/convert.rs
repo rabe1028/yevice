@@ -95,11 +95,26 @@ fn tf_resource_to_raw(resource: &TfResource, logical_id: &str) -> RawTfResource 
 /// Returns `None` for unresolved references (`VarRef`, `LocalRef`, `ResourceRef`,
 /// `Unknown`). `ResourceRef` is not a scalar value; it is consumed separately by
 /// [`build_connections`].
+///
+/// For `Object` and `Array`, nested references are silently dropped so that the
+/// spec JSON is not polluted by un-serialisable reference values. Keys/elements
+/// whose value cannot be converted are omitted.
 fn tf_value_to_json(value: &TfValue) -> Option<JsonValue> {
     match value {
         TfValue::String(s) => Some(JsonValue::String(s.clone())),
         TfValue::Number(n) => serde_json::Number::from_f64(*n).map(JsonValue::Number),
         TfValue::Bool(b) => Some(JsonValue::Bool(*b)),
+        TfValue::Object(map) => {
+            let obj: serde_json::Map<String, JsonValue> = map
+                .iter()
+                .filter_map(|(k, v)| tf_value_to_json(v).map(|jv| (k.clone(), jv)))
+                .collect();
+            Some(JsonValue::Object(obj))
+        }
+        TfValue::Array(items) => {
+            let arr: Vec<JsonValue> = items.iter().filter_map(tf_value_to_json).collect();
+            Some(JsonValue::Array(arr))
+        }
         TfValue::VarRef(_) | TfValue::LocalRef(_) | TfValue::ResourceRef { .. } | TfValue::Unknown => {
             tracing::debug!(value = ?value, "unresolved TfValue reference dropped during conversion");
             None
@@ -180,9 +195,41 @@ fn push_unique(
     }
 }
 
+/// Recursively collect every `ResourceRef` reachable from `value`.
+///
+/// Each found ref is appended to `out` as `(resource_type, name, attr)`.
+fn collect_resource_refs<'a>(
+    value: &'a TfValue,
+    out: &mut Vec<(&'a str, &'a str, &'a str)>,
+) {
+    match value {
+        TfValue::ResourceRef {
+            resource_type,
+            name,
+            attr,
+        } => out.push((resource_type.as_str(), name.as_str(), attr.as_str())),
+        TfValue::Object(map) => {
+            for v in map.values() {
+                collect_resource_refs(v, out);
+            }
+        }
+        TfValue::Array(items) => {
+            for v in items {
+                collect_resource_refs(v, out);
+            }
+        }
+        TfValue::String(_)
+        | TfValue::Number(_)
+        | TfValue::Bool(_)
+        | TfValue::VarRef(_)
+        | TfValue::LocalRef(_)
+        | TfValue::Unknown => {}
+    }
+}
+
 /// Walk all resolved `TfResource`s and produce `Connection` edges from every
-/// `TfValue::ResourceRef` found in their attrs (top-level only; block attrs
-/// are not walked here because event-source-mapping uses top-level attrs).
+/// `TfValue::ResourceRef` found in their attrs or block attrs (including nested
+/// Object/Array values).
 fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec<Connection> {
     let nodes = node_set(resources);
     let mut connections: Vec<Connection> = Vec::new();
@@ -232,44 +279,53 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
         // aws_s3_bucket_notification: Notification edges
         // ---------------------------------------------------------------
         if NOTIFICATION_SOURCE_TYPES.contains(&src_type) {
+            let mut notif_refs: Vec<(&str, &str, &str)> = Vec::new();
             for ref_val in src_resource.attrs.values() {
-                if let TfValue::ResourceRef {
-                    resource_type: tgt_type,
-                    name: tgt_name,
-                    ..
-                } = ref_val
-                {
-                    let tgt_lid = logical_id_for(tgt_type, tgt_name);
-                    push_unique(
-                        &mut connections,
-                        &mut seen,
-                        &nodes,
-                        &src_lid,
-                        &tgt_lid,
-                        ConnectionType::Notification,
-                    );
+                collect_resource_refs(ref_val, &mut notif_refs);
+            }
+            for block_list in src_resource.blocks.values() {
+                for block_attrs in block_list {
+                    for ref_val in block_attrs.values() {
+                        collect_resource_refs(ref_val, &mut notif_refs);
+                    }
                 }
+            }
+            for (tgt_type, tgt_name, _attr) in notif_refs {
+                let tgt_lid = logical_id_for(tgt_type, tgt_name);
+                push_unique(
+                    &mut connections,
+                    &mut seen,
+                    &nodes,
+                    &src_lid,
+                    &tgt_lid,
+                    ConnectionType::Notification,
+                );
             }
             continue;
         }
 
         // ---------------------------------------------------------------
-        // Generic: walk every top-level attr ResourceRef.
+        // Generic: walk every ResourceRef reachable from attrs and block
+        // attrs, including those nested inside Object/Array values.
         // Connection type depends on source / target resource types.
         // ---------------------------------------------------------------
-        for ref_val in src_resource.attrs.values() {
-            let TfValue::ResourceRef {
-                resource_type: tgt_type,
-                name: tgt_name,
-                ..
-            } = ref_val
-            else {
-                continue;
-            };
+        let mut refs: Vec<(&str, &str, &str)> = Vec::new();
 
+        for attr_val in src_resource.attrs.values() {
+            collect_resource_refs(attr_val, &mut refs);
+        }
+
+        for block_list in src_resource.blocks.values() {
+            for block_attrs in block_list {
+                for attr_val in block_attrs.values() {
+                    collect_resource_refs(attr_val, &mut refs);
+                }
+            }
+        }
+
+        for (tgt_type, tgt_name, _attr) in refs {
             let tgt_lid = logical_id_for(tgt_type, tgt_name);
-
-            let conn_type = classify_connection(src_type, tgt_type.as_str());
+            let conn_type = classify_connection(src_type, tgt_type);
             push_unique(
                 &mut connections,
                 &mut seen,

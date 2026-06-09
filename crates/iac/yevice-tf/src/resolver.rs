@@ -96,7 +96,9 @@ fn resolve_resource(
     locals: &HashMap<String, TfValue>,
 ) {
     for value in resource.attrs.values_mut() {
-        if let Some(resolved) = resolve_value(value, vars, locals, 0).filter(TfValue::is_concrete) {
+        if let Some(resolved) = resolve_value(value, vars, locals, 0)
+            && (resolved.is_concrete() || resolved.contains_resource_ref())
+        {
             *value = resolved;
         }
     }
@@ -104,8 +106,8 @@ fn resolve_resource(
     for blocks in resource.blocks.values_mut() {
         for attrs in blocks {
             for value in attrs.values_mut() {
-                if let Some(resolved) =
-                    resolve_value(value, vars, locals, 0).filter(TfValue::is_concrete)
+                if let Some(resolved) = resolve_value(value, vars, locals, 0)
+                    && (resolved.is_concrete() || resolved.contains_resource_ref())
                 {
                     *value = resolved;
                 }
@@ -137,5 +139,29 @@ fn resolve_value(
         // connection building. Returning None here causes resolve_resource to leave
         // the original ResourceRef value untouched.
         TfValue::ResourceRef { .. } | TfValue::Unknown => None,
+        // Recursively resolve Object/Array values. Each inner value is resolved
+        // independently; unresolvable non-ref values stay as-is (the map/vec is
+        // rebuilt with every entry preserved, letting the caller decide what to
+        // do with remaining Unknown entries).
+        TfValue::Object(map) => {
+            let resolved_map = map
+                .iter()
+                .map(|(k, v)| {
+                    let resolved = resolve_value(v, vars, locals, depth + 1)
+                        .unwrap_or_else(|| *v.clone());
+                    (k.clone(), Box::new(resolved))
+                })
+                .collect();
+            Some(TfValue::Object(resolved_map))
+        }
+        TfValue::Array(items) => {
+            let resolved_items = items
+                .iter()
+                .map(|v| {
+                    resolve_value(v, vars, locals, depth + 1).unwrap_or_else(|| v.clone())
+                })
+                .collect();
+            Some(TfValue::Array(resolved_items))
+        }
     }
 }
