@@ -117,7 +117,10 @@ mod tests {
         let output = renderer.render(&cost).expect("render");
 
         // Should start with flowchart directive
-        assert!(output.starts_with("flowchart LR"), "missing flowchart LR header");
+        assert!(
+            output.starts_with("flowchart LR"),
+            "missing flowchart LR header"
+        );
 
         // Node IDs must be sanitized versions of logical IDs
         assert!(output.contains("MyFunction"), "missing MyFunction node");
@@ -172,7 +175,10 @@ mod tests {
             "missing <mxGraphModel> wrapper"
         );
         assert!(output.contains("</root>"), "missing </root>");
-        assert!(output.contains("</mxGraphModel>"), "missing </mxGraphModel>");
+        assert!(
+            output.contains("</mxGraphModel>"),
+            "missing </mxGraphModel>"
+        );
     }
 
     #[test]
@@ -180,10 +186,7 @@ mod tests {
         let cost = make_test_cost();
         let output = DrawIoRenderer.render(&cost).expect("render");
 
-        assert!(
-            output.contains("id=\"0\""),
-            "missing cell id=0"
-        );
+        assert!(output.contains("id=\"0\""), "missing cell id=0");
         assert!(
             output.contains("id=\"1\" parent=\"0\""),
             "missing cell id=1 with parent=0"
@@ -197,7 +200,10 @@ mod tests {
 
         // 3 nodes + 2 edges + 2 reserved = 7 total <mxCell occurrences
         let cell_count = output.matches("<mxCell").count();
-        assert_eq!(cell_count, 7, "expected 7 mxCell elements (2 reserved + 3 nodes + 2 edges)");
+        assert_eq!(
+            cell_count, 7,
+            "expected 7 mxCell elements (2 reserved + 3 nodes + 2 edges)"
+        );
     }
 
     #[test]
@@ -229,7 +235,10 @@ mod tests {
 
         // Connection type labels must be present
         assert!(output.contains("DataFlow"), "missing DataFlow edge label");
-        assert!(output.contains("Invocation"), "missing Invocation edge label");
+        assert!(
+            output.contains("Invocation"),
+            "missing Invocation edge label"
+        );
     }
 
     // ---- JsonRenderer ----
@@ -464,10 +473,22 @@ mod tests {
         let second_end = end_positions[1];
 
         // Structure: VPC_open < Subnet_open < Instance < first_end (closes Subnet) < second_end (closes VPC).
-        assert!(vpc_open < subnet_open, "VPC subgraph must open before Subnet subgraph");
-        assert!(subnet_open < instance_pos, "Subnet subgraph must open before Instance leaf");
-        assert!(instance_pos < first_end, "Instance must appear before first `end`");
-        assert!(first_end < second_end, "first `end` must precede second `end`");
+        assert!(
+            vpc_open < subnet_open,
+            "VPC subgraph must open before Subnet subgraph"
+        );
+        assert!(
+            subnet_open < instance_pos,
+            "Subnet subgraph must open before Instance leaf"
+        );
+        assert!(
+            instance_pos < first_end,
+            "Instance must appear before first `end`"
+        );
+        assert!(
+            first_end < second_end,
+            "first `end` must precede second `end`"
+        );
     }
 
     #[test]
@@ -508,8 +529,14 @@ mod tests {
         );
 
         // Well-formed XML: must open and close mxGraphModel/root.
-        assert!(output.contains("<mxGraphModel><root>"), "must open mxGraphModel");
-        assert!(output.contains("</root></mxGraphModel>"), "must close mxGraphModel");
+        assert!(
+            output.contains("<mxGraphModel><root>"),
+            "must open mxGraphModel"
+        );
+        assert!(
+            output.contains("</root></mxGraphModel>"),
+            "must close mxGraphModel"
+        );
 
         // Cell count: 2 reserved + 3 nodes + 0 edges = 5.
         let cell_count = output.matches("<mxCell").count();

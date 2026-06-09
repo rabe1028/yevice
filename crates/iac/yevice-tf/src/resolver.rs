@@ -147,8 +147,8 @@ fn resolve_value(
             let resolved_map = map
                 .iter()
                 .map(|(k, v)| {
-                    let resolved = resolve_value(v, vars, locals, depth + 1)
-                        .unwrap_or_else(|| *v.clone());
+                    let resolved =
+                        resolve_value(v, vars, locals, depth + 1).unwrap_or_else(|| *v.clone());
                     (k.clone(), Box::new(resolved))
                 })
                 .collect();
@@ -157,9 +157,7 @@ fn resolve_value(
         TfValue::Array(items) => {
             let resolved_items = items
                 .iter()
-                .map(|v| {
-                    resolve_value(v, vars, locals, depth + 1).unwrap_or_else(|| v.clone())
-                })
+                .map(|v| resolve_value(v, vars, locals, depth + 1).unwrap_or_else(|| v.clone()))
                 .collect();
             Some(TfValue::Array(resolved_items))
         }

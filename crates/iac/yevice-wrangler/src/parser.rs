@@ -542,9 +542,9 @@ database_id = "db-id"
         assert_eq!(arch.connections.len(), 3);
 
         let has_conn = |source: &LogicalId, target: &LogicalId, ctype: &ConnectionType| {
-            arch.connections.iter().any(|c| {
-                &c.source == source && &c.target == target && &c.connection_type == ctype
-            })
+            arch.connections
+                .iter()
+                .any(|c| &c.source == source && &c.target == target && &c.connection_type == ctype)
         };
 
         assert!(has_conn(&worker_id, &kv_id, &ConnectionType::DataFlow));
@@ -634,7 +634,10 @@ class_name = "ChatRoom"
         // Worker + KV = 2 resources, 1 DataFlow connection
         assert_eq!(arch.resources.len(), 2);
         assert_eq!(arch.connections.len(), 1);
-        assert_eq!(arch.connections[0].connection_type, ConnectionType::DataFlow);
+        assert_eq!(
+            arch.connections[0].connection_type,
+            ConnectionType::DataFlow
+        );
         assert_eq!(arch.connections[0].source, LogicalId::new("w"));
         assert_eq!(arch.connections[0].target, LogicalId::new("w_kv_my_kv"));
     }

@@ -339,9 +339,7 @@ fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnErro
         Value::Sequence(seq) => {
             let parts: Vec<&str> = seq.iter().filter_map(|v| v.as_str()).collect();
             match parts.as_slice() {
-                [logical_id, attr] => {
-                    Ok(Value::String(sentinel::make_getatt(logical_id, attr)))
-                }
+                [logical_id, attr] => Ok(Value::String(sentinel::make_getatt(logical_id, attr))),
                 [logical_id, rest @ ..] if !rest.is_empty() => {
                     // More than 2 elements: join remaining parts with "." as the attr.
                     let attr = rest.join(".");
@@ -461,10 +459,7 @@ mod tests {
         );
         // And specifically must NOT contain the getatt sentinel format.
         assert!(
-            !result
-                .as_str()
-                .unwrap_or("")
-                .contains("{{getatt:"),
+            !result.as_str().unwrap_or("").contains("{{getatt:"),
             "no-dot GetAtt must not produce a getatt sentinel: {result:?}"
         );
     }

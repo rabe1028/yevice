@@ -254,10 +254,7 @@ fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
 /// - no matching property is found,
 /// - the resolved logical ID does not exist in `resources` (dangling parent), or
 /// - the resolved logical ID equals the resource's own logical ID (self-reference).
-fn extract_group(
-    cfn: &CfnResource,
-    resources: &HashMap<String, CfnResource>,
-) -> Option<LogicalId> {
+fn extract_group(cfn: &CfnResource, resources: &HashMap<String, CfnResource>) -> Option<LogicalId> {
     // Ordered list of single-reference property names to probe.
     const SINGLE_REF_PROPS: &[&str] = &["Cluster", "ClusterName", "SubnetId", "VpcId"];
 
@@ -287,11 +284,7 @@ fn extract_group(
 }
 
 /// Make a simple connection with no batch_size / parallelization / factor.
-fn simple_connection(
-    source: &str,
-    target: &str,
-    connection_type: ConnectionType,
-) -> Connection {
+fn simple_connection(source: &str, target: &str, connection_type: ConnectionType) -> Connection {
     Connection {
         source: LogicalId::new(source),
         target: LogicalId::new(target),
@@ -307,10 +300,7 @@ fn simple_connection(
 // S3 NotificationConfiguration
 // ---------------------------------------------------------------------------
 
-fn extract_s3_notification_connections(
-    bucket_id: &str,
-    cfn: &CfnResource,
-) -> Vec<Connection> {
+fn extract_s3_notification_connections(bucket_id: &str, cfn: &CfnResource) -> Vec<Connection> {
     let mut conns = Vec::new();
     let Some(props) = cfn.properties.as_mapping() else {
         return conns;
@@ -323,10 +313,7 @@ fn extract_s3_notification_connections(
     };
 
     // LambdaConfigurations (cfn) or LambdaFunctionConfigurations (SAM/CDK alias)
-    for key in &[
-        "LambdaConfigurations",
-        "LambdaFunctionConfigurations",
-    ] {
+    for key in &["LambdaConfigurations", "LambdaFunctionConfigurations"] {
         if let Some(items) = notif_map
             .get(YamlValue::String((*key).into()))
             .and_then(|v| v.as_sequence())
@@ -458,17 +445,18 @@ fn extract_sns_subscription_resource_connection(cfn: &CfnResource) -> Option<Con
         .as_str()
         .and_then(extract_logical_id_from_sentinel)?;
 
-    Some(simple_connection(&source_id, &target_id, ConnectionType::Notification))
+    Some(simple_connection(
+        &source_id,
+        &target_id,
+        ConnectionType::Notification,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // AWS::Events::Rule Targets
 // ---------------------------------------------------------------------------
 
-fn extract_events_rule_connections(
-    rule_id: &str,
-    cfn: &CfnResource,
-) -> Vec<Connection> {
+fn extract_events_rule_connections(rule_id: &str, cfn: &CfnResource) -> Vec<Connection> {
     let mut conns = Vec::new();
     let Some(props) = cfn.properties.as_mapping() else {
         return conns;
@@ -696,10 +684,7 @@ mod containment_tests {
     #[test]
     fn subnet_id_sentinel_resolves_to_subnet_group() {
         let subnet = cfn_resource("MySubnet", yaml_map(&[]));
-        let nat = cfn_resource(
-            "MyNat",
-            yaml_map(&[("SubnetId", "{{ref:MySubnet}}")]),
-        );
+        let nat = cfn_resource("MyNat", yaml_map(&[("SubnetId", "{{ref:MySubnet}}")]));
 
         let mut resources = HashMap::new();
         resources.insert("MySubnet".to_string(), subnet);
@@ -712,10 +697,7 @@ mod containment_tests {
     #[test]
     fn cluster_sentinel_resolves_to_cluster_group() {
         let cluster = cfn_resource("MyCluster", yaml_map(&[]));
-        let service = cfn_resource(
-            "MyService",
-            yaml_map(&[("Cluster", "{{ref:MyCluster}}")]),
-        );
+        let service = cfn_resource("MyService", yaml_map(&[("Cluster", "{{ref:MyCluster}}")]));
 
         let mut resources = HashMap::new();
         resources.insert("MyCluster".to_string(), cluster);
@@ -732,10 +714,7 @@ mod containment_tests {
         let vpc = cfn_resource("MyVpc", yaml_map(&[]));
         let resource = cfn_resource(
             "MyResource",
-            yaml_map(&[
-                ("Cluster", "{{ref:MyCluster}}"),
-                ("VpcId", "{{ref:MyVpc}}"),
-            ]),
+            yaml_map(&[("Cluster", "{{ref:MyCluster}}"), ("VpcId", "{{ref:MyVpc}}")]),
         );
 
         let mut resources = HashMap::new();
@@ -765,10 +744,7 @@ mod containment_tests {
     #[test]
     fn literal_property_value_yields_no_group() {
         // A plain string (not a sentinel) must not be treated as a logical ID.
-        let nat = cfn_resource(
-            "MyNat",
-            yaml_map(&[("SubnetId", "subnet-12345678")]),
-        );
+        let nat = cfn_resource("MyNat", yaml_map(&[("SubnetId", "subnet-12345678")]));
 
         let mut resources = HashMap::new();
         resources.insert("MyNat".to_string(), nat);

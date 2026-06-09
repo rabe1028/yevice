@@ -136,11 +136,7 @@ fn test_sam_sqs_event_source_edge() {
 
     // batch_size should be 10 as specified
     let edge = edge.unwrap();
-    assert_eq!(
-        edge.batch_size,
-        Some(10.0),
-        "batch_size should be 10"
-    );
+    assert_eq!(edge.batch_size, Some(10.0), "batch_size should be 10");
 }
 
 #[test]

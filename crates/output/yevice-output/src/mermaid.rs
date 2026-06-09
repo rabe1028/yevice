@@ -216,7 +216,10 @@ mod tests {
 
     #[test]
     fn sanitize_id_replaces_non_alphanumeric() {
-        assert_eq!(sanitize_id("AWS::Lambda::Function"), "AWS__Lambda__Function");
+        assert_eq!(
+            sanitize_id("AWS::Lambda::Function"),
+            "AWS__Lambda__Function"
+        );
         assert_eq!(sanitize_id("my-resource"), "my_resource");
         assert_eq!(sanitize_id("MyTable"), "MyTable");
     }
@@ -303,9 +306,21 @@ mod tests {
         };
         let cost = minimal_cost(topology);
         let output = MermaidRenderer.render(&cost).unwrap();
-        assert!(output.contains("alpha["), "alpha should have no suffix: {output}");
-        assert!(output.contains("beta["), "beta should have no suffix: {output}");
-        assert!(!output.contains("alpha_2"), "alpha must not get a suffix: {output}");
-        assert!(!output.contains("beta_2"), "beta must not get a suffix: {output}");
+        assert!(
+            output.contains("alpha["),
+            "alpha should have no suffix: {output}"
+        );
+        assert!(
+            output.contains("beta["),
+            "beta should have no suffix: {output}"
+        );
+        assert!(
+            !output.contains("alpha_2"),
+            "alpha must not get a suffix: {output}"
+        );
+        assert!(
+            !output.contains("beta_2"),
+            "beta must not get a suffix: {output}"
+        );
     }
 }

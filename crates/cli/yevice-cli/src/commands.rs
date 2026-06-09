@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
-use yevice_solver::{EnumerationSolver, Solver, SolverError};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
+use yevice_solver::{EnumerationSolver, Solver, SolverError};
 
 use yevice_cfn::convert as cfn_convert;
 use yevice_cfn::parser;
@@ -125,7 +125,12 @@ pub fn generate(
         &cfn_adapters,
         &tf_adapters,
     )?;
-    let pricing = build_pricing_resolver(&parsed_input.architecture, region, provider_regions, list_price);
+    let pricing = build_pricing_resolver(
+        &parsed_input.architecture,
+        region,
+        provider_regions,
+        list_price,
+    );
     let mut cost_model = catalog
         .build_cost_model(&parsed_input.architecture, &pricing, strict)
         .context("failed to build cost model")?;
@@ -286,8 +291,11 @@ pub fn sensitivity(
 
     if breakdown && !resource_labels.is_empty() {
         println!("\nResource Breakdown by Step:");
-        let bd_table =
-            crate::render::render_sensitivity_breakdown_table(var_name, &resource_labels, &breakdown_rows);
+        let bd_table = crate::render::render_sensitivity_breakdown_table(
+            var_name,
+            &resource_labels,
+            &breakdown_rows,
+        );
         println!("{bd_table}");
     }
 
@@ -427,9 +435,9 @@ pub fn optimize(
     // Parse --decision NAME=v1,v2,...
     let mut decision_variables: Vec<DecisionVariable> = Vec::new();
     for spec in decisions {
-        let (name_part, values_part) = spec
-            .split_once('=')
-            .with_context(|| format!("invalid --decision value '{spec}': expected NAME=v1,v2,..."))?;
+        let (name_part, values_part) = spec.split_once('=').with_context(|| {
+            format!("invalid --decision value '{spec}': expected NAME=v1,v2,...")
+        })?;
         let name = VariableName::new(name_part.trim());
         if values_part.trim().is_empty() {
             bail!("decision variable '{name_part}' has an empty domain");
@@ -437,13 +445,9 @@ pub fn optimize(
         let domain: Vec<f64> = values_part
             .split(',')
             .map(|s| {
-                s.trim()
-                    .parse::<f64>()
-                    .with_context(|| {
-                        format!(
-                            "invalid domain value '{s}' for decision variable '{name_part}'"
-                        )
-                    })
+                s.trim().parse::<f64>().with_context(|| {
+                    format!("invalid domain value '{s}' for decision variable '{name_part}'")
+                })
             })
             .collect::<Result<_>>()?;
         decision_variables.push(DecisionVariable { name, domain });
@@ -475,9 +479,7 @@ pub fn optimize(
     let obj_direction = match direction {
         "min" => ObjectiveDirection::Minimize,
         "max" => ObjectiveDirection::Maximize,
-        other => bail!(
-            "unknown --direction value '{other}': valid values are min, max"
-        ),
+        other => bail!("unknown --direction value '{other}': valid values are min, max"),
     };
 
     let problem = OptimizationProblem {
@@ -499,7 +501,10 @@ pub fn optimize(
         Err(e) => return Err(e.into()),
     };
 
-    println!("\nOptimization Result ({}, direction={direction}):", arch.name);
+    println!(
+        "\nOptimization Result ({}, direction={direction}):",
+        arch.name
+    );
     if sol.feasible {
         // Print each decision variable's chosen value.
         for dv in &problem.decision_variables {
@@ -507,7 +512,10 @@ pub fn optimize(
                 println!("  {} = {val}", dv.name);
             }
         }
-        println!("  objective (total monthly cost) = ${:.4}", sol.objective_value);
+        println!(
+            "  objective (total monthly cost) = ${:.4}",
+            sol.objective_value
+        );
     } else {
         println!("  Result: INFEASIBLE — no combination satisfied all constraints.");
     }
@@ -813,16 +821,16 @@ fn build_pricing_resolver(
             let region = provider_regions
                 .get(&plugin.provider())
                 .map_or(default_region, String::as_str);
-            resolver.insert(plugin.provider(), plugin.pricing_catalog(region, list_price));
+            resolver.insert(
+                plugin.provider(),
+                plugin.pricing_catalog(region, list_price),
+            );
         }
     }
 
     // Provider::Other has no dedicated plugin; use a no-op catalog.
     if arch.has_provider(Provider::Other) {
-        resolver.insert(
-            Provider::Other,
-            Box::new(yevice_pricing::NoopCatalog),
-        );
+        resolver.insert(Provider::Other, Box::new(yevice_pricing::NoopCatalog));
     }
 
     resolver
@@ -1015,8 +1023,9 @@ fn load_simulation_profile(path: &str) -> Result<SimulationProfile> {
                         tracing::warn!(key = ?sub_k, "non-string key in profile base_params mapping; skipping");
                         continue;
                     };
-                    let val = extract_f64(&sub_v)
-                        .with_context(|| format!("profile base_param '{k}_{sub_key}': invalid value"))?;
+                    let val = extract_f64(&sub_v).with_context(|| {
+                        format!("profile base_param '{k}_{sub_key}': invalid value")
+                    })?;
                     base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
                 }
             }
@@ -1141,12 +1150,16 @@ pub fn diagram(cost_model_path: &str, format: &str, output: Option<&str>) -> Res
     let cost = load_cost_model(cost_model_path)?;
 
     let rendered: String = match format {
-        "drawio" => DrawIoRenderer.render(&cost).context("draw.io rendering failed")?,
-        "mermaid" => MermaidRenderer.render(&cost).context("mermaid rendering failed")?,
-        "json" => JsonRenderer.render(&cost).context("json rendering failed")?,
-        other => bail!(
-            "unknown diagram format '{other}'. Valid choices: drawio, mermaid, json"
-        ),
+        "drawio" => DrawIoRenderer
+            .render(&cost)
+            .context("draw.io rendering failed")?,
+        "mermaid" => MermaidRenderer
+            .render(&cost)
+            .context("mermaid rendering failed")?,
+        "json" => JsonRenderer
+            .render(&cost)
+            .context("json rendering failed")?,
+        other => bail!("unknown diagram format '{other}'. Valid choices: drawio, mermaid, json"),
     };
 
     match output {
@@ -1207,8 +1220,7 @@ fn load_params(path: &str) -> Result<Params> {
             }
             // Flat: key is the full variable name
             _ => {
-                let val = extract_f64(&v)
-                    .with_context(|| format!("param '{k}': invalid value"))?;
+                let val = extract_f64(&v).with_context(|| format!("param '{k}': invalid value"))?;
                 params.insert(VariableName::new(k), val);
             }
         }
@@ -1433,7 +1445,11 @@ mod tests {
             "topology": { "nodes": [], "connections": [] }
         });
         let cost_model_path = dir.join("cost.json");
-        fs::write(&cost_model_path, serde_json::to_string(&cost_model).unwrap()).unwrap();
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
 
         let err = super::optimize(
             cost_model_path.to_str().unwrap(),
@@ -1461,7 +1477,11 @@ mod tests {
             "topology": { "nodes": [], "connections": [] }
         });
         let cost_model_path = dir.join("cost.json");
-        fs::write(&cost_model_path, serde_json::to_string(&cost_model).unwrap()).unwrap();
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
 
         let err = super::optimize(
             cost_model_path.to_str().unwrap(),
@@ -1502,12 +1522,7 @@ mod tests {
         .unwrap();
 
         // No decisions needed for an empty objective.
-        let result = super::optimize(
-            cost_model_path.to_str().unwrap(),
-            None,
-            &[],
-            "min",
-        );
+        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min");
         assert!(result.is_ok(), "min direction must be accepted: {result:?}");
     }
 
@@ -1522,12 +1537,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = super::optimize(
-            cost_model_path.to_str().unwrap(),
-            None,
-            &[],
-            "max",
-        );
+        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "max");
         assert!(result.is_ok(), "max direction must be accepted: {result:?}");
     }
 
@@ -1542,13 +1552,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = super::optimize(
-            cost_model_path.to_str().unwrap(),
-            None,
-            &[],
-            "sideways",
-        )
-        .unwrap_err();
+        let err =
+            super::optimize(cost_model_path.to_str().unwrap(), None, &[], "sideways").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("sideways"),

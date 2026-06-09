@@ -18,8 +18,7 @@ pub const DYNAMODB_MAX_RCU_PER_TABLE: &str = "aws.dynamodb.max_rcu_per_table";
 pub const DYNAMODB_MAX_TABLES: &str = "aws.dynamodb.max_tables";
 pub const DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT: &str = "aws.dynamodb.ondemand_initial_throughput";
 pub const KINESIS_MAX_SHARDS_PER_STREAM: &str = "aws.kinesis.max_shards_per_stream";
-pub const KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD: &str =
-    "aws.kinesis.max_records_per_sec_per_shard";
+pub const KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD: &str = "aws.kinesis.max_records_per_sec_per_shard";
 pub const KINESIS_MAX_MB_PER_SEC_PER_SHARD: &str = "aws.kinesis.max_mb_per_sec_per_shard";
 
 // ---------------------------------------------------------------------------
@@ -49,19 +48,34 @@ pub struct AwsQuotaProvider;
 impl QuotaProvider for AwsQuotaProvider {
     fn default_quotas(&self, _region: &str) -> Quotas {
         Quotas::default()
-            .with(LAMBDA_CONCURRENT_EXECUTIONS, DEFAULT_LAMBDA_CONCURRENT_EXECUTIONS)
-            .with(DYNAMODB_MAX_WCU_PER_TABLE, DEFAULT_DYNAMODB_MAX_WCU_PER_TABLE)
-            .with(DYNAMODB_MAX_RCU_PER_TABLE, DEFAULT_DYNAMODB_MAX_RCU_PER_TABLE)
+            .with(
+                LAMBDA_CONCURRENT_EXECUTIONS,
+                DEFAULT_LAMBDA_CONCURRENT_EXECUTIONS,
+            )
+            .with(
+                DYNAMODB_MAX_WCU_PER_TABLE,
+                DEFAULT_DYNAMODB_MAX_WCU_PER_TABLE,
+            )
+            .with(
+                DYNAMODB_MAX_RCU_PER_TABLE,
+                DEFAULT_DYNAMODB_MAX_RCU_PER_TABLE,
+            )
             .with(DYNAMODB_MAX_TABLES, DEFAULT_DYNAMODB_MAX_TABLES)
             .with(
                 DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT,
                 DEFAULT_DYNAMODB_ONDEMAND_INITIAL_THROUGHPUT,
             )
-            .with(KINESIS_MAX_SHARDS_PER_STREAM, DEFAULT_KINESIS_MAX_SHARDS_PER_STREAM)
+            .with(
+                KINESIS_MAX_SHARDS_PER_STREAM,
+                DEFAULT_KINESIS_MAX_SHARDS_PER_STREAM,
+            )
             .with(
                 KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD,
                 DEFAULT_KINESIS_MAX_RECORDS_PER_SEC_PER_SHARD,
             )
-            .with(KINESIS_MAX_MB_PER_SEC_PER_SHARD, DEFAULT_KINESIS_MAX_MB_PER_SEC_PER_SHARD)
+            .with(
+                KINESIS_MAX_MB_PER_SEC_PER_SHARD,
+                DEFAULT_KINESIS_MAX_MB_PER_SEC_PER_SHARD,
+            )
     }
 }

@@ -1,10 +1,6 @@
 //! Shared helpers for AWS service cost implementations.
 
-use yevice_core::{
-    cost::VariableInfo,
-    expr::Expr,
-    types::LogicalId,
-};
+use yevice_core::{cost::VariableInfo, expr::Expr, types::LogicalId};
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::error::CostError;
 

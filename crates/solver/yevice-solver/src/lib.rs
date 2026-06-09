@@ -49,7 +49,7 @@ pub trait Solver {
 ///
 /// Exponential in the number of decision variables and the sizes of their
 /// domains.  The solver rejects problems whose combination count exceeds
-/// [`MAX_COMBINATIONS`] with [`SolverError::TooManyCombinations`].
+/// `MAX_COMBINATIONS` with [`SolverError::TooManyCombinations`].
 ///
 /// # Determinism
 ///
@@ -66,7 +66,11 @@ impl Solver for EnumerationSolver {
 
         // Guard: if any decision variable has an empty domain, no assignment
         // can ever be constructed — immediately return infeasible.
-        if problem.decision_variables.iter().any(|dv| dv.domain.is_empty()) {
+        if problem
+            .decision_variables
+            .iter()
+            .any(|dv| dv.domain.is_empty())
+        {
             return Ok(Solution {
                 assignments: HashMap::new(),
                 objective_value: f64::NAN,
@@ -146,7 +150,7 @@ impl Solver for EnumerationSolver {
 /// Compute the total number of combinations (product of domain sizes).
 ///
 /// Returns [`SolverError::TooManyCombinations`] if the count exceeds
-/// [`MAX_COMBINATIONS`].
+/// `MAX_COMBINATIONS`.
 fn combination_count(problem: &OptimizationProblem) -> Result<u64, SolverError> {
     let mut count: u64 = 1;
     for dv in &problem.decision_variables {
@@ -223,10 +227,10 @@ fn solve_single(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yevice_core::expr::Expr;
     use yevice_core::optimize::{
         DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
     };
-    use yevice_core::expr::Expr;
     use yevice_core::types::VariableName;
 
     fn var(name: &str) -> VariableName {
@@ -353,7 +357,12 @@ mod tests {
     fn too_many_combinations_errors() {
         // 101 decision variables each with domain size 10 → 10^101 combinations.
         let dvs: Vec<DecisionVariable> = (0..101_u32)
-            .map(|i| dv(&format!("x{i}"), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]))
+            .map(|i| {
+                dv(
+                    &format!("x{i}"),
+                    vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                )
+            })
             .collect();
 
         let problem = problem_with(
@@ -463,7 +472,10 @@ mod tests {
         );
 
         let sol = EnumerationSolver.solve(&problem).unwrap();
-        assert!(!sol.feasible, "empty domain on any variable must be infeasible");
+        assert!(
+            !sol.feasible,
+            "empty domain on any variable must be infeasible"
+        );
         assert!(sol.objective_value.is_nan());
     }
 

@@ -10,8 +10,8 @@ pub mod services;
 pub mod tf;
 
 pub use connection_rules::{
-    aws_connection_rules, AwsDataFlowRule, AwsEventSourceRule, AwsInvocationRule,
-    AwsNotificationRule,
+    AwsDataFlowRule, AwsEventSourceRule, AwsInvocationRule, AwsNotificationRule,
+    aws_connection_rules,
 };
 pub use plugin::AwsPlugin;
 pub use pricing_adapter::AwsPricingCatalog;

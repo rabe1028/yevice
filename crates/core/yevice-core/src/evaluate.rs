@@ -186,7 +186,8 @@ pub fn resolve_bindings(
     let mut params = base_params.clone();
     // Targets whose expression can never evaluate (e.g. division by zero), as
     // distinct from those merely waiting on a not-yet-resolved variable.
-    let mut unresolvable: std::collections::HashSet<VariableName> = std::collections::HashSet::new();
+    let mut unresolvable: std::collections::HashSet<VariableName> =
+        std::collections::HashSet::new();
 
     let max_passes = bindings.len() + 1;
     for _ in 0..max_passes {

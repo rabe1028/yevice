@@ -75,7 +75,12 @@ impl ArchitectureRenderer for DrawIoRenderer {
 
         emit_roots(&roots, &children, &node_cell_ids, &mut xml);
 
-        emit_edges(&topology.connections, &node_cell_ids, &mut xml, &mut edge_id);
+        emit_edges(
+            &topology.connections,
+            &node_cell_ids,
+            &mut xml,
+            &mut edge_id,
+        );
 
         xml.push_str("</root></mxGraphModel>");
         Ok(xml)
@@ -87,10 +92,7 @@ impl ArchitectureRenderer for DrawIoRenderer {
 /// A node is a root when its `group` is `None` or points to a non-existent id.
 fn build_forest(
     nodes: &[TopologyNode],
-) -> (
-    HashMap<&LogicalId, Vec<&TopologyNode>>,
-    Vec<&TopologyNode>,
-) {
+) -> (HashMap<&LogicalId, Vec<&TopologyNode>>, Vec<&TopologyNode>) {
     let node_id_set: HashSet<&LogicalId> = nodes.iter().map(|n| &n.logical_id).collect();
 
     let mut children: HashMap<&LogicalId, Vec<&TopologyNode>> = HashMap::new();
@@ -135,8 +137,12 @@ fn emit_roots<'a>(
     .expect("node count fits in u32");
     let leaf_rows = ungrouped_leaf_count.div_ceil(GRID_COLUMNS);
     let leaf_section_height = leaf_rows * CELL_ROW_STEP;
-    let mut container_y =
-        leaf_section_height + if ungrouped_leaf_count > 0 { CONTAINER_GAP } else { 0 };
+    let mut container_y = leaf_section_height
+        + if ungrouped_leaf_count > 0 {
+            CONTAINER_GAP
+        } else {
+            0
+        };
 
     let mut leaf_index: u32 = 0;
 
@@ -243,7 +249,10 @@ fn compute_container_size<'a>(
 
     let Some(child_nodes) = children.get(&node.logical_id) else {
         // Leaf node: return its fixed size.
-        return Size { width: CELL_WIDTH, height: CELL_HEIGHT };
+        return Size {
+            width: CELL_WIDTH,
+            height: CELL_HEIGHT,
+        };
     };
 
     // Measure each child (recursively for sub-containers).
@@ -251,22 +260,28 @@ fn compute_container_size<'a>(
     for child in child_nodes {
         if visited.contains(&child.logical_id) {
             // Cycle — treat as a leaf.
-            child_sizes.push(Size { width: CELL_WIDTH, height: CELL_HEIGHT });
+            child_sizes.push(Size {
+                width: CELL_WIDTH,
+                height: CELL_HEIGHT,
+            });
             continue;
         }
         if children.contains_key(&child.logical_id) {
             child_sizes.push(compute_container_size(child, children, visited));
         } else {
             visited.insert(&child.logical_id);
-            child_sizes.push(Size { width: CELL_WIDTH, height: CELL_HEIGHT });
+            child_sizes.push(Size {
+                width: CELL_WIDTH,
+                height: CELL_HEIGHT,
+            });
         }
     }
 
     // Layout children in a GRID_COLUMNS-wide grid.
     // Row heights determined by tallest child in each row.
-    let cols = usize::try_from(GRID_COLUMNS.min(
-        u32::try_from(child_nodes.len()).expect("child count fits in u32"),
-    ))
+    let cols = usize::try_from(
+        GRID_COLUMNS.min(u32::try_from(child_nodes.len()).expect("child count fits in u32")),
+    )
     .expect("cols fits in usize");
     let rows = child_sizes.len().div_ceil(cols);
 
@@ -285,10 +300,8 @@ fn compute_container_size<'a>(
     let cols_u32 = u32::try_from(cols).expect("cols fits in u32");
     let rows_u32 = u32::try_from(rows).expect("rows fits in u32");
 
-    let content_w: u32 = col_widths.iter().sum::<u32>()
-        + cols_u32.saturating_sub(1) * col_gap;
-    let content_h: u32 = row_heights.iter().sum::<u32>()
-        + rows_u32.saturating_sub(1) * row_gap;
+    let content_w: u32 = col_widths.iter().sum::<u32>() + cols_u32.saturating_sub(1) * col_gap;
+    let content_h: u32 = row_heights.iter().sum::<u32>() + rows_u32.saturating_sub(1) * row_gap;
 
     let width = content_w + GROUP_PADDING * 2;
     let height = content_h + GROUP_PADDING * 2 + GROUP_HEADER;
@@ -320,19 +333,21 @@ fn emit_children<'a>(
         return;
     };
 
-    let cols = usize::try_from(GRID_COLUMNS.min(
-        u32::try_from(child_nodes.len()).expect("child count fits in u32"),
-    ))
+    let cols = usize::try_from(
+        GRID_COLUMNS.min(u32::try_from(child_nodes.len()).expect("child count fits in u32")),
+    )
     .expect("cols fits in usize");
 
     // Measure children sizes for layout using the shared size_visited guard.
     let child_sizes: Vec<Size> = child_nodes
         .iter()
         .map(|child| {
-            if size_visited.contains(&child.logical_id)
-                || !children.contains_key(&child.logical_id)
+            if size_visited.contains(&child.logical_id) || !children.contains_key(&child.logical_id)
             {
-                Size { width: CELL_WIDTH, height: CELL_HEIGHT }
+                Size {
+                    width: CELL_WIDTH,
+                    height: CELL_HEIGHT,
+                }
             } else {
                 compute_container_size(child, children, size_visited)
             }
@@ -350,7 +365,11 @@ fn emit_children<'a>(
 
     // Prefix sums for absolute positions inside the container.
     let col_x: Vec<u32> = prefix_positions(&col_widths, GROUP_PADDING, CELL_COL_STEP - CELL_WIDTH);
-    let row_y: Vec<u32> = prefix_positions(&row_heights, GROUP_HEADER + GROUP_PADDING, CELL_ROW_STEP - CELL_HEIGHT);
+    let row_y: Vec<u32> = prefix_positions(
+        &row_heights,
+        GROUP_HEADER + GROUP_PADDING,
+        CELL_ROW_STEP - CELL_HEIGHT,
+    );
 
     for (i, child) in child_nodes.iter().enumerate() {
         if visited.contains(&child.logical_id) {
@@ -375,7 +394,15 @@ fn emit_children<'a>(
                   </mxCell>",
                 sz.width, sz.height
             );
-            emit_children(child, cell_id, node_cell_ids, children, visited, size_visited, xml);
+            emit_children(
+                child,
+                cell_id,
+                node_cell_ids,
+                children,
+                visited,
+                size_visited,
+                xml,
+            );
         } else {
             // Leaf.
             let value = xml_escape(&node_label(child));
@@ -504,9 +531,9 @@ mod tests {
         // A is a root container that contains B.
         // B is a container that contains C.
         // C erroneously points back to B (cycle B→C→B).
-        let node_a = make_node("A", None);          // root container
-        let node_b = make_node("B", Some("A"));     // child of A
-        let node_c = make_node("C", Some("B"));     // child of B (creates B→C)
+        let node_a = make_node("A", None); // root container
+        let node_b = make_node("B", Some("A")); // child of A
+        let node_c = make_node("C", Some("B")); // child of B (creates B→C)
         // Add a node D that claims B as its group too — and B's child list
         // contains C which already references B → indirect cycle.
         // We model it more directly: make C's group point to B (so A→B→C with C→B cycle).

@@ -11,7 +11,7 @@ use yevice_pricing::catalog::PriceCatalog;
 
 /// Selects the appropriate [`PriceCatalog`] for a given cloud provider.
 ///
-/// Used by [`ServiceCatalog::build_cost_model`] to dispatch per-resource,
+/// Used by [`crate::ServiceCatalog::build_cost_model`] to dispatch per-resource,
 /// enabling mixed-provider architectures.
 pub trait PriceCatalogResolver: Send + Sync {
     /// Return the catalog to use for `provider`, or `None` if no catalog is
@@ -23,7 +23,7 @@ pub trait PriceCatalogResolver: Send + Sync {
 ///
 /// Build one with [`MultiProviderCatalog::with`] chaining or
 /// [`MultiProviderCatalog::insert`], then pass a reference to
-/// [`ServiceCatalog::build_cost_model`].
+/// [`crate::ServiceCatalog::build_cost_model`].
 #[derive(Default)]
 pub struct MultiProviderCatalog {
     catalogs: HashMap<Provider, Box<dyn PriceCatalog>>,
@@ -55,6 +55,8 @@ impl MultiProviderCatalog {
 
 impl PriceCatalogResolver for MultiProviderCatalog {
     fn resolve(&self, provider: Provider) -> Option<&dyn PriceCatalog> {
-        self.catalogs.get(&provider).map(std::convert::AsRef::as_ref)
+        self.catalogs
+            .get(&provider)
+            .map(std::convert::AsRef::as_ref)
     }
 }

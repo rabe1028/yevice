@@ -7,7 +7,9 @@ use std::{
 
 use yevice_core::resource::{Architecture, ConnectionType, Provider, Resource};
 use yevice_pricing::gcp_hardcoded_pricing;
-use yevice_service_api::{CfnAdapterRegistry, MultiProviderCatalog, ServiceCatalog, TfAdapterRegistry};
+use yevice_service_api::{
+    CfnAdapterRegistry, MultiProviderCatalog, ServiceCatalog, TfAdapterRegistry,
+};
 use yevice_services_aws::{
     AwsPricingCatalog,
     services::{
@@ -448,8 +450,11 @@ fn connections_have_no_dangling_endpoints() {
     let (_, tf) = aws_registries();
     let arch = convert::build_architecture("test", "ap-northeast-1", &resolved, &tf);
 
-    let node_ids: std::collections::HashSet<&str> =
-        arch.resources.iter().map(|r| r.logical_id.as_str()).collect();
+    let node_ids: std::collections::HashSet<&str> = arch
+        .resources
+        .iter()
+        .map(|r| r.logical_id.as_str())
+        .collect();
 
     for conn in &arch.connections {
         assert!(

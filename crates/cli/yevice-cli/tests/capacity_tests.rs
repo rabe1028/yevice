@@ -9,9 +9,7 @@ use yevice_cfn::{convert, parser};
 use yevice_core::capacity::{Quotas, Severity, validate_capacity};
 use yevice_service_api::{CfnAdapterRegistry, ServiceCatalog, TfAdapterRegistry};
 use yevice_services_aws::AwsPricingCatalog;
-use yevice_services_aws::quotas::{
-    LAMBDA_CONCURRENT_EXECUTIONS,
-};
+use yevice_services_aws::quotas::LAMBDA_CONCURRENT_EXECUTIONS;
 
 fn build_capacity(
     name: &str,

@@ -37,7 +37,10 @@ pub(crate) fn make_getatt(logical_id: &str, attr: &str) -> String {
 /// - `"{{getatt:X.Attr}}"` → `CfnRef { logical_id: "X", attr: Some("Attr") }`
 /// - `"{{getatt:X.Y.Z}}"` → `CfnRef { logical_id: "X", attr: Some("Y.Z") }` (split on first `.`)
 pub(crate) fn parse(s: &str) -> Option<CfnRef> {
-    if let Some(inner) = s.strip_prefix(REF_PREFIX).and_then(|r| r.strip_suffix(SUFFIX)) {
+    if let Some(inner) = s
+        .strip_prefix(REF_PREFIX)
+        .and_then(|r| r.strip_suffix(SUFFIX))
+    {
         return Some(CfnRef {
             logical_id: inner.to_string(),
             attr: None,

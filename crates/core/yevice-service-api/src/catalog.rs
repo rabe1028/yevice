@@ -1,7 +1,7 @@
 //! `ServiceCatalog` — the central registry for all service plugins.
 
 use yevice_core::{
-    bindings::{derive_bindings, ConnectionRule},
+    bindings::{ConnectionRule, derive_bindings},
     capacity::{CapacityModel, QuotaProvider, Quotas},
     cost::ArchitectureCost,
     resource::Architecture,

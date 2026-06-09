@@ -149,7 +149,10 @@ pub fn validate_capacity(
         Severity::Info => 2,
     });
 
-    ValidationResult { violations, skipped }
+    ValidationResult {
+        violations,
+        skipped,
+    }
 }
 
 // ---- Provider-agnostic Quotas ----

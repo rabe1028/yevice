@@ -115,7 +115,10 @@ fn tf_value_to_json(value: &TfValue) -> Option<JsonValue> {
             let arr: Vec<JsonValue> = items.iter().filter_map(tf_value_to_json).collect();
             Some(JsonValue::Array(arr))
         }
-        TfValue::VarRef(_) | TfValue::LocalRef(_) | TfValue::ResourceRef { .. } | TfValue::Unknown => {
+        TfValue::VarRef(_)
+        | TfValue::LocalRef(_)
+        | TfValue::ResourceRef { .. }
+        | TfValue::Unknown => {
             tracing::debug!(value = ?value, "unresolved TfValue reference dropped during conversion");
             None
         }
@@ -198,10 +201,7 @@ fn push_unique(
 /// Recursively collect every `ResourceRef` reachable from `value`.
 ///
 /// Each found ref is appended to `out` as `(resource_type, name, attr)`.
-fn collect_resource_refs<'a>(
-    value: &'a TfValue,
-    out: &mut Vec<(&'a str, &'a str, &'a str)>,
-) {
+fn collect_resource_refs<'a>(value: &'a TfValue, out: &mut Vec<(&'a str, &'a str, &'a str)>) {
     match value {
         TfValue::ResourceRef {
             resource_type,

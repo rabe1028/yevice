@@ -190,7 +190,11 @@ pub(crate) fn render_sensitivity_table(var_name: &str, rows: &[SensitivityRow]) 
 
     for row in rows {
         match row {
-            SensitivityRow::Ok { value, total, delta } => {
+            SensitivityRow::Ok {
+                value,
+                total,
+                delta,
+            } => {
                 let delta_str = if *delta >= 0.0 {
                     format!("+${delta:.2}")
                 } else {

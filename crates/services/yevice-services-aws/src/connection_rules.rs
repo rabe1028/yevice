@@ -4,7 +4,7 @@
 //! inside `yevice-core`. Core only walks the graph; these rules supply
 //! the AWS service-id knowledge (e.g. `"aws.sqs"`, `"aws.lambda"`).
 
-use yevice_core::bindings::{scale_description, scale_expr, scaled_binding, ConnectionRule};
+use yevice_core::bindings::{ConnectionRule, scale_description, scale_expr, scaled_binding};
 use yevice_core::cost::{Expr, VariableBinding};
 use yevice_core::resource::{Architecture, Connection, ConnectionType};
 use yevice_core::types::{LogicalId, VariableName};
@@ -104,8 +104,8 @@ impl ConnectionRule for AwsInvocationRule {
 
         let target_resource = arch.find_resource(&conn.target);
         let target_service_id = target_resource.map(|r| r.shell.service_id.as_str());
-        let workflow_type = target_resource
-            .and_then(|r| r.shell.metadata.get("workflow_type").map(String::as_str));
+        let workflow_type =
+            target_resource.and_then(|r| r.shell.metadata.get("workflow_type").map(String::as_str));
 
         let (target_var, target_type) = match target_service_id {
             Some("aws.lambda") => (conn.target.var("requests"), "Lambda"),
@@ -246,10 +246,10 @@ pub fn aws_connection_rules() -> Vec<Box<dyn ConnectionRule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yevice_core::bindings::derive_bindings;
     use yevice_core::evaluate::Params;
     use yevice_core::resource::{Architecture, Provider, Resource, ResourceShell};
     use yevice_core::types::{LogicalId, Region, ResourceType, VariableName};
-    use yevice_core::bindings::derive_bindings;
 
     fn params_from(pairs: &[(&str, f64)]) -> Params {
         pairs
@@ -416,7 +416,12 @@ mod tests {
             region: Region::new("ap-northeast-1"),
             resources: vec![
                 make_resource("Trigger", "aws.lambda"),
-                make_resource_with_meta("Workflow", "aws.step_functions", "workflow_type", "express"),
+                make_resource_with_meta(
+                    "Workflow",
+                    "aws.step_functions",
+                    "workflow_type",
+                    "express",
+                ),
             ],
             connections: vec![Connection {
                 source: LogicalId::new("Trigger"),
@@ -523,10 +528,7 @@ mod tests {
 
         let bindings = derive_bindings(&arch, &all_rules());
         assert_eq!(bindings.len(), 1);
-        assert_eq!(
-            bindings[0].target,
-            LogicalId::new("Queue").var("requests")
-        );
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
     }
 
     // -----------------------------------------------------------------------
@@ -586,10 +588,7 @@ mod tests {
 
         let bindings = derive_bindings(&arch, &all_rules());
         assert_eq!(bindings.len(), 1);
-        assert_eq!(
-            bindings[0].target,
-            LogicalId::new("Queue").var("requests")
-        );
+        assert_eq!(bindings[0].target, LogicalId::new("Queue").var("requests"));
     }
 
     // -----------------------------------------------------------------------
