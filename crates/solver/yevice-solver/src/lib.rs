@@ -25,6 +25,10 @@ const CONSTRAINT_TOLERANCE: f64 = 1e-9;
 pub struct Solution {
     /// Chosen value for each decision variable in the optimal (or any feasible)
     /// assignment.  Empty when `feasible` is false.
+    ///
+    /// Kept as a `std::collections::HashMap` (rather than the `FxHashMap`-based
+    /// `evaluate::Params`) to keep this public field's type stable; the
+    /// solver's per-combination hot-path maps use `Params` internally.
     pub assignments: HashMap<VariableName, f64>,
     /// Objective value at the optimal assignment.  [`f64::NAN`] when infeasible.
     pub objective_value: f64,

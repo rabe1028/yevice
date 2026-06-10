@@ -32,9 +32,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 # windows-sys は ring/rustls 系(v0.52)と clap/comfy-table/tracing-subscriber 系(v0.61)から
 # 推移的に引き込まれており、直接依存ではないため解決不能。意図的に重複を許容する。
-skip = [
-  { crate = "windows-sys" },
-]
+skip = [{ crate = "windows-sys" }]
 
 [sources]
 unknown-registry = "deny"
