@@ -1155,7 +1155,8 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
                 println!(" {size_kb} KB");
             }
             Err(e) => {
-                println!(" SKIP ({e})");
+                println!(" SKIP");
+                eprintln!("[WARN] {service_code}: skipped – {e}");
             }
         }
     }
@@ -1164,7 +1165,7 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
     Ok(())
 }
 
-const MAX_PRICING_BODY_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+const MAX_PRICING_BODY_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 fn download_pricing(url: &str) -> Result<Vec<u8>> {
     let mut response = ureq::get(url)
