@@ -757,3 +757,21 @@ fn local_resource_ref_alias_produces_notification_edge() {
         arch.connections,
     );
 }
+
+/// Integration (wiring): a `.tfvars` file exceeding `MAX_IAC_FILE_BYTES` is
+/// rejected by `parse_tfvars`' read path (`read_to_string_capped`). Ignored by
+/// default because it writes a >16 MiB temp file.
+#[test]
+#[ignore = "writes a >16 MiB temp file; run with `cargo test -- --ignored`"]
+fn parse_tfvars_rejects_oversized_file() {
+    let path =
+        std::env::temp_dir().join(format!("yevice_tf_oversized_{}.tfvars", std::process::id()));
+    std::fs::write(
+        &path,
+        vec![b' '; (yevice_core::io::MAX_IAC_FILE_BYTES + 1) as usize],
+    )
+    .unwrap();
+    let result = parser::parse_tfvars(&path);
+    let _ = std::fs::remove_file(&path);
+    assert!(result.is_err(), "oversized tfvars file must be rejected");
+}

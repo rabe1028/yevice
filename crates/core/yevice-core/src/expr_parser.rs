@@ -218,8 +218,8 @@ mod tests {
 
     #[test]
     fn test_constant() {
-        assert_eq!(compute("42", &Params::new()), 42.0);
-        assert_eq!(compute("0.7", &Params::new()), 0.7);
+        assert_eq!(compute("42", &Params::default()), 42.0);
+        assert_eq!(compute("0.7", &Params::default()), 0.7);
     }
 
     #[test]

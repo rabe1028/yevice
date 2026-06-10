@@ -6,6 +6,7 @@ pub mod evaluate;
 pub mod expr;
 pub mod expr_introspect;
 pub mod expr_parser;
+pub mod io;
 pub mod optimize;
 pub mod resource;
 pub mod schema;

@@ -1,0 +1,14 @@
+## Bundled AWS Pricing Data
+
+The pricing data files under `pricing-data/` are retrieved from the
+AWS Price List API
+(https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/).
+
+This data is provided for informational purposes only and may not
+reflect actual charges. AWS pricing is subject to change without notice.
+
+Use of this data is governed by the AWS Customer Agreement
+(https://aws.amazon.com/agreement/) and the AWS Intellectual Property
+License (https://aws.amazon.com/legal/aws-ip-license-terms/), not by
+this project's MIT license. The MIT license of this repository applies
+to the source code only, not to the bundled AWS pricing data.

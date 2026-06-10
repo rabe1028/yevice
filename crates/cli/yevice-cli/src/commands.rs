@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
@@ -433,7 +434,7 @@ pub fn optimize(
 
     let fixed_params = match params_path {
         Some(p) => load_params(p)?,
-        None => Params::new(),
+        None => Params::default(),
     };
 
     // Parse --decision NAME=v1,v2,...
@@ -1045,7 +1046,7 @@ fn load_simulation_profile(path: &str) -> Result<SimulationProfile> {
         serde_yaml_ng::from_value(base_params_val.clone())
             .context("failed to parse base_params")?;
 
-    let mut base_params = Params::new();
+    let mut base_params = Params::default();
     for (k, v) in base_map {
         match v {
             serde_yaml_ng::Value::Mapping(sub_map) => {
@@ -1163,10 +1164,19 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
     Ok(())
 }
 
+const MAX_PRICING_BODY_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
+
 fn download_pricing(url: &str) -> Result<Vec<u8>> {
-    let response = ureq::get(url).call().context("HTTP request failed")?;
+    let mut response = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .call()
+        .context("HTTP request failed")?;
     let body = response
-        .into_body()
+        .body_mut()
+        .with_config()
+        .limit(MAX_PRICING_BODY_BYTES)
         .read_to_vec()
         .context("failed to read response body")?;
     Ok(body)
@@ -1233,7 +1243,7 @@ fn load_params(path: &str) -> Result<Params> {
     let map: HashMap<String, serde_yaml_ng::Value> =
         serde_yaml_ng::from_str(&content).context("failed to parse params file")?;
 
-    let mut params = Params::new();
+    let mut params = Params::default();
     for (k, v) in map {
         match v {
             // Hierarchical: key is logical ID, value is a mapping of short var names

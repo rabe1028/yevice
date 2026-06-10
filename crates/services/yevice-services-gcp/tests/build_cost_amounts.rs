@@ -4,8 +4,6 @@
 //! round-number test prices and explicit variable bindings, so that mutations
 //! to the cost arithmetic are caught.
 
-use std::collections::HashMap;
-
 use yevice_core::{
     evaluate::{Params, evaluate},
     expr::Expr,
@@ -80,7 +78,7 @@ fn rt(name: &str) -> ResourceType {
 }
 
 fn params<const N: usize>(entries: [(VariableName, f64); N]) -> Params {
-    HashMap::from(entries)
+    entries.into_iter().collect()
 }
 
 #[test]

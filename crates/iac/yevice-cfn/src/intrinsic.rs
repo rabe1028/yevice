@@ -5,6 +5,13 @@ use serde_yaml_ng::Value;
 use crate::error::CfnError;
 use crate::sentinel;
 
+/// Maximum nesting depth for intrinsic function resolution.
+///
+/// Set high enough to accommodate legitimate deeply-nested CloudFormation
+/// templates while still preventing stack overflows on adversarial input.
+/// (The `yevice-tf` resolver applies its own, separate depth guard.)
+const MAX_INTRINSIC_DEPTH: usize = 128;
+
 /// Context for resolving `CloudFormation` intrinsic functions.
 pub struct ResolveContext {
     /// Template parameters: name -> value.
@@ -35,8 +42,23 @@ impl ResolveContext {
 ///
 /// Unresolvable values are returned as-is (for forward compatibility).
 pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+    resolve_inner(value, ctx, 0)
+}
+
+/// Depth-aware implementation of [`resolve`].
+///
+/// `depth` is incremented at every recursive call site. When it exceeds
+/// [`MAX_INTRINSIC_DEPTH`] an error is returned instead of recursing further,
+/// preventing stack overflows on deeply-nested templates.
+fn resolve_inner(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
+    if depth > MAX_INTRINSIC_DEPTH {
+        return Err(CfnError::IntrinsicError(format!(
+            "intrinsic nesting exceeds maximum depth ({MAX_INTRINSIC_DEPTH})"
+        )));
+    }
+
     match value {
-        Value::Tagged(tagged) => resolve_tagged(tagged, ctx),
+        Value::Tagged(tagged) => resolve_tagged(tagged, ctx, depth),
         Value::Mapping(map) => {
             // Check for long-form intrinsic functions (e.g., {"Fn::Sub": "..."})
             if map.len() == 1
@@ -45,12 +67,12 @@ pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
             {
                 match fn_name.as_str() {
                     "Ref" => return resolve_ref(val, ctx),
-                    "Fn::Sub" => return resolve_sub(val, ctx),
-                    "Fn::FindInMap" => return resolve_find_in_map(val, ctx),
-                    "Fn::Select" => return resolve_select(val, ctx),
-                    "Fn::If" => return resolve_if(val, ctx),
-                    "Fn::ImportValue" => return resolve_import_value(val, ctx),
-                    "Fn::Join" => return resolve_join(val, ctx),
+                    "Fn::Sub" => return resolve_sub(val, ctx, depth),
+                    "Fn::FindInMap" => return resolve_find_in_map(val, ctx, depth),
+                    "Fn::Select" => return resolve_select(val, ctx, depth),
+                    "Fn::If" => return resolve_if(val, ctx, depth),
+                    "Fn::ImportValue" => return resolve_import_value(val, ctx, depth),
+                    "Fn::Join" => return resolve_join(val, ctx, depth),
                     "Fn::GetAtt" => return resolve_get_att(val, ctx),
                     _ => {}
                 }
@@ -58,13 +80,15 @@ pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
             // Recursively resolve all values in the mapping
             let mut new_map = serde_yaml_ng::Mapping::new();
             for (k, v) in map {
-                new_map.insert(k.clone(), resolve(v, ctx)?);
+                new_map.insert(k.clone(), resolve_inner(v, ctx, depth + 1)?);
             }
             Ok(Value::Mapping(new_map))
         }
         Value::Sequence(seq) => {
-            let resolved: Result<Vec<Value>, CfnError> =
-                seq.iter().map(|v| resolve(v, ctx)).collect();
+            let resolved: Result<Vec<Value>, CfnError> = seq
+                .iter()
+                .map(|v| resolve_inner(v, ctx, depth + 1))
+                .collect();
             Ok(Value::Sequence(resolved?))
         }
         _ => Ok(value.clone()),
@@ -74,16 +98,17 @@ pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
 fn resolve_tagged(
     tagged: &serde_yaml_ng::value::TaggedValue,
     ctx: &ResolveContext,
+    depth: usize,
 ) -> Result<Value, CfnError> {
     let tag = tagged.tag.to_string();
     match tag.as_str() {
         "!Ref" => resolve_ref(&tagged.value, ctx),
-        "!Sub" => resolve_sub(&tagged.value, ctx),
-        "!FindInMap" => resolve_find_in_map(&tagged.value, ctx),
-        "!Select" => resolve_select(&tagged.value, ctx),
-        "!If" => resolve_if(&tagged.value, ctx),
-        "!ImportValue" => resolve_import_value(&tagged.value, ctx),
-        "!Join" => resolve_join(&tagged.value, ctx),
+        "!Sub" => resolve_sub(&tagged.value, ctx, depth),
+        "!FindInMap" => resolve_find_in_map(&tagged.value, ctx, depth),
+        "!Select" => resolve_select(&tagged.value, ctx, depth),
+        "!If" => resolve_if(&tagged.value, ctx, depth),
+        "!ImportValue" => resolve_import_value(&tagged.value, ctx, depth),
+        "!Join" => resolve_join(&tagged.value, ctx, depth),
         "!GetAtt" => resolve_get_att(&tagged.value, ctx),
         // Return unresolvable tagged values as-is
         _ => Ok(Value::Tagged(Box::new(tagged.clone()))),
@@ -118,7 +143,7 @@ fn resolve_ref(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     Ok(Value::String(sentinel::make_ref(name)))
 }
 
-fn resolve_sub(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_sub(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
     match value {
         Value::String(template) => {
             let result = substitute_variables(template, &HashMap::new(), ctx)?;
@@ -138,7 +163,7 @@ fn resolve_sub(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
                     let mut map = HashMap::new();
                     for (k, v) in m {
                         if let Value::String(key) = k {
-                            let resolved = resolve(v, ctx)?;
+                            let resolved = resolve_inner(v, ctx, depth + 1)?;
                             // If the resolved value is a string, use it; otherwise
                             // insert an empty string so that ${Key} is replaced with
                             // "" rather than being left as a bare variable name that
@@ -204,7 +229,11 @@ fn substitute_variables(
     Ok(result)
 }
 
-fn resolve_find_in_map(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_find_in_map(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<Value, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!FindInMap argument must be a sequence".into()))?;
@@ -215,9 +244,9 @@ fn resolve_find_in_map(value: &Value, ctx: &ResolveContext) -> Result<Value, Cfn
         ));
     }
 
-    let map_name = resolve(&seq[0], ctx)?;
-    let first_key = resolve(&seq[1], ctx)?;
-    let second_key = resolve(&seq[2], ctx)?;
+    let map_name = resolve_inner(&seq[0], ctx, depth + 1)?;
+    let first_key = resolve_inner(&seq[1], ctx, depth + 1)?;
+    let second_key = resolve_inner(&seq[2], ctx, depth + 1)?;
 
     let map_name = map_name.as_str().unwrap_or_default();
     let first_key = first_key.as_str().unwrap_or_default();
@@ -235,7 +264,7 @@ fn resolve_find_in_map(value: &Value, ctx: &ResolveContext) -> Result<Value, Cfn
         })
 }
 
-fn resolve_select(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_select(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!Select argument must be a sequence".into()))?;
@@ -246,14 +275,14 @@ fn resolve_select(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError
         ));
     }
 
-    let index = resolve(&seq[0], ctx)?;
+    let index = resolve_inner(&seq[0], ctx, depth + 1)?;
     let index = match &index {
         Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
         Value::String(s) => s.parse::<usize>().unwrap_or(0),
         _ => 0,
     };
 
-    let list = resolve(&seq[1], ctx)?;
+    let list = resolve_inner(&seq[1], ctx, depth + 1)?;
     let list = list
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!Select second arg must be a list".into()))?;
@@ -263,7 +292,7 @@ fn resolve_select(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError
         .ok_or_else(|| CfnError::IntrinsicError(format!("!Select index {index} out of bounds")))
 }
 
-fn resolve_if(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_if(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!If argument must be a sequence".into()))?;
@@ -284,14 +313,18 @@ fn resolve_if(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
         .ok_or_else(|| CfnError::ConditionNotFound(cond_name.to_string()))?;
 
     if *cond_value {
-        resolve(&seq[1], ctx)
+        resolve_inner(&seq[1], ctx, depth + 1)
     } else {
-        resolve(&seq[2], ctx)
+        resolve_inner(&seq[2], ctx, depth + 1)
     }
 }
 
-fn resolve_import_value(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
-    let resolved = resolve(value, ctx)?;
+fn resolve_import_value(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<Value, CfnError> {
+    let resolved = resolve_inner(value, ctx, depth + 1)?;
     let export_name = resolved.as_str().ok_or_else(|| {
         CfnError::IntrinsicError("Fn::ImportValue argument must resolve to a string".into())
     })?;
@@ -302,7 +335,7 @@ fn resolve_import_value(value: &Value, ctx: &ResolveContext) -> Result<Value, Cf
         .ok_or_else(|| CfnError::ImportValueNotFound(export_name.to_string()))
 }
 
-fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_join(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!Join argument must be a sequence".into()))?;
@@ -313,10 +346,10 @@ fn resolve_join(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> 
         ));
     }
 
-    let delimiter = resolve(&seq[0], ctx)?;
+    let delimiter = resolve_inner(&seq[0], ctx, depth + 1)?;
     let delimiter = delimiter.as_str().unwrap_or("");
 
-    let list = resolve(&seq[1], ctx)?;
+    let list = resolve_inner(&seq[1], ctx, depth + 1)?;
     let list = list
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!Join second arg must be a list".into()))?;
@@ -408,7 +441,7 @@ mod tests {
     fn test_resolve_sub() {
         let ctx = make_ctx();
         let val = Value::String("arn:aws:s3:::${Env}-bucket".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(result, Value::String("arn:aws:s3:::prod-bucket".into()));
     }
 
@@ -420,7 +453,7 @@ mod tests {
             Value::String("ap-northeast-1".into()),
             Value::String("AMI".into()),
         ]);
-        let result = resolve_find_in_map(&val, &ctx).unwrap();
+        let result = resolve_find_in_map(&val, &ctx, 0).unwrap();
         assert_eq!(result, Value::String("ami-12345".into()));
     }
 
@@ -432,7 +465,7 @@ mod tests {
             Value::String("prod-value".into()),
             Value::String("dev-value".into()),
         ]);
-        let result = resolve_if(&val, &ctx).unwrap();
+        let result = resolve_if(&val, &ctx, 0).unwrap();
         assert_eq!(result, Value::String("prod-value".into()));
     }
 
@@ -440,7 +473,7 @@ mod tests {
     fn test_resolve_import_value() {
         let ctx = make_ctx();
         let val = Value::String("SharedVpcId".into());
-        let result = resolve_import_value(&val, &ctx).unwrap();
+        let result = resolve_import_value(&val, &ctx, 0).unwrap();
         assert_eq!(result, Value::String("vpc-12345".into()));
     }
 
@@ -518,7 +551,7 @@ mod tests {
     fn test_sub_resource_attr_becomes_getatt_sentinel() {
         let ctx = make_ctx();
         let val = Value::String("${HandlerFunction.Arn}".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("{{getatt:HandlerFunction.Arn}}".into()),
@@ -533,7 +566,7 @@ mod tests {
         let ctx = make_ctx();
         // "MyQueue" is not a parameter in make_ctx(), so it must sentinel-ise.
         let val = Value::String("${MyQueue}".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("{{ref:MyQueue}}".into()),
@@ -547,7 +580,7 @@ mod tests {
     fn test_sub_pseudo_parameter_stays_verbatim() {
         let ctx = make_ctx();
         let val = Value::String("${AWS::Region}".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("${AWS::Region}".into()),
@@ -563,7 +596,7 @@ mod tests {
     fn test_sub_embedded_resource_ref_is_not_standalone_sentinel() {
         let ctx = make_ctx();
         let val = Value::String("arn:aws:sqs:us-east-1:123456789012:${MyQueue}/suffix".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         let s = result.as_str().unwrap();
         // The sentinel is embedded, not the whole string.
         assert!(
@@ -583,7 +616,7 @@ mod tests {
     fn test_sub_bang_escape_produces_literal() {
         let ctx = make_ctx();
         let val = Value::String("foo-${!NotAVar}-bar".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("foo-${NotAVar}-bar".into()),
@@ -596,7 +629,7 @@ mod tests {
     fn test_sub_bang_escape_does_not_sentinel() {
         let ctx = make_ctx();
         let val = Value::String("${!SomeVar}".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         let s = result.as_str().unwrap();
         assert!(
             !s.contains("{{ref:"),
@@ -615,7 +648,7 @@ mod tests {
         let ctx = make_ctx();
         // MyQueue is not a parameter in make_ctx(), so it becomes a ref sentinel.
         let val = Value::String("${MyQueue}-${!NotAVar}".into());
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("{{ref:MyQueue}}-${NotAVar}".into()),
@@ -638,7 +671,7 @@ mod tests {
                 Value::Bool(false),
             ]),
         ]);
-        let result = resolve_join(&val, &ctx).unwrap();
+        let result = resolve_join(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("true:suffix:false".into()),
@@ -654,7 +687,7 @@ mod tests {
             Value::String(String::new()),
             Value::Sequence(vec![Value::Bool(false)]),
         ]);
-        let result = resolve_join(&val, &ctx).unwrap();
+        let result = resolve_join(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
             Value::String("false".into()),
@@ -684,7 +717,7 @@ mod tests {
                 m
             }),
         ]);
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         let s = result.as_str().unwrap();
         // NumVar resolves to a Number, which is not a string — must be inserted
         // as empty string, producing "prefix--suffix", NOT "prefix-{{ref:NumVar}}-suffix".
@@ -710,7 +743,102 @@ mod tests {
                 m
             }),
         ]);
-        let result = resolve_sub(&val, &ctx).unwrap();
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(result, Value::String("hello-world".into()));
+    }
+
+    // --- Depth guard tests ---
+
+    /// Build a deeply nested `!Join` value that exceeds MAX_INTRINSIC_DEPTH.
+    ///
+    /// The structure is:
+    ///   Join(["-", [Join(["-", [Join(["-", [...]])]])]])
+    /// repeated MAX_INTRINSIC_DEPTH + 2 times so the recursion definitely
+    /// exceeds the limit.
+    fn build_deep_join(depth: usize) -> Value {
+        if depth == 0 {
+            return Value::String("leaf".into());
+        }
+        // Fn::Join long-form mapping so it goes through resolve_inner dispatch
+        let mut inner_map = serde_yaml_ng::Mapping::new();
+        inner_map.insert(
+            Value::String("Fn::Join".into()),
+            Value::Sequence(vec![
+                Value::String("-".into()),
+                Value::Sequence(vec![build_deep_join(depth - 1)]),
+            ]),
+        );
+        Value::Mapping(inner_map)
+    }
+
+    /// Resolving a value nested beyond MAX_INTRINSIC_DEPTH must return
+    /// `CfnError::IntrinsicError` (depth exceeded), not panic.
+    #[test]
+    fn test_depth_guard_exceeds_limit_returns_error() {
+        let ctx = make_ctx();
+        // Build MAX_INTRINSIC_DEPTH + 2 levels of nesting to guarantee we exceed 128.
+        let deep = build_deep_join(MAX_INTRINSIC_DEPTH + 2);
+        let result = resolve(&deep, &ctx);
+        assert!(
+            result.is_err(),
+            "expected Err for depth > MAX_INTRINSIC_DEPTH, got Ok"
+        );
+        let err = result.unwrap_err();
+        match err {
+            CfnError::IntrinsicError(msg) => {
+                assert!(
+                    msg.contains("maximum depth"),
+                    "error message should mention 'maximum depth', got: {msg}"
+                );
+            }
+            other => panic!("expected CfnError::IntrinsicError, got: {other:?}"),
+        }
+    }
+
+    /// A shallow nesting (well within MAX_INTRINSIC_DEPTH) must resolve normally.
+    #[test]
+    fn test_depth_guard_shallow_nesting_succeeds() {
+        let ctx = make_ctx();
+        // 3 levels of nesting: trivially within limit.
+        let shallow = build_deep_join(3);
+        let result = resolve(&shallow, &ctx);
+        assert!(
+            result.is_ok(),
+            "expected Ok for shallow nesting, got: {result:?}"
+        );
+        // The leaf value "leaf" joined with "-" at each level is just "leaf"
+        // (only one element per list), so the final string is "leaf".
+        assert_eq!(result.unwrap(), Value::String("leaf".into()));
+    }
+
+    /// Exactly at MAX_INTRINSIC_DEPTH levels must still succeed (boundary case).
+    ///
+    /// `build_deep_join(N)` adds 2 to the depth counter per layer (one for the
+    /// `Fn::Join` dispatch, one for the list element), so N=64 drives the
+    /// deepest `resolve_inner` to exactly depth 128 — the largest value that
+    /// still succeeds.
+    #[test]
+    fn test_depth_guard_at_limit_succeeds() {
+        let ctx = make_ctx();
+        let at_limit = build_deep_join(64);
+        let result = resolve(&at_limit, &ctx);
+        assert!(
+            result.is_ok(),
+            "expected Ok for nesting at MAX_INTRINSIC_DEPTH, got: {result:?}"
+        );
+    }
+
+    /// One level past the limit (N=65 → depth 130 > 128) must error. Together
+    /// with `test_depth_guard_at_limit_succeeds` this pins the exact 64-ok /
+    /// 65-err boundary, catching an off-by-one in the `depth > MAX` guard.
+    #[test]
+    fn test_depth_guard_just_over_limit_errors() {
+        let ctx = make_ctx();
+        let just_over = build_deep_join(65);
+        let result = resolve(&just_over, &ctx);
+        assert!(
+            result.is_err(),
+            "expected Err one level past MAX_INTRINSIC_DEPTH, got: {result:?}"
+        );
     }
 }

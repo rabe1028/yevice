@@ -117,7 +117,7 @@ fn validate_capacity_skips_constraints_whose_variable_is_unprovided() {
     let models = vec![model(10.0, Severity::Error)];
     // "x" is not provided -> evaluation fails -> constraint skipped, no panic.
     assert!(
-        validate_capacity(&models, &Params::new())
+        validate_capacity(&models, &Params::default())
             .violations
             .is_empty()
     );
@@ -127,7 +127,7 @@ fn validate_capacity_skips_constraints_whose_variable_is_unprovided() {
 fn validate_capacity_records_skipped_when_variable_is_missing() {
     let models = vec![model(10.0, Severity::Error)];
     // "x" is not provided -> constraint is skipped and recorded.
-    let result = validate_capacity(&models, &Params::new());
+    let result = validate_capacity(&models, &Params::default());
     assert!(result.violations.is_empty());
     assert_eq!(result.skipped.len(), 1);
     assert_eq!(result.skipped[0].resource, LogicalId::new("svc"));
@@ -219,7 +219,8 @@ fn evaluate_architecture_sums_components_when_all_components_evaluate() {
             },
         ],
     );
-    let result = evaluate_architecture(&architecture(vec![rc], vec![]), &Params::new()).unwrap();
+    let result =
+        evaluate_architecture(&architecture(vec![rc], vec![]), &Params::default()).unwrap();
     approx(result.total_monthly_cost, 30.0);
     approx(result.resources[0].monthly_cost, 30.0);
 }
@@ -236,7 +237,8 @@ fn evaluate_architecture_falls_back_to_expr_when_a_component_cannot_evaluate() {
             expr: Expr::variable("missing"),
         }],
     );
-    let result = evaluate_architecture(&architecture(vec![rc], vec![]), &Params::new()).unwrap();
+    let result =
+        evaluate_architecture(&architecture(vec![rc], vec![]), &Params::default()).unwrap();
     approx(result.total_monthly_cost, 42.0);
 }
 

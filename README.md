@@ -158,6 +158,18 @@ before adopting it:
   ~19 of the ~36 AWS services have a TF adapter; the rest are CFn-only.
 - **API stability.** Pre-1.0 — public APIs may break between minor versions.
 
+## Pricing Data
+
+The JSON files under `pricing-data/` are downloaded from the
+[AWS Price List API](https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/)
+and are **provided for informational purposes only**. They may not reflect
+actual AWS charges, and pricing is subject to change without notice. Run
+`yevice update-pricing` to refresh the data for your region.
+
+Use of this data is governed by the [AWS Customer Agreement](https://aws.amazon.com/agreement/)
+and the [AWS Intellectual Property License](https://aws.amazon.com/legal/aws-ip-license-terms/),
+not by this project's MIT license. See [`NOTICE`](./NOTICE) for details.
+
 ## License
 
 MIT

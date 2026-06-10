@@ -44,7 +44,7 @@ fn load_usage(name: &str) -> Params {
     let path = fixtures_dir().join(name);
     let content = std::fs::read_to_string(&path).unwrap();
     let map: HashMap<String, serde_yaml_ng::Value> = serde_yaml_ng::from_str(&content).unwrap();
-    let mut params = Params::new();
+    let mut params = Params::default();
     for (k, v) in map {
         match v {
             serde_yaml_ng::Value::Mapping(sub_map) => {
@@ -594,7 +594,7 @@ fn test_binding_derives_lambda_requests_from_sqs() {
     let arch = build_architecture_cost("test", &resources, (), false);
 
     // Provide SQS requests but NOT OrderBackupFunction_requests
-    let mut usage = Params::new();
+    let mut usage = Params::default();
     usage.insert(VariableName::new("FailedOrderQueue_requests"), 10000.0);
     usage.insert(VariableName::new("FailedOrderDLQ_requests"), 0.0);
     usage.insert(
@@ -668,7 +668,7 @@ fn test_binding_can_be_overridden_by_explicit_param() {
     let resources = parser::resolve_template(&tmpl, &params, &imports).unwrap();
     let arch = build_architecture_cost("test", &resources, (), false);
 
-    let mut usage = Params::new();
+    let mut usage = Params::default();
     usage.insert(VariableName::new("FailedOrderQueue_requests"), 10000.0);
     usage.insert(VariableName::new("FailedOrderDLQ_requests"), 0.0);
     // Explicitly override with 5M requests (well above 1M free tier)
@@ -772,7 +772,7 @@ fn test_batch_job_cost_calculation() {
     let resources = parser::resolve_template(&tmpl, &HashMap::new(), &HashMap::new()).unwrap();
     let arch = build_architecture_cost("batch", &resources, (), false);
 
-    let mut usage = Params::new();
+    let mut usage = Params::default();
     // 1000 executions, 220 sec each
     usage.insert(VariableName::new("BatchWorkflow_transitions"), 3000.0);
     usage.insert(VariableName::new("ProcessingJob_executions"), 1000.0);
@@ -1005,7 +1005,7 @@ fn test_batch_scenario_evaluation_with_user_bindings() {
     arch_cost.bindings.extend(user_bindings);
 
     // Usage parameters from batch-scenario-usage.yaml (root metrics only)
-    let mut params = Params::new();
+    let mut params = Params::default();
     params.insert(VariableName::new("BatchWorkflow_transitions"), 3000.0);
     params.insert(VariableName::new("ProcessingJob_avg_duration_sec"), 220.0);
     params.insert(VariableName::new("OutputBucket_avg_object_size_gb"), 0.7);
@@ -1095,7 +1095,7 @@ fn test_batch_scenario_bindings_derive_correct_values() {
     // BatchWorkflow_transitions=3000 => ProcessingJob_executions = ceil(3000/3) = 1000
     // ProcessingJob_executions=1000 => OutputBucket_put_requests = 1000
     // executions=1000, avg_object_size_gb=0.7, retention_days=7 => storage = 1000*0.7*7/30 ≈ 163.33
-    let mut params = Params::new();
+    let mut params = Params::default();
     params.insert(VariableName::new("BatchWorkflow_transitions"), 3000.0);
     params.insert(VariableName::new("ProcessingJob_avg_duration_sec"), 220.0);
     params.insert(VariableName::new("OutputBucket_avg_object_size_gb"), 0.7);
@@ -1138,7 +1138,7 @@ fn test_batch_scenario_bindings_overridable() {
     arch_cost.bindings.extend(user_bindings);
 
     // Base: derived executions = 1000 (3000 / 3)
-    let mut base_params = Params::new();
+    let mut base_params = Params::default();
     base_params.insert(VariableName::new("BatchWorkflow_transitions"), 3000.0);
     base_params.insert(VariableName::new("ProcessingJob_avg_duration_sec"), 220.0);
     base_params.insert(VariableName::new("OutputBucket_avg_object_size_gb"), 0.7);

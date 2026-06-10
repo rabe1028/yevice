@@ -71,7 +71,7 @@ fn test_lambda_concurrency_violation_detected() {
         .expect("should have at least one Lambda");
 
     // Peak 200 req/sec * 1000ms duration = 200 concurrent => exceeds 100 quota
-    let mut params = Params::new();
+    let mut params = Params::default();
     params.insert(
         VariableName::new(format!("{lambda_id}_peak_requests_per_sec")),
         200.0,
@@ -110,7 +110,7 @@ fn test_lambda_concurrency_within_quota_passes() {
         .expect("should have at least one Lambda");
 
     // Peak 100 req/sec * 200ms = 20 concurrent => well under 1000
-    let mut params = Params::new();
+    let mut params = Params::default();
     params.insert(
         VariableName::new(format!("{lambda_id}_peak_requests_per_sec")),
         100.0,
@@ -190,7 +190,7 @@ fn test_kinesis_shard_throughput_violation() {
     let quotas = Quotas::default(); // uses default fallback (1 MB/sec/shard, 1000 records/sec/shard)
     let models = build_capacity("streaming-pipeline", &resources, &quotas);
 
-    let mut params = Params::new();
+    let mut params = Params::default();
     // 2 shards available; need 5 MB/sec => required 5 shards => violation
     params.insert(
         VariableName::new("InputStream_peak_ingestion_mb_per_sec"),

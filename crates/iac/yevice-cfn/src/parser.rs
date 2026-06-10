@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde_yaml_ng::Value;
+use yevice_core::io::read_to_string_capped;
 
 use crate::error::CfnError;
 use crate::intrinsic::{ResolveContext, resolve};
@@ -36,7 +37,7 @@ pub struct CfnResource {
 
 /// Parse a `CloudFormation` YAML template from a file.
 pub fn parse_template(path: &Path) -> Result<CfnTemplate, CfnError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_to_string_capped(path)?;
     parse_template_str(&content)
 }
 
@@ -419,6 +420,21 @@ fn resolve_condition_value(value: &Value, ctx: &ConditionContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Integration (wiring): a file exceeding `MAX_IAC_FILE_BYTES` is rejected
+    /// by the parser's read path (`read_to_string_capped`). Ignored by default
+    /// because it writes a >16 MiB temp file.
+    #[test]
+    #[ignore = "writes a >16 MiB temp file; run with `cargo test -- --ignored`"]
+    fn parse_template_rejects_oversized_file() {
+        use yevice_core::io::MAX_IAC_FILE_BYTES;
+        let path =
+            std::env::temp_dir().join(format!("yevice_cfn_oversized_{}.yaml", std::process::id()));
+        std::fs::write(&path, vec![b' '; (MAX_IAC_FILE_BYTES + 1) as usize]).unwrap();
+        let result = parse_template(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "oversized template file must be rejected");
+    }
 
     const SAMPLE_TEMPLATE: &str = r#"
 AWSTemplateFormatVersion: "2010-09-09"
