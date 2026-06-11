@@ -9,7 +9,7 @@
 //!   orders-ingest.sam ─ Kinesis->Lambda ────────┘
 //!   catalog-indexing.sam ─ DDB Stream->Lambda->AOSS
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use yevice_cfn::convert;
@@ -77,7 +77,7 @@ fn extract_f64(v: &serde_yaml_ng::Value) -> Option<f64> {
 
 fn build_architecture_cost(
     name: &str,
-    resources: &HashMap<String, yevice_cfn::parser::CfnResource>,
+    resources: &BTreeMap<String, yevice_cfn::parser::CfnResource>,
     _pricing: (),
     strict: bool,
 ) -> yevice_core::cost::ArchitectureCost {

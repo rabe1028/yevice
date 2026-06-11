@@ -13,7 +13,7 @@ use yevice_services_aws::quotas::LAMBDA_CONCURRENT_EXECUTIONS;
 
 fn build_capacity(
     name: &str,
-    resources: &std::collections::HashMap<String, parser::CfnResource>,
+    resources: &std::collections::BTreeMap<String, parser::CfnResource>,
     quotas: &Quotas,
 ) -> Vec<yevice_core::capacity::CapacityModel> {
     let tmpl = parser::CfnTemplate {

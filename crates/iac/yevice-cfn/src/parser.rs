@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_yaml_ng::Value;
@@ -12,7 +12,7 @@ pub struct CfnTemplate {
     pub parameters: HashMap<String, ParameterDef>,
     pub mappings: HashMap<String, HashMap<String, HashMap<String, String>>>,
     pub conditions: HashMap<String, Value>,
-    pub resources: HashMap<String, CfnResource>,
+    pub resources: BTreeMap<String, CfnResource>,
 }
 
 /// A `CloudFormation` parameter definition.
@@ -177,8 +177,8 @@ fn parse_conditions(root: &serde_yaml_ng::Mapping) -> HashMap<String, Value> {
 
 fn parse_resources(
     root: &serde_yaml_ng::Mapping,
-) -> Result<HashMap<String, CfnResource>, CfnError> {
-    let mut resources = HashMap::new();
+) -> Result<BTreeMap<String, CfnResource>, CfnError> {
+    let mut resources = BTreeMap::new();
 
     let section = root
         .get(Value::String("Resources".into()))
@@ -236,7 +236,7 @@ pub fn resolve_template(
     template: &CfnTemplate,
     param_values: &HashMap<String, String>,
     import_values: &HashMap<String, String>,
-) -> Result<HashMap<String, CfnResource>, CfnError> {
+) -> Result<BTreeMap<String, CfnResource>, CfnError> {
     // Build effective parameters: supplied values override defaults
     let mut effective_params = HashMap::new();
     for (name, def) in &template.parameters {
@@ -267,7 +267,7 @@ pub fn resolve_template(
     ctx.mappings.clone_from(&template.mappings);
     ctx.conditions.clone_from(&conditions);
 
-    let mut resolved_resources = HashMap::new();
+    let mut resolved_resources = BTreeMap::new();
     for (id, resource) in &template.resources {
         // Skip resources with a false condition
         if let Some(cond_name) = &resource.condition

@@ -152,39 +152,86 @@ impl Solver for EnumerationSolver {
         // entirely outside the dependent set (safe to resolve once).
         // decision_bindings must be re-resolved each iteration (original order kept).
         // Clone into owned Vecs so we can pass slices to resolve_bindings_into.
-        let (fixed_bindings, decision_bindings): (Vec<_>, Vec<_>) = problem
+        let (mut fixed_bindings, mut decision_bindings): (Vec<_>, Vec<_>) = problem
             .bindings
             .iter()
             .cloned()
             .partition(|b| b.expr.variables().iter().all(|v| !dependent.contains(v)));
 
-        // Compute the set of "contested" targets: targets that appear in BOTH
-        // fixed_bindings AND decision_bindings.  For these targets the original
-        // list-order priority is restored by removing the pre-resolved fixed
-        // value from scratch before re-evaluating the decision-dependent binding
-        // (see loop body below).
+        // Hardening (Scenario B): a binding whose target IS a decision variable
+        // name must NOT be hoisted into fixed_bindings.  Pre-seeding base with a
+        // constant value for that target would shadow the decision variable write
+        // that happens in the inner loop (via get_mut), causing the binding result
+        // to persist in scratch rather than the chosen domain value.
+        //
+        // Only decision variable names are reclassified here — NOT transitively
+        // dependent targets, which are handled correctly by contested_decision_first.
+        let (still_fixed, must_be_decision): (Vec<_>, Vec<_>) = fixed_bindings
+            .into_iter()
+            .partition(|b| !decision_names.contains(&b.target));
+        fixed_bindings = still_fixed;
+        decision_bindings.extend(must_be_decision);
+
+        // Build the contested_decision_first set: targets that appear in BOTH
+        // fixed_bindings AND decision_bindings, where the FIRST occurrence in
+        // problem.bindings is a decision-dependent binding.  Only for these targets
+        // does the hoist incorrectly let the fixed binding win; removing the
+        // pre-resolved value from scratch restores list-order priority.
+        //
+        // Targets that are fixed_param keys or decision variable names are excluded:
+        //   - fixed_param key: base already holds the param value and must keep it.
+        //   - decision variable name: the decision slot written above must win.
         let decision_binding_targets: std::collections::HashSet<&VariableName> =
             decision_bindings.iter().map(|b| &b.target).collect();
-        let contested_targets: std::collections::HashSet<&VariableName> = fixed_bindings
-            .iter()
-            .filter(|b| decision_binding_targets.contains(&b.target))
-            .map(|b| &b.target)
-            .collect();
+
+        // Walk problem.bindings once to record, for each collision target, whether
+        // its FIRST occurrence is decision-dependent.
+        let mut first_is_decision: std::collections::HashMap<&VariableName, bool> =
+            std::collections::HashMap::new();
+        for binding in &problem.bindings {
+            if !first_is_decision.contains_key(&binding.target) {
+                let depends_on_decision = binding
+                    .expr
+                    .variables()
+                    .iter()
+                    .any(|v| dependent.contains(v));
+                first_is_decision.insert(&binding.target, depends_on_decision);
+            }
+        }
+
+        let contested_decision_first: std::collections::HashSet<&VariableName> =
+            decision_binding_targets
+                .iter()
+                .filter(|t| {
+                    // Must also have a fixed binding (truly contested)
+                    fixed_bindings.iter().any(|b| &b.target == **t)
+                    // Must NOT be a fixed_param (its value must win)
+                    && !problem.fixed_params.contains_key(*t)
+                    // Must NOT be a decision variable name (its slot value must win)
+                    && !decision_names.contains(*t)
+                    // FIRST entry in problem.bindings for this target is decision-dependent
+                    && first_is_decision.get(*t).copied().unwrap_or(false)
+                })
+                .copied()
+                .collect();
 
         // Build the base params map once: fixed_params + fixed bindings resolved.
         // Pre-insert slots for decision variables so that the inner loop can
         // update values via get_mut without cloning keys.
         //
-        // NOTE: decision_binding targets are intentionally NOT pre-seeded here.
-        // This preserves the correct priority contract:
+        // Priority contract (after hardening reclassification above):
         //   - fixed_param with same name as a binding target → fixed value wins
         //     (already in base; resolve_bindings_into skips keys already present).
         //   - decision variable with same name as a binding target → decision
         //     value wins (written by get_mut after clone_from; skipped by
-        //     resolve_bindings_into).
-        //   - pure binding target (neither fixed nor decision) → absent from
-        //     base; clone_from removes any stale value; resolve_bindings_into
-        //     recomputes it fresh each iteration.
+        //     resolve_bindings_into).  Hardening ensures the binding was moved to
+        //     decision_bindings, so it is never pre-seeded into base.
+        //   - pure binding target (neither fixed_param nor decision var) with its
+        //     FIRST occurrence as a fixed binding → fixed value wins (pre-seeded
+        //     into base; resolve_bindings_into skips it).
+        //   - contested target whose FIRST occurrence in problem.bindings is a
+        //     decision-dependent binding → removed from scratch each iteration
+        //     (contested_decision_first); decision binding re-evaluates and wins.
         let mut base: Params = problem
             .fixed_params
             .iter()
@@ -233,23 +280,22 @@ impl Solver for EnumerationSolver {
                 ) = vars[k].domain[idx];
             }
 
-            // Restore list-order priority for contested targets: when the same
-            // target appears in both fixed_bindings and decision_bindings, the
-            // entry that comes first in problem.bindings must win — mirroring the
-            // old single-pass `resolve_bindings(all_bindings, params)` semantics
-            // where `contains_key` in resolve_bindings_into lets the first
-            // resolvable binding win.
+            // Restore list-order priority for contested_decision_first targets:
+            // these are targets that appear in both fixed_bindings and
+            // decision_bindings, whose FIRST occurrence in problem.bindings is a
+            // decision-dependent binding, and that are neither a fixed_param key
+            // nor a decision variable name.
             //
             // After clone_from, scratch already holds the fixed-resolved value
-            // for contested targets (written during pre-loop base construction).
+            // for these targets (written during pre-loop base construction).
             // Removing them here lets resolve_bindings_into recompute the
             // decision-dependent expression, so the decision-dependent binding
-            // wins — which is correct when the decision-dependent binding appears
-            // BEFORE the fixed binding in problem.bindings.
+            // wins — preserving the original list-order "first resolvable wins"
+            // semantics.
             //
-            // Fixed params and decision variable slot values are NOT contested
-            // (they are not binding targets), so they remain intact.
-            for t in &contested_targets {
+            // Targets excluded from this set (fixed_param keys and decision
+            // variable names) are left intact in scratch so their values win.
+            for t in &contested_decision_first {
                 scratch.remove(*t);
             }
 
@@ -259,16 +305,17 @@ impl Solver for EnumerationSolver {
             // `contains_key` skip:
             //   - decision variable == binding target → scratch already holds the
             //     decision value (written above); resolve_bindings_into skips it
-            //     → decision value wins (bug-2 fix).
+            //     → decision value wins.  Hardening (above) ensures such bindings
+            //     were moved to decision_bindings, so they are never in base.
             //   - fixed_param == binding target → base (and thus scratch after
             //     clone_from) already holds the fixed value; skipped → fixed
-            //     value wins (bug-1 fix).
+            //     value wins.
             //   - pure binding target → absent from scratch after clone_from
             //     (not pre-seeded); resolve_bindings_into inserts the fresh
             //     computed value → correct recomputation each iteration.
-            //   - contested target → removed above; resolve_bindings_into
+            //   - contested_decision_first target → removed above; resolve_bindings_into
             //     inserts the decision-dependent value → list-order priority
-            //     restored.
+            //     restored for targets whose first occurrence is decision-dependent.
             //
             // resolve_bindings_into does not return a value — errors are absorbed
             // internally (division-by-zero or missing variables are warned and
@@ -1198,6 +1245,163 @@ mod tests {
         assert_eq!(
             sol.objective_value, 100.0,
             "sole fixed binding T=100 must be resolved correctly; expected 100, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (Scenario A): when a contested target T equals a fixed_params
+    /// key, the fixed_param value must win — the decision-dependent binding must
+    /// NOT overwrite it.
+    ///
+    /// Setup:
+    ///   fixed_params: x = 99.0
+    ///   decision variable: y ∈ {1, 2, 3}
+    ///   binding (first):  x = 50           (fixed literal — listed first)
+    ///   binding (second): x = y + 100      (decision-dependent — listed second)
+    ///   objective: x                       (minimize)
+    ///
+    /// Expected: feasible=true, objective=99.0, assignments\["x"\]=99.0.
+    /// Buggy behaviour (old patch): scratch.remove("x") deleted the fixed_param
+    /// value; decision binding wrote x = y+100 = 101..103.
+    #[test]
+    fn contested_target_equals_fixed_param_uses_fixed_param_value() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("x"),
+            expr: Expr::constant(50.0),
+            description: "x = 50".into(),
+            source: "test".into(),
+        };
+        let binding_decision = VariableBinding {
+            target: var("x"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+            description: "x = y + 100".into(),
+            source: "test".into(),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 99.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding_fixed, binding_decision],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.objective_value, 99.0,
+            "fixed_param x=99 must win over contested bindings; expected 99, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (Scenario B): when a contested target T equals a decision
+    /// variable name, the decision variable's own domain value must win — the
+    /// binding must NOT overwrite the slot value.
+    ///
+    /// Setup:
+    ///   decision variables: x ∈ {1, 2, 3},  y ∈ {1, 2, 3}
+    ///   binding (first):  x = 50            (fixed literal — listed first)
+    ///   binding (second): x = y + 100       (decision-dependent — listed second)
+    ///   objective: x                        (minimize)
+    ///
+    /// Expected: feasible=true, objective=1.0, assignments\["x"\]=1.0 (NOT 101+).
+    /// Buggy behaviour (old patch): scratch.remove("x") deleted the decision
+    /// slot value; decision binding wrote x = y+100.
+    #[test]
+    fn contested_target_equals_decision_var_uses_decision_value() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("x"),
+            expr: Expr::constant(50.0),
+            description: "x = 50".into(),
+            source: "test".into(),
+        };
+        let binding_decision = VariableBinding {
+            target: var("x"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+            description: "x = y + 100".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0]), dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_fixed, binding_decision],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.assignments[&var("x")],
+            1.0,
+            "decision variable x must keep its domain value; expected x=1, got {}",
+            sol.assignments[&var("x")]
+        );
+        assert_eq!(
+            sol.objective_value, 1.0,
+            "objective must be decision x=1, not binding result; expected 1, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (Scenario C): when the SAME target T appears in both a fixed
+    /// binding and a decision-dependent binding, and the FIXED binding is listed
+    /// FIRST, the fixed value must win — list-order priority must not be reversed.
+    ///
+    /// Setup:
+    ///   decision variable: y ∈ {1, 2, 3}
+    ///   binding (first):  T = 100          (fixed literal — listed first)
+    ///   binding (second): T = y + 0        (decision-dependent — listed second)
+    ///   objective: T                       (minimize)
+    ///
+    /// Expected: feasible=true, objective=100.0.
+    /// Buggy behaviour (old patch): scratch.remove(T) stripped the pre-seeded
+    /// value for every contested target, so the decision binding always won
+    /// regardless of order → objective=1 instead of 100.
+    #[test]
+    fn binding_order_fixed_wins_over_decision_dependent_when_listed_first() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("T"),
+            expr: Expr::constant(100.0),
+            description: "T = 100".into(),
+            source: "test".into(),
+        };
+        let binding_decision = VariableBinding {
+            target: var("T"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(0.0)]),
+            description: "T = y + 0".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("T"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            // Fixed binding listed first → fixed value must win.
+            bindings: vec![binding_fixed, binding_decision],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.objective_value, 100.0,
+            "fixed binding (T = 100) listed first must win over decision binding (T = y+0); \
+             expected T=100, got {}",
             sol.objective_value
         );
     }
