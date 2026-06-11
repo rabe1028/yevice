@@ -286,15 +286,23 @@ impl Solver for EnumerationSolver {
             // decision-dependent binding, and that are neither a fixed_param key
             // nor a decision variable name.
             //
-            // After clone_from, scratch already holds the fixed-resolved value
-            // for these targets (written during pre-loop base construction).
-            // Removing them here lets resolve_bindings_into recompute the
-            // decision-dependent expression, so the decision-dependent binding
-            // wins — preserving the original list-order "first resolvable wins"
-            // semantics.
+            // Contested-first decision-dep binding gets priority if resolvable;
+            // otherwise the fallback fixed binding wins. This preserves OLD
+            // list-order "first resolvable wins" semantics exactly.
             //
             // Targets excluded from this set (fixed_param keys and decision
             // variable names) are left intact in scratch so their values win.
+
+            // Save fixed-binding values for contested-first targets so we can fall
+            // back to them if the decision-dependent binding fails to resolve.
+            // This restores OLD single-pass "first resolvable wins" semantics:
+            // if the list-first (decision-dep) binding is unresolvable for this
+            // assignment, the next resolvable binding (the fixed fallback) wins.
+            let contested_fallback: Vec<(VariableName, f64)> = contested_decision_first
+                .iter()
+                .filter_map(|t| scratch.get(*t).map(|v| ((*t).clone(), *v)))
+                .collect();
+
             for t in &contested_decision_first {
                 scratch.remove(*t);
             }
@@ -321,6 +329,12 @@ impl Solver for EnumerationSolver {
             // internally (division-by-zero or missing variables are warned and
             // the target is left absent, causing infeasibility below).
             resolve_bindings_into(&mut scratch, &decision_bindings);
+
+            // Restore fixed-binding value for any contested-first target whose
+            // decision-dependent binding failed to resolve.
+            for (t, v) in contested_fallback {
+                scratch.entry(t).or_insert(v);
+            }
 
             // Evaluate and check all constraints; skip this combination on any
             // evaluation error (treat as infeasible).
@@ -1402,6 +1416,65 @@ mod tests {
             sol.objective_value, 100.0,
             "fixed binding (T = 100) listed first must win over decision binding (T = y+0); \
              expected T=100, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression: when a contested-first target's decision-dependent binding is
+    /// UNRESOLVABLE (references an undefined variable), the solver must fall back
+    /// to the fixed binding's value rather than leaving the target absent.
+    ///
+    /// Setup:
+    ///   decision variable: x ∈ {1, 2, 3}
+    ///   binding (first):  z = x + missing_param   (decision-dep, UNRESOLVABLE)
+    ///   binding (second): z = 5                   (fixed fallback)
+    ///   objective: z                              (minimize)
+    ///
+    /// OLD single-pass semantics: first resolvable binding wins → z = 5.
+    /// Expected: feasible=true, objective≈5.0, assignments\["z"\] is absent
+    ///   (z is not a decision variable, so it won't be in assignments) but
+    ///   the objective evaluates via scratch to 5.0.
+    /// Buggy behaviour (before this fix): z absent after unresolvable decision
+    ///   binding; objective eval fails; evaluation_failures=3/3, feasible=false.
+    #[test]
+    fn contested_decision_first_falls_back_to_fixed_when_decision_unresolvable() {
+        use yevice_core::cost::VariableBinding;
+
+        // First binding: z = x + missing_param  (decision-dep; missing_param undefined)
+        let binding_unresolvable = VariableBinding {
+            target: var("z"),
+            expr: Expr::sum(vec![Expr::variable("x"), Expr::variable("missing_param")]),
+            description: "z = x + missing_param".into(),
+            source: "test".into(),
+        };
+        // Second binding: z = 5  (fixed literal fallback)
+        let binding_fixed = VariableBinding {
+            target: var("z"),
+            expr: Expr::constant(5.0),
+            description: "z = 5".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("z"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            // Decision-dep binding listed first, fixed fallback listed second.
+            bindings: vec![binding_unresolvable, binding_fixed],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            sol.feasible,
+            "expected feasible: fixed fallback z=5 must apply when decision binding is unresolvable; \
+             got evaluation_failures={}/{}",
+            sol.evaluation_failures, sol.total_combinations,
+        );
+        assert!(
+            (sol.objective_value - 5.0).abs() < 1e-9,
+            "expected objective=5.0 (from fixed fallback z=5), got {}",
             sol.objective_value
         );
     }
