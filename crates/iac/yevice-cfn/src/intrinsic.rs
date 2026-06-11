@@ -276,10 +276,22 @@ fn resolve_select(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<V
     }
 
     let index = resolve_inner(&seq[0], ctx, depth + 1)?;
-    let index = match &index {
-        Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
-        Value::String(s) => s.parse::<usize>().unwrap_or(0),
-        _ => 0,
+    let index: usize = match &index {
+        Value::Number(n) => n.as_u64().ok_or_else(|| {
+            CfnError::IntrinsicError(format!(
+                "!Select index must be a non-negative integer, got {n}"
+            ))
+        })? as usize,
+        Value::String(s) => s.parse::<usize>().map_err(|_| {
+            CfnError::IntrinsicError(format!(
+                "!Select index must be numeric, got \"{s}\" (is the index an unresolved parameter?)"
+            ))
+        })?,
+        other => {
+            return Err(CfnError::IntrinsicError(format!(
+                "!Select index must be a number, got {other:?}"
+            )));
+        }
     };
 
     let list = resolve_inner(&seq[1], ctx, depth + 1)?;
@@ -745,6 +757,63 @@ mod tests {
         ]);
         let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(result, Value::String("hello-world".into()));
+    }
+
+    // --- resolve_select error on bad index (Fix 3) ---
+
+    /// `!Select` with a non-numeric string index must return an error
+    /// containing the offending value, not silently use index 0.
+    #[test]
+    fn test_select_non_numeric_string_index_errors() {
+        let ctx = make_ctx();
+        // Index "abc" is not a valid usize.
+        let val = Value::Sequence(vec![
+            Value::String("abc".into()),
+            Value::Sequence(vec![
+                Value::String("first".into()),
+                Value::String("second".into()),
+            ]),
+        ]);
+        let result = resolve_select(&val, &ctx, 0);
+        assert!(
+            result.is_err(),
+            "expected Err for non-numeric string index, got Ok"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("abc"),
+            "error message must contain the offending value 'abc': {err_msg}"
+        );
+    }
+
+    /// `!Select` with a numeric string index must still resolve correctly.
+    #[test]
+    fn test_select_numeric_string_index_succeeds() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("1".into()),
+            Value::Sequence(vec![
+                Value::String("first".into()),
+                Value::String("second".into()),
+            ]),
+        ]);
+        let result = resolve_select(&val, &ctx, 0).unwrap();
+        assert_eq!(result, Value::String("second".into()));
+    }
+
+    /// `!Select` with a valid Number index must still resolve correctly.
+    #[test]
+    fn test_select_number_index_succeeds() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::Number(serde_yaml_ng::value::Number::from(0_u64)),
+            Value::Sequence(vec![
+                Value::String("first".into()),
+                Value::String("second".into()),
+            ]),
+        ]);
+        let result = resolve_select(&val, &ctx, 0).unwrap();
+        assert_eq!(result, Value::String("first".into()));
     }
 
     // --- Depth guard tests ---

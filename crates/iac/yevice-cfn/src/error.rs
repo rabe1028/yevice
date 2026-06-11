@@ -24,6 +24,9 @@ pub enum CfnError {
     #[error("condition not found: {0}")]
     ConditionNotFound(String),
 
+    #[error("Parameters: [{0}] must have values")]
+    MissingParameters(String),
+
     #[error("unsupported resource type: {0}")]
     UnsupportedResourceType(String),
 

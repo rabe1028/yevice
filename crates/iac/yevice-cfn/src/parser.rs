@@ -247,6 +247,18 @@ pub fn resolve_template(
         }
     }
 
+    // Validate that every declared parameter without a Default was supplied.
+    let mut missing: Vec<String> = template
+        .parameters
+        .iter()
+        .filter(|(name, def)| def.default.is_none() && !param_values.contains_key(*name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(CfnError::MissingParameters(missing.join(", ")));
+    }
+
     // Evaluate conditions
     let conditions =
         evaluate_conditions(&template.conditions, &effective_params, &template.mappings);
@@ -312,8 +324,12 @@ fn evaluate_condition(value: &Value, ctx: &ConditionContext) -> bool {
                     if let Some(seq) = tagged.value.as_sequence()
                         && seq.len() == 2
                     {
-                        let a = resolve_condition_value(&seq[0], ctx);
-                        let b = resolve_condition_value(&seq[1], ctx);
+                        let Ok(a) = resolve_condition_value(&seq[0], ctx) else {
+                            return false;
+                        };
+                        let Ok(b) = resolve_condition_value(&seq[1], ctx) else {
+                            return false;
+                        };
                         return a == b;
                     }
                     false
@@ -346,8 +362,12 @@ fn evaluate_condition(value: &Value, ctx: &ConditionContext) -> bool {
                 && let Some(seq) = seq.as_sequence()
                 && seq.len() == 2
             {
-                let a = resolve_condition_value(&seq[0], ctx);
-                let b = resolve_condition_value(&seq[1], ctx);
+                let Ok(a) = resolve_condition_value(&seq[0], ctx) else {
+                    return false;
+                };
+                let Ok(b) = resolve_condition_value(&seq[1], ctx) else {
+                    return false;
+                };
                 return a == b;
             }
             false
@@ -356,64 +376,90 @@ fn evaluate_condition(value: &Value, ctx: &ConditionContext) -> bool {
     }
 }
 
-fn resolve_condition_value(value: &Value, ctx: &ConditionContext) -> String {
+fn resolve_condition_value(value: &Value, ctx: &ConditionContext) -> Result<String, CfnError> {
     match value {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
         Value::Tagged(tagged) => {
             let tag = tagged.tag.to_string();
             match tag.as_str() {
                 "!Ref" => {
                     if let Some(name) = tagged.value.as_str() {
-                        return ctx.params.get(name).cloned().unwrap_or_default();
+                        return ctx
+                            .params
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| CfnError::ParameterNotFound(name.to_string()));
                     }
-                    String::new()
+                    Err(CfnError::IntrinsicError(
+                        "!Ref in condition must reference a string name".into(),
+                    ))
                 }
                 "!FindInMap" => {
                     if let Some(seq) = tagged.value.as_sequence()
                         && seq.len() == 3
                     {
-                        let map_name = resolve_condition_value(&seq[0], ctx);
-                        let first_key = resolve_condition_value(&seq[1], ctx);
-                        let second_key = resolve_condition_value(&seq[2], ctx);
+                        let map_name = resolve_condition_value(&seq[0], ctx)?;
+                        let first_key = resolve_condition_value(&seq[1], ctx)?;
+                        let second_key = resolve_condition_value(&seq[2], ctx)?;
                         return ctx
                             .mappings
                             .get(&map_name)
                             .and_then(|m| m.get(&first_key))
                             .and_then(|m| m.get(&second_key))
                             .cloned()
-                            .unwrap_or_default();
+                            .ok_or_else(|| CfnError::MappingNotFound {
+                                map_name: map_name.clone(),
+                                first_key: first_key.clone(),
+                                second_key: second_key.clone(),
+                            });
                     }
-                    String::new()
+                    Err(CfnError::IntrinsicError(
+                        "!FindInMap in condition must have exactly 3 elements".into(),
+                    ))
                 }
-                _ => String::new(),
+                _ => Err(CfnError::IntrinsicError(format!(
+                    "unsupported intrinsic {tag} in condition value"
+                ))),
             }
         }
         Value::Mapping(map) => {
             if let Some(name) = map.get(Value::String("Ref".into()))
                 && let Some(name) = name.as_str()
             {
-                return ctx.params.get(name).cloned().unwrap_or_default();
+                return ctx
+                    .params
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| CfnError::ParameterNotFound(name.to_string()));
             }
             if let Some(seq) = map.get(Value::String("Fn::FindInMap".into()))
                 && let Some(seq) = seq.as_sequence()
                 && seq.len() == 3
             {
-                let map_name = resolve_condition_value(&seq[0], ctx);
-                let first_key = resolve_condition_value(&seq[1], ctx);
-                let second_key = resolve_condition_value(&seq[2], ctx);
+                let map_name = resolve_condition_value(&seq[0], ctx)?;
+                let first_key = resolve_condition_value(&seq[1], ctx)?;
+                let second_key = resolve_condition_value(&seq[2], ctx)?;
                 return ctx
                     .mappings
                     .get(&map_name)
                     .and_then(|m| m.get(&first_key))
                     .and_then(|m| m.get(&second_key))
                     .cloned()
-                    .unwrap_or_default();
+                    .ok_or_else(|| CfnError::MappingNotFound {
+                        map_name: map_name.clone(),
+                        first_key: first_key.clone(),
+                        second_key: second_key.clone(),
+                    });
             }
-            String::new()
+            Err(CfnError::IntrinsicError(
+                "unsupported mapping form in condition value".into(),
+            ))
         }
-        _ => String::new(),
+        _ => Err(CfnError::IntrinsicError(
+            "unsupported value type in condition".into(),
+        )),
     }
 }
 
@@ -810,5 +856,66 @@ Resources:
         let resources = resolve_template(&tmpl, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(resources.len(), 2);
         assert_eq!(resources["TableA"].resource_type, "AWS::DynamoDB::Table");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: Required-parameter validation
+    // -----------------------------------------------------------------------
+
+    /// A template with a parameter that has no Default and is not supplied
+    /// must return MissingParameters containing the parameter name.
+    #[test]
+    fn test_resolve_missing_required_parameter_errors() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Env:
+    Type: String
+  InstanceTypeParam:
+    Type: String
+Resources:
+  MyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeParam
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let result = resolve_template(&tmpl, &HashMap::new(), &HashMap::new());
+        let err = result
+            .err()
+            .expect("expected Err for missing required parameters");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Env"),
+            "error message must contain parameter name 'Env': {err_msg}"
+        );
+        assert!(
+            err_msg.contains("InstanceTypeParam"),
+            "error message must contain parameter name 'InstanceTypeParam': {err_msg}"
+        );
+    }
+
+    /// A template with a parameter that has no Default but IS supplied must succeed.
+    #[test]
+    fn test_resolve_supplied_required_parameter_succeeds() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Env:
+    Type: String
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-bucket"
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let mut params = HashMap::new();
+        params.insert("Env".to_string(), "prod".to_string());
+        let result = resolve_template(&tmpl, &params, &HashMap::new());
+        assert!(
+            result.is_ok(),
+            "expected Ok when required parameter is supplied"
+        );
     }
 }

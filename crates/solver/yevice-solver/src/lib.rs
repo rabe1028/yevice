@@ -34,6 +34,17 @@ pub struct Solution {
     pub objective_value: f64,
     /// True iff at least one feasible assignment was found.
     pub feasible: bool,
+    /// Number of combinations that were skipped because objective evaluation
+    /// returned an error (e.g. division by zero, undefined variable).  When
+    /// this equals `total_combinations` and `feasible` is false, all
+    /// combinations failed to evaluate rather than genuinely being infeasible.
+    pub evaluation_failures: u64,
+    /// Total number of combinations in the Cartesian product of all decision
+    /// variable domains.  Zero when the solver returned early (empty domain).
+    pub total_combinations: u64,
+    /// The formatted error message from the first objective-evaluation failure,
+    /// if any occurred.
+    pub first_evaluation_error: Option<String>,
 }
 
 /// Interface for optimization backends.
@@ -79,6 +90,9 @@ impl Solver for EnumerationSolver {
                 assignments: HashMap::new(),
                 objective_value: f64::NAN,
                 feasible: false,
+                evaluation_failures: 0,
+                total_combinations: 0,
+                first_evaluation_error: None,
             });
         }
 
@@ -184,6 +198,8 @@ impl Solver for EnumerationSolver {
         let mut scratch = base.clone();
 
         let mut best: Option<Solution> = None;
+        let mut evaluation_failures: u64 = 0;
+        let mut first_evaluation_error: Option<String> = None;
 
         for i in 0..combination_count {
             // Restore scratch to the fixed base state (reuses existing allocation).
@@ -232,7 +248,13 @@ impl Solver for EnumerationSolver {
             // Evaluate the objective; skip on error.
             let obj = match evaluate::evaluate(&problem.objective, &scratch) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    evaluation_failures += 1;
+                    if first_evaluation_error.is_none() {
+                        first_evaluation_error = Some(format!("{e}"));
+                    }
+                    continue;
+                }
             };
 
             let better = match &best {
@@ -262,15 +284,31 @@ impl Solver for EnumerationSolver {
                     assignments,
                     objective_value: obj,
                     feasible: true,
+                    // Diagnostic counters are finalized after the loop; these
+                    // placeholder values are overwritten before the function returns.
+                    evaluation_failures: 0,
+                    total_combinations: combination_count,
+                    first_evaluation_error: None,
                 });
             }
         }
 
-        Ok(best.unwrap_or(Solution {
-            assignments: HashMap::new(),
-            objective_value: f64::NAN,
-            feasible: false,
-        }))
+        // Finalize diagnostic counters now that the full loop is complete.
+        Ok(match best {
+            Some(mut sol) => {
+                sol.evaluation_failures = evaluation_failures;
+                sol.first_evaluation_error = first_evaluation_error;
+                sol
+            }
+            None => Solution {
+                assignments: HashMap::new(),
+                objective_value: f64::NAN,
+                feasible: false,
+                evaluation_failures,
+                total_combinations: combination_count,
+                first_evaluation_error,
+            },
+        })
     }
 }
 
@@ -1043,8 +1081,8 @@ mod tests {
     fn max_combinations_boundary_exact_ok() {
         // 1000 * 1000 = 1_000_000 = MAX_COMBINATIONS → must not error.
         let dvs = vec![
-            dv("x", (0..1000).map(|i| f64::from(i)).collect()),
-            dv("y", (0..1000).map(|i| f64::from(i)).collect()),
+            dv("x", (0..1000).map(f64::from).collect()),
+            dv("y", (0..1000).map(f64::from).collect()),
         ];
 
         let problem = problem_with(
@@ -1149,6 +1187,50 @@ mod tests {
             (sol.objective_value - (-10.0)).abs() < 1e-9,
             "expected objective=-10, got {}",
             sol.objective_value
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic field tests (Fix 3)
+    // -----------------------------------------------------------------------
+
+    /// When the objective references an undefined variable for every combination,
+    /// all evaluations fail.  The solver must return:
+    ///   - feasible = false
+    ///   - evaluation_failures == total_combinations
+    ///   - first_evaluation_error = Some(..)
+    ///
+    /// This distinguishes "all evaluations errored" from genuine infeasibility.
+    #[test]
+    fn all_evaluations_fail_reports_diagnostic_fields() {
+        // objective = undefined_var  (not in domain or fixed_params)
+        // domain x ∈ {1.0, 2.0, 3.0} → 3 combinations, all fail to evaluate
+        let problem = problem_with(
+            Expr::variable("undefined_var"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![],
+            HashMap::new(),
+        );
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            !sol.feasible,
+            "expected infeasible when all objective evaluations fail"
+        );
+        assert_eq!(
+            sol.evaluation_failures, 3,
+            "expected 3 evaluation failures (one per combination), got {}",
+            sol.evaluation_failures
+        );
+        assert_eq!(
+            sol.total_combinations, 3,
+            "expected total_combinations=3, got {}",
+            sol.total_combinations
+        );
+        assert!(
+            sol.first_evaluation_error.is_some(),
+            "expected first_evaluation_error to be Some(..) when all evaluations fail"
         );
     }
 }
