@@ -1212,7 +1212,7 @@ const MAX_PRICING_BODY_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 fn download_pricing(url: &str) -> Result<Vec<u8>> {
     let mut response = ureq::get(url)
         .config()
-        .timeout_global(Some(Duration::from_secs(30)))
+        .timeout_global(Some(Duration::from_secs(300)))
         .build()
         .call()
         .context("HTTP request failed")?;
