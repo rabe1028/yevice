@@ -24,6 +24,45 @@ fn file_registry_uses_loaded_lambda_prices_instead_of_fallback_defaults() {
     assert_close(price.free_tier_gb_seconds, 400_000.0);
 }
 
+/// The fixture rds.json contains a "Database Storage" SKU with
+/// `volumeType = "General Purpose-GP3"` and price $0.1300, and a
+/// "System Operation" SKU with `group = "RDS-GP3-IOPS"` and price $0.0090.
+/// Both prices differ from the hardcoded ap-northeast-1 constants
+/// (0.1216 and 0.008), so if the file-backed lookup falls back to hardcoded
+/// values the assertions will fail.
+#[test]
+fn file_registry_returns_gp3_prices_from_rds_json_not_hardcoded_fallback() {
+    let registry = FilePricingRegistry::load("us-east-1", fixture_dir());
+
+    let storage_price = registry.rds_gp3_storage_price();
+    assert_close(storage_price, 0.1300);
+
+    let iops_price = registry.rds_gp3_iops_price();
+    assert_close(iops_price, 0.0090);
+}
+
+/// The fixture rds.json deliberately includes both Single-AZ ($0.1300, $0.0090)
+/// and Multi-AZ ($0.2600, $0.0180) GP3 rows.  The lookup must select the
+/// Single-AZ row so that RdsService can apply az_mult externally.
+#[test]
+fn file_registry_gp3_lookup_selects_single_az_row_not_multi_az() {
+    let registry = FilePricingRegistry::load("us-east-1", fixture_dir());
+
+    let storage_price = registry.rds_gp3_storage_price();
+    assert_close(storage_price, 0.1300);
+    assert!(
+        (storage_price - 0.2600).abs() > 1e-6,
+        "must not return the Multi-AZ storage price ($0.2600)"
+    );
+
+    let iops_price = registry.rds_gp3_iops_price();
+    assert_close(iops_price, 0.0090);
+    assert!(
+        (iops_price - 0.0180).abs() > 1e-6,
+        "must not return the Multi-AZ IOPS price ($0.0180)"
+    );
+}
+
 #[test]
 fn file_registry_maps_rds_engine_aliases_to_bulk_api_database_engine_names() {
     let registry = FilePricingRegistry::load("ap-northeast-1", fixture_dir());

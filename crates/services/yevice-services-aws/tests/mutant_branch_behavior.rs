@@ -43,6 +43,9 @@ impl PriceCatalog for BranchCatalog {
             "aws.batch.ebs_gp3_throughput_mibps_month_price" => 6.7,
             "aws.batch.ebs_gp3_throughput_free_mibps" => 19.0,
             sku if sku.starts_with("aws.rds_storage.") => 8.9,
+            // gp3 exact-match arms must precede the aws.rds.* prefix guard.
+            "aws.rds.gp3_storage_gb_month" => 0.1216,
+            "aws.rds.gp3_iops_month" => 0.008,
             sku if sku.starts_with("aws.rds.") => 2.7,
             other => {
                 return Err(PricingError::NotFound {

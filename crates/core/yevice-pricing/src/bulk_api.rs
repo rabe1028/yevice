@@ -169,6 +169,27 @@ pub fn find_entries<'a>(
         .collect()
 }
 
+/// Lookup helper: find pricing entries matching both a `product_family` value
+/// and a set of attribute filters.
+///
+/// `productFamily` is a top-level field on `PricingEntry` (not stored inside
+/// `attributes`), so it cannot be matched by [`find_entries`] alone.
+pub fn find_entries_by_family<'a>(
+    entries: &'a [PricingEntry],
+    product_family: &str,
+    filters: &[(&str, &str)],
+) -> Vec<&'a PricingEntry> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.product_family == product_family
+                && filters
+                    .iter()
+                    .all(|(key, value)| e.attributes.get(*key).is_some_and(|v| v == *value))
+        })
+        .collect()
+}
+
 /// Get the first non-zero USD price from an entry's dimensions.
 pub fn first_price(entry: &PricingEntry) -> Option<f64> {
     entry
