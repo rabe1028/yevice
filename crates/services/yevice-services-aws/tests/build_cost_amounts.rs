@@ -4,8 +4,6 @@
 //! round-number test prices and explicit variable bindings, so that mutations
 //! to the cost arithmetic (e.g. `*` -> `+`, `-` -> `/`) are caught.
 
-use std::collections::HashMap;
-
 use yevice_core::{
     cost::Tier,
     evaluate::{Params, evaluate},
@@ -202,7 +200,7 @@ fn rt(name: &str) -> ResourceType {
 }
 
 fn params<const N: usize>(entries: [(VariableName, f64); N]) -> Params {
-    HashMap::from(entries)
+    entries.into_iter().collect()
 }
 
 // 730 hours per month is the constant used across the hourly cost formulas.

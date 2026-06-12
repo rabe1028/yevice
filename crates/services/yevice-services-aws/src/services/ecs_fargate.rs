@@ -110,7 +110,6 @@ impl Service for EcsFargateService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use yevice_core::evaluate::evaluate;
     use yevice_core::expr::Tier;
     use yevice_pricing::catalog::PriceRecord;
@@ -156,7 +155,7 @@ mod tests {
             .build_cost(&id, &rt, &spec, &pricing)
             .expect("build cost");
 
-        let mut params: HashMap<_, _> = HashMap::new();
+        let mut params = yevice_core::evaluate::Params::default();
         params.insert(id.var("vcpu"), 0.5);
         params.insert(id.var("memory_gb"), 1.0);
         params.insert(id.var("data_transfer_out_gb"), 0.0);

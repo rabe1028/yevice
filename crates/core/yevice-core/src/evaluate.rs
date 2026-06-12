@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::cost::{ArchitectureCost, Expr};
 use crate::error::CoreError;
 use crate::types::{ArchitectureName, LogicalId, ResourceType, VariableName};
 
 /// Parameters for cost evaluation: variable name -> value.
-pub type Params = HashMap<VariableName, f64>;
+pub type Params = FxHashMap<VariableName, f64>;
 
 /// Evaluate a cost expression with the given parameters.
 pub fn evaluate(expr: &Expr, params: &Params) -> Result<f64, CoreError> {
@@ -184,10 +184,20 @@ pub fn resolve_bindings(
     base_params: &Params,
 ) -> Result<Params, CoreError> {
     let mut params = base_params.clone();
+    resolve_bindings_into(&mut params, bindings);
+    Ok(params)
+}
+
+/// In-place variant of [`resolve_bindings`]: resolves bindings directly into
+/// the supplied `params` map without cloning it first.
+///
+/// The fixed-point semantics are identical to [`resolve_bindings`].  Variables
+/// already present in `params` are never overwritten (decision-variable values
+/// and pre-resolved fixed bindings take precedence).
+pub fn resolve_bindings_into(params: &mut Params, bindings: &[crate::cost::VariableBinding]) {
     // Targets whose expression can never evaluate (e.g. division by zero), as
     // distinct from those merely waiting on a not-yet-resolved variable.
-    let mut unresolvable: std::collections::HashSet<VariableName> =
-        std::collections::HashSet::new();
+    let mut unresolvable: FxHashSet<VariableName> = FxHashSet::default();
 
     let max_passes = bindings.len() + 1;
     for _ in 0..max_passes {
@@ -196,7 +206,7 @@ pub fn resolve_bindings(
             if params.contains_key(&binding.target) || unresolvable.contains(&binding.target) {
                 continue;
             }
-            match evaluate(&binding.expr, &params) {
+            match evaluate(&binding.expr, params) {
                 Ok(value) => {
                     params.insert(binding.target.clone(), value);
                     progressed = true;
@@ -228,8 +238,6 @@ pub fn resolve_bindings(
             );
         }
     }
-
-    Ok(params)
 }
 
 #[cfg(test)]
@@ -248,7 +256,7 @@ mod tests {
     #[test]
     fn test_div_by_zero_returns_err() {
         let expr = Expr::div(Expr::constant(10.0), Expr::constant(0.0));
-        let result = evaluate(&expr, &Params::new());
+        let result = evaluate(&expr, &Params::default());
         assert!(
             matches!(result, Err(CoreError::DivisionByZero)),
             "expected DivisionByZero error, got {result:?}"
@@ -258,13 +266,13 @@ mod tests {
     #[test]
     fn test_div_nonzero() {
         let expr = Expr::div(Expr::constant(10.0), Expr::constant(2.0));
-        assert_eq!(evaluate(&expr, &Params::new()).unwrap(), 5.0);
+        assert_eq!(evaluate(&expr, &Params::default()).unwrap(), 5.0);
     }
 
     #[test]
     fn test_constant() {
         let expr = Expr::constant(42.0);
-        assert_eq!(evaluate(&expr, &Params::new()).unwrap(), 42.0);
+        assert_eq!(evaluate(&expr, &Params::default()).unwrap(), 42.0);
     }
 
     #[test]
@@ -277,7 +285,7 @@ mod tests {
     #[test]
     fn test_undefined_variable() {
         let expr = Expr::variable("x");
-        assert!(evaluate(&expr, &Params::new()).is_err());
+        assert!(evaluate(&expr, &Params::default()).is_err());
     }
 
     #[test]
@@ -418,7 +426,7 @@ mod tests {
             description: String::new(),
             source: String::new(),
         }];
-        let base = Params::new();
+        let base = Params::default();
         let resolved = resolve_bindings(&bindings, &base).unwrap();
         // Unresolvable binding stays unset, but the function returns Ok.
         assert!(!resolved.contains_key(&var("Derived")));

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use yevice_core::{
     capacity::{QuotaType, Quotas, Severity},
     evaluate::{Params, evaluate},
@@ -76,7 +74,7 @@ fn rt(name: &str) -> ResourceType {
 }
 
 fn params<const N: usize>(entries: [(VariableName, f64); N]) -> Params {
-    HashMap::from(entries)
+    entries.into_iter().collect()
 }
 
 fn test_quotas() -> Quotas {
@@ -254,7 +252,7 @@ fn dynamodb_capacity_covers_empty_provisioned_on_demand_and_quota_boundary() {
             .find(|constraint| constraint.dimension == "wcu_quota");
         assert_eq!(warning.is_some(), expect_warning);
         if let Some(warning) = warning {
-            approx_expr(&warning.required, &Params::new(), wcu);
+            approx_expr(&warning.required, &Params::default(), wcu);
             assert_eq!(warning.limit, 100.0);
             assert_eq!(warning.severity, Severity::Warning);
         }
@@ -353,7 +351,7 @@ fn kinesis_capacity_covers_non_provisioned_missing_count_and_quota_boundary() {
             .find(|constraint| constraint.dimension == "shard_quota");
         assert_eq!(warning.is_some(), expect_warning);
         if let Some(warning) = warning {
-            approx_expr(&warning.required, &Params::new(), shard_count);
+            approx_expr(&warning.required, &Params::default(), shard_count);
             assert_eq!(warning.limit, 50.0);
             assert_eq!(warning.severity, Severity::Warning);
         }
@@ -419,8 +417,12 @@ fn rds_storage_formulas_cover_gp3_boundary_and_other_storage_arms() {
                 &BranchCatalog,
             )
             .expect("build cost");
-        approx_expr(&cost.components[0].expr, &Params::new(), 1971.0);
-        approx_expr(&cost.components[1].expr, &Params::new(), expected_storage);
+        approx_expr(&cost.components[0].expr, &Params::default(), 1971.0);
+        approx_expr(
+            &cost.components[1].expr,
+            &Params::default(),
+            expected_storage,
+        );
     }
 
     // multi_az: true -> storage is billed on both primary and standby (x2):
@@ -442,8 +444,12 @@ fn rds_storage_formulas_cover_gp3_boundary_and_other_storage_arms() {
                 &BranchCatalog,
             )
             .expect("build cost");
-        approx_expr(&cost.components[0].expr, &Params::new(), 3942.0);
-        approx_expr(&cost.components[1].expr, &Params::new(), expected_storage);
+        approx_expr(&cost.components[0].expr, &Params::default(), 3942.0);
+        approx_expr(
+            &cost.components[1].expr,
+            &Params::default(),
+            expected_storage,
+        );
     }
 
     let gp2 = RdsService
@@ -461,5 +467,5 @@ fn rds_storage_formulas_cover_gp3_boundary_and_other_storage_arms() {
             &BranchCatalog,
         )
         .expect("build cost");
-    approx_expr(&gp2.components[1].expr, &Params::new(), 97.9);
+    approx_expr(&gp2.components[1].expr, &Params::default(), 97.9);
 }

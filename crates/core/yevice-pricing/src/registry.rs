@@ -89,10 +89,10 @@ impl PricingRegistry {
     /// Lambda pricing for ap-northeast-1.
     pub fn lambda_price(&self) -> LambdaPrice {
         LambdaPrice {
-            request_price: 0.0000002,        // $0.20 per 1M requests
-            gb_second_price: 0.0000166667,   // per GB-second
-            free_tier_requests: 1_000_000.0, // 1M free requests/month
-            free_tier_gb_seconds: 400_000.0, // 400K GB-seconds/month
+            request_price: Self::LAMBDA_REQUEST_PRICE, // $0.20 per 1M requests
+            gb_second_price: Self::LAMBDA_GB_SECOND_PRICE, // per GB-second
+            free_tier_requests: 1_000_000.0,           // 1M free requests/month
+            free_tier_gb_seconds: 400_000.0,           // 400K GB-seconds/month
         }
     }
 
@@ -166,16 +166,16 @@ impl PricingRegistry {
     pub fn dynamodb_price(&self) -> DynamoDbPrice {
         DynamoDbPrice {
             // On-Demand (PAY_PER_REQUEST)
-            write_request_price: 0.000000715, // per WRU ($1.4269 per million)
-            read_request_price: 0.000000143,  // per RRU ($0.2854 per million)
+            write_request_price: Self::DYNAMODB_WRITE_REQUEST_PRICE, // per WRU ($1.4269 per million)
+            read_request_price: Self::DYNAMODB_READ_REQUEST_PRICE, // per RRU ($0.2854 per million)
             // Provisioned
             wcu_hour_price: 0.000742, // $0.000742 per WCU-hour ($0.5417 per WCU-month)
             rcu_hour_price: 0.0001484, // $0.0001484 per RCU-hour ($0.1083 per RCU-month)
             // Common
-            storage_price_per_gb: 0.285, // per GB-month
-            free_tier_wru: 25_000.0,     // 25K WCU (equivalent)
-            free_tier_rru: 25_000.0,     // 25K RCU (equivalent)
-            free_tier_storage_gb: 25.0,  // 25 GB
+            storage_price_per_gb: Self::DYNAMODB_STORAGE_PRICE, // per GB-month
+            free_tier_wru: 25_000.0,                            // 25K WCU (equivalent)
+            free_tier_rru: 25_000.0,                            // 25K RCU (equivalent)
+            free_tier_storage_gb: 25.0,                         // 25 GB
         }
     }
 
@@ -195,12 +195,36 @@ impl PricingRegistry {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Canonical fallback constants shared with FilePricingRegistry.
+    // These are the single source of truth; file_registry.rs references these
+    // when a downloaded pricing file loads successfully but the expected group
+    // attribute is missing or yields no price.
+    // ---------------------------------------------------------------------------
+
+    /// Lambda: per-request price fallback (matches `lambda_price`).
+    pub(crate) const LAMBDA_REQUEST_PRICE: f64 = 0.0000002;
+    /// Lambda: per-GB-second price fallback (matches `lambda_price`).
+    pub(crate) const LAMBDA_GB_SECOND_PRICE: f64 = 0.0000166667;
+
+    /// DynamoDB on-demand: per-WRU price fallback (matches `dynamodb_price`).
+    pub(crate) const DYNAMODB_WRITE_REQUEST_PRICE: f64 = 0.000000715;
+    /// DynamoDB on-demand: per-RRU price fallback (matches `dynamodb_price`).
+    pub(crate) const DYNAMODB_READ_REQUEST_PRICE: f64 = 0.000000143;
+    /// DynamoDB: storage per-GB-month price fallback (matches `dynamodb_price`).
+    pub(crate) const DYNAMODB_STORAGE_PRICE: f64 = 0.285;
+
+    /// Kinesis: shard-hour price fallback (matches `kinesis_price`).
+    pub(crate) const KINESIS_SHARD_HOUR_PRICE: f64 = 0.0195;
+    /// Kinesis: PUT-payload-unit price fallback (matches `kinesis_price`).
+    pub(crate) const KINESIS_PUT_PAYLOAD_UNIT_PRICE: f64 = 0.0000002;
+
     /// Kinesis Data Streams pricing for ap-northeast-1.
     pub fn kinesis_price(&self) -> KinesisPrice {
         KinesisPrice {
             // Provisioned mode
-            shard_hour_price: 0.0195,          // per shard hour
-            put_payload_unit_price: 0.0000002, // per 25KB payload unit
+            shard_hour_price: Self::KINESIS_SHARD_HOUR_PRICE,
+            put_payload_unit_price: Self::KINESIS_PUT_PAYLOAD_UNIT_PRICE,
             // On-Demand mode
             on_demand_ingestion_price_per_gb: 0.098, // $0.098 per GB
             on_demand_retrieval_price_per_gb: 0.034, // $0.034 per GB

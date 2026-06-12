@@ -22,10 +22,17 @@ allow = [
   "Zlib",
 ]
 confidence-threshold = 0.93
+# BSD-2-Clause / CC0-1.0 / MPL-2.0 / Unicode-DFS-2016 は現在の依存グラフには
+# 出現しないが、将来の依存追加に備えて許可リストに残す。
+# unused-allowed-license = "allow" で「未使用許可」警告を抑制する。
+unused-allowed-license = "allow"
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# windows-sys は ring/rustls 系(v0.52)と clap/comfy-table/tracing-subscriber 系(v0.61)から
+# 推移的に引き込まれており、直接依存ではないため解決不能。意図的に重複を許容する。
+skip = [{ crate = "windows-sys" }]
 
 [sources]
 unknown-registry = "deny"

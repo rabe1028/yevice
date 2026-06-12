@@ -4,6 +4,7 @@ use std::{
 };
 
 use hcl::{Body, Structure};
+use yevice_core::io::read_to_string_capped;
 
 use crate::error::TfError;
 
@@ -102,8 +103,14 @@ pub fn parse_tf_dir(dir: &Path) -> Result<TfConfig, TfError> {
     tf_files.sort();
 
     for path in tf_files {
-        let content = std::fs::read_to_string(&path)?;
-        let body: Body = hcl::parse(&content)?;
+        let content = read_to_string_capped(&path).map_err(|e| {
+            TfError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", path.display()),
+            ))
+        })?;
+        let body: Body = hcl::parse(&content)
+            .map_err(|e| TfError::ParseError(format!("{}: {e}", path.display())))?;
         parse_body_into(&body, &mut config);
     }
 
@@ -111,7 +118,7 @@ pub fn parse_tf_dir(dir: &Path) -> Result<TfConfig, TfError> {
 }
 
 pub fn parse_tfvars(path: &Path) -> Result<HashMap<String, TfValue>, TfError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_to_string_capped(path)?;
     let body: Body = hcl::parse(&content)?;
     let mut vars = HashMap::new();
 
@@ -284,5 +291,41 @@ pub fn expr_to_tf_value(expr: &hcl::expr::Expression) -> TfValue {
             TfValue::Unknown
         }
         _ => TfValue::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod parse_tf_dir_error_tests {
+    use super::*;
+
+    /// A directory containing a syntactically broken `.tf` file must return an
+    /// error whose message contains the filename of the broken file.
+    #[test]
+    fn broken_tf_file_error_contains_filename() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock drift")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("yevice-tf-parser-test-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let broken_path = dir.join("broken_syntax.tf");
+        std::fs::write(
+            &broken_path,
+            b"resource \"aws_instance\" \"web\" {\n  !!invalid\n}\n",
+        )
+        .unwrap();
+
+        let result = parse_tf_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = result.expect_err("broken .tf file must produce an error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("broken_syntax.tf"),
+            "error message must contain the filename 'broken_syntax.tf'; got: {err_msg}"
+        );
     }
 }

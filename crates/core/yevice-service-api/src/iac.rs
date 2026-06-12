@@ -63,7 +63,18 @@ impl RawCfnResource {
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         match self.properties.get(key)? {
             Value::Number(n) => n.as_f64(),
-            Value::String(s) => s.parse::<f64>().ok(),
+            Value::String(s) => {
+                if s.starts_with("{{ref:") || s.starts_with("{{getatt:") {
+                    tracing::warn!(
+                        value = %s,
+                        key = %key,
+                        "unresolved CloudFormation reference {} where a number was expected; treating as absent",
+                        s
+                    );
+                    return None;
+                }
+                s.parse::<f64>().ok()
+            }
             _ => None,
         }
     }
@@ -72,11 +83,22 @@ impl RawCfnResource {
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         match self.properties.get(key)? {
             Value::Bool(b) => Some(*b),
-            Value::String(s) => match s.to_lowercase().as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
+            Value::String(s) => {
+                if s.starts_with("{{ref:") || s.starts_with("{{getatt:") {
+                    tracing::warn!(
+                        value = %s,
+                        key = %key,
+                        "unresolved CloudFormation reference {} where a boolean was expected; treating as absent",
+                        s
+                    );
+                    return None;
+                }
+                match s.to_lowercase().as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }

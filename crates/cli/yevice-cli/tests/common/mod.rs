@@ -4,7 +4,7 @@
 //! binary uses every helper, so suppress dead-code warnings for the unused ones.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use yevice_cfn::{convert, parser};
@@ -23,7 +23,7 @@ pub fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-pub fn load_fixture(name: &str) -> HashMap<String, parser::CfnResource> {
+pub fn load_fixture(name: &str) -> BTreeMap<String, parser::CfnResource> {
     let path = fixtures_dir().join(name);
     let tmpl = parser::parse_template(path.as_ref()).unwrap();
     parser::resolve_template(&tmpl, &HashMap::new(), &HashMap::new()).unwrap()
@@ -31,7 +31,7 @@ pub fn load_fixture(name: &str) -> HashMap<String, parser::CfnResource> {
 
 pub fn build_arch(
     name: &str,
-    resources: &HashMap<String, parser::CfnResource>,
+    resources: &BTreeMap<String, parser::CfnResource>,
     strict: bool,
 ) -> ArchitectureCost {
     let tmpl = parser::CfnTemplate {

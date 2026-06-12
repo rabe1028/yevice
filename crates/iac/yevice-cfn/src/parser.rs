@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_yaml_ng::Value;
+use yevice_core::io::read_to_string_capped;
 
 use crate::error::CfnError;
 use crate::intrinsic::{ResolveContext, resolve};
@@ -11,7 +12,7 @@ pub struct CfnTemplate {
     pub parameters: HashMap<String, ParameterDef>,
     pub mappings: HashMap<String, HashMap<String, HashMap<String, String>>>,
     pub conditions: HashMap<String, Value>,
-    pub resources: HashMap<String, CfnResource>,
+    pub resources: BTreeMap<String, CfnResource>,
 }
 
 /// A `CloudFormation` parameter definition.
@@ -36,7 +37,7 @@ pub struct CfnResource {
 
 /// Parse a `CloudFormation` YAML template from a file.
 pub fn parse_template(path: &Path) -> Result<CfnTemplate, CfnError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_to_string_capped(path)?;
     parse_template_str(&content)
 }
 
@@ -176,8 +177,8 @@ fn parse_conditions(root: &serde_yaml_ng::Mapping) -> HashMap<String, Value> {
 
 fn parse_resources(
     root: &serde_yaml_ng::Mapping,
-) -> Result<HashMap<String, CfnResource>, CfnError> {
-    let mut resources = HashMap::new();
+) -> Result<BTreeMap<String, CfnResource>, CfnError> {
+    let mut resources = BTreeMap::new();
 
     let section = root
         .get(Value::String("Resources".into()))
@@ -235,7 +236,7 @@ pub fn resolve_template(
     template: &CfnTemplate,
     param_values: &HashMap<String, String>,
     import_values: &HashMap<String, String>,
-) -> Result<HashMap<String, CfnResource>, CfnError> {
+) -> Result<BTreeMap<String, CfnResource>, CfnError> {
     // Build effective parameters: supplied values override defaults
     let mut effective_params = HashMap::new();
     for (name, def) in &template.parameters {
@@ -246,6 +247,18 @@ pub fn resolve_template(
         }
     }
 
+    // Validate that every declared parameter without a Default was supplied.
+    let mut missing: Vec<String> = template
+        .parameters
+        .iter()
+        .filter(|(name, def)| def.default.is_none() && !param_values.contains_key(*name))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(CfnError::MissingParameters(missing.join(", ")));
+    }
+
     // Evaluate conditions
     let conditions =
         evaluate_conditions(&template.conditions, &effective_params, &template.mappings);
@@ -254,7 +267,7 @@ pub fn resolve_template(
     ctx.mappings.clone_from(&template.mappings);
     ctx.conditions.clone_from(&conditions);
 
-    let mut resolved_resources = HashMap::new();
+    let mut resolved_resources = BTreeMap::new();
     for (id, resource) in &template.resources {
         // Skip resources with a false condition
         if let Some(cond_name) = &resource.condition
@@ -311,8 +324,12 @@ fn evaluate_condition(value: &Value, ctx: &ConditionContext) -> bool {
                     if let Some(seq) = tagged.value.as_sequence()
                         && seq.len() == 2
                     {
-                        let a = resolve_condition_value(&seq[0], ctx);
-                        let b = resolve_condition_value(&seq[1], ctx);
+                        let Ok(a) = resolve_condition_value(&seq[0], ctx) else {
+                            return false;
+                        };
+                        let Ok(b) = resolve_condition_value(&seq[1], ctx) else {
+                            return false;
+                        };
                         return a == b;
                     }
                     false
@@ -345,8 +362,12 @@ fn evaluate_condition(value: &Value, ctx: &ConditionContext) -> bool {
                 && let Some(seq) = seq.as_sequence()
                 && seq.len() == 2
             {
-                let a = resolve_condition_value(&seq[0], ctx);
-                let b = resolve_condition_value(&seq[1], ctx);
+                let Ok(a) = resolve_condition_value(&seq[0], ctx) else {
+                    return false;
+                };
+                let Ok(b) = resolve_condition_value(&seq[1], ctx) else {
+                    return false;
+                };
                 return a == b;
             }
             false
@@ -355,70 +376,111 @@ fn evaluate_condition(value: &Value, ctx: &ConditionContext) -> bool {
     }
 }
 
-fn resolve_condition_value(value: &Value, ctx: &ConditionContext) -> String {
+fn resolve_condition_value(value: &Value, ctx: &ConditionContext) -> Result<String, CfnError> {
     match value {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
         Value::Tagged(tagged) => {
             let tag = tagged.tag.to_string();
             match tag.as_str() {
                 "!Ref" => {
                     if let Some(name) = tagged.value.as_str() {
-                        return ctx.params.get(name).cloned().unwrap_or_default();
+                        return ctx
+                            .params
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| CfnError::ParameterNotFound(name.to_string()));
                     }
-                    String::new()
+                    Err(CfnError::IntrinsicError(
+                        "!Ref in condition must reference a string name".into(),
+                    ))
                 }
                 "!FindInMap" => {
                     if let Some(seq) = tagged.value.as_sequence()
                         && seq.len() == 3
                     {
-                        let map_name = resolve_condition_value(&seq[0], ctx);
-                        let first_key = resolve_condition_value(&seq[1], ctx);
-                        let second_key = resolve_condition_value(&seq[2], ctx);
+                        let map_name = resolve_condition_value(&seq[0], ctx)?;
+                        let first_key = resolve_condition_value(&seq[1], ctx)?;
+                        let second_key = resolve_condition_value(&seq[2], ctx)?;
                         return ctx
                             .mappings
                             .get(&map_name)
                             .and_then(|m| m.get(&first_key))
                             .and_then(|m| m.get(&second_key))
                             .cloned()
-                            .unwrap_or_default();
+                            .ok_or_else(|| CfnError::MappingNotFound {
+                                map_name: map_name.clone(),
+                                first_key: first_key.clone(),
+                                second_key: second_key.clone(),
+                            });
                     }
-                    String::new()
+                    Err(CfnError::IntrinsicError(
+                        "!FindInMap in condition must have exactly 3 elements".into(),
+                    ))
                 }
-                _ => String::new(),
+                _ => Err(CfnError::IntrinsicError(format!(
+                    "unsupported intrinsic {tag} in condition value"
+                ))),
             }
         }
         Value::Mapping(map) => {
             if let Some(name) = map.get(Value::String("Ref".into()))
                 && let Some(name) = name.as_str()
             {
-                return ctx.params.get(name).cloned().unwrap_or_default();
+                return ctx
+                    .params
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| CfnError::ParameterNotFound(name.to_string()));
             }
             if let Some(seq) = map.get(Value::String("Fn::FindInMap".into()))
                 && let Some(seq) = seq.as_sequence()
                 && seq.len() == 3
             {
-                let map_name = resolve_condition_value(&seq[0], ctx);
-                let first_key = resolve_condition_value(&seq[1], ctx);
-                let second_key = resolve_condition_value(&seq[2], ctx);
+                let map_name = resolve_condition_value(&seq[0], ctx)?;
+                let first_key = resolve_condition_value(&seq[1], ctx)?;
+                let second_key = resolve_condition_value(&seq[2], ctx)?;
                 return ctx
                     .mappings
                     .get(&map_name)
                     .and_then(|m| m.get(&first_key))
                     .and_then(|m| m.get(&second_key))
                     .cloned()
-                    .unwrap_or_default();
+                    .ok_or_else(|| CfnError::MappingNotFound {
+                        map_name: map_name.clone(),
+                        first_key: first_key.clone(),
+                        second_key: second_key.clone(),
+                    });
             }
-            String::new()
+            Err(CfnError::IntrinsicError(
+                "unsupported mapping form in condition value".into(),
+            ))
         }
-        _ => String::new(),
+        _ => Err(CfnError::IntrinsicError(
+            "unsupported value type in condition".into(),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Integration (wiring): a file exceeding `MAX_IAC_FILE_BYTES` is rejected
+    /// by the parser's read path (`read_to_string_capped`). Ignored by default
+    /// because it writes a >16 MiB temp file.
+    #[test]
+    #[ignore = "writes a >16 MiB temp file; run with `cargo test -- --ignored`"]
+    fn parse_template_rejects_oversized_file() {
+        use yevice_core::io::MAX_IAC_FILE_BYTES;
+        let path =
+            std::env::temp_dir().join(format!("yevice_cfn_oversized_{}.yaml", std::process::id()));
+        std::fs::write(&path, vec![b' '; (MAX_IAC_FILE_BYTES + 1) as usize]).unwrap();
+        let result = parse_template(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "oversized template file must be rejected");
+    }
 
     const SAMPLE_TEMPLATE: &str = r#"
 AWSTemplateFormatVersion: "2010-09-09"
@@ -794,5 +856,66 @@ Resources:
         let resources = resolve_template(&tmpl, &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(resources.len(), 2);
         assert_eq!(resources["TableA"].resource_type, "AWS::DynamoDB::Table");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: Required-parameter validation
+    // -----------------------------------------------------------------------
+
+    /// A template with a parameter that has no Default and is not supplied
+    /// must return MissingParameters containing the parameter name.
+    #[test]
+    fn test_resolve_missing_required_parameter_errors() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Env:
+    Type: String
+  InstanceTypeParam:
+    Type: String
+Resources:
+  MyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceTypeParam
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let result = resolve_template(&tmpl, &HashMap::new(), &HashMap::new());
+        let err = result
+            .err()
+            .expect("expected Err for missing required parameters");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Env"),
+            "error message must contain parameter name 'Env': {err_msg}"
+        );
+        assert!(
+            err_msg.contains("InstanceTypeParam"),
+            "error message must contain parameter name 'InstanceTypeParam': {err_msg}"
+        );
+    }
+
+    /// A template with a parameter that has no Default but IS supplied must succeed.
+    #[test]
+    fn test_resolve_supplied_required_parameter_succeeds() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Env:
+    Type: String
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-bucket"
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let mut params = HashMap::new();
+        params.insert("Env".to_string(), "prod".to_string());
+        let result = resolve_template(&tmpl, &params, &HashMap::new());
+        assert!(
+            result.is_ok(),
+            "expected Ok when required parameter is supplied"
+        );
     }
 }

@@ -10,7 +10,7 @@ pub mod error;
 use std::collections::HashMap;
 
 pub use error::SolverError;
-use yevice_core::evaluate::{self, Params, resolve_bindings};
+use yevice_core::evaluate::{self, Params, resolve_bindings_into};
 use yevice_core::optimize::{ObjectiveDirection, OptimizationProblem, Relation};
 use yevice_core::types::VariableName;
 
@@ -25,11 +25,26 @@ const CONSTRAINT_TOLERANCE: f64 = 1e-9;
 pub struct Solution {
     /// Chosen value for each decision variable in the optimal (or any feasible)
     /// assignment.  Empty when `feasible` is false.
+    ///
+    /// Kept as a `std::collections::HashMap` (rather than the `FxHashMap`-based
+    /// `evaluate::Params`) to keep this public field's type stable; the
+    /// solver's per-combination hot-path maps use `Params` internally.
     pub assignments: HashMap<VariableName, f64>,
     /// Objective value at the optimal assignment.  [`f64::NAN`] when infeasible.
     pub objective_value: f64,
     /// True iff at least one feasible assignment was found.
     pub feasible: bool,
+    /// Number of combinations that were skipped because objective evaluation
+    /// returned an error (e.g. division by zero, undefined variable).  When
+    /// this equals `total_combinations` and `feasible` is false, all
+    /// combinations failed to evaluate rather than genuinely being infeasible.
+    pub evaluation_failures: u64,
+    /// Total number of combinations in the Cartesian product of all decision
+    /// variable domains.  Zero when the solver returned early (empty domain).
+    pub total_combinations: u64,
+    /// The formatted error message from the first objective-evaluation failure,
+    /// if any occurred.
+    pub first_evaluation_error: Option<String>,
 }
 
 /// Interface for optimization backends.
@@ -75,56 +90,268 @@ impl Solver for EnumerationSolver {
                 assignments: HashMap::new(),
                 objective_value: f64::NAN,
                 feasible: false,
+                evaluation_failures: 0,
+                total_combinations: 0,
+                first_evaluation_error: None,
             });
         }
 
         // Guard against combinatorial explosion.
         let combination_count = combination_count(problem)?;
 
-        if combination_count == 0 {
-            // No decision variables: treat as a single empty combination.
-            return solve_single(problem, HashMap::new());
+        let vars = &problem.decision_variables;
+        let n = vars.len();
+
+        // Precompute mixed-radix weights: weights[k] is the number of
+        // combinations contributed by variables k+1..n.  This lets us decode
+        // any flat index i into a per-variable selection index in O(n).
+        //
+        //   weights[n-1] = 1
+        //   weights[k]   = weights[k+1] * vars[k+1].domain.len()   (k = n-2 ..= 0)
+        //
+        // vars[0] is the most-significant "digit" (slowest-changing), matching
+        // the original nested-loop order exactly.
+        let mut weights = vec![1u64; n];
+        for k in (0..n.saturating_sub(1)).rev() {
+            weights[k] = weights[k + 1].saturating_mul(vars[k + 1].domain.len() as u64);
         }
 
-        let vars = &problem.decision_variables;
-        // Start with a single empty partial assignment.
-        let mut candidates: Vec<HashMap<VariableName, f64>> = vec![HashMap::new()];
+        // -----------------------------------------------------------------------
+        // Pre-loop: partition bindings into those independent of decision
+        // variables and those that may depend on them.
+        // -----------------------------------------------------------------------
 
-        for dv in vars {
-            let mut next = Vec::with_capacity(candidates.len() * dv.domain.len());
-            for partial in candidates {
-                for &val in &dv.domain {
-                    let mut extended = partial.clone();
-                    extended.insert(dv.name.clone(), val);
-                    next.push(extended);
+        // Collect all decision variable names into a "dependent" set, then
+        // transitively expand it: a binding whose expression references any
+        // dependent variable makes its *target* dependent too.
+        let decision_names: std::collections::HashSet<&VariableName> =
+            vars.iter().map(|dv| &dv.name).collect();
+
+        let mut dependent: std::collections::HashSet<&VariableName> =
+            decision_names.iter().copied().collect();
+
+        // Fixed-point expansion of the dependent set over bindings.
+        loop {
+            let mut changed = false;
+            for binding in &problem.bindings {
+                if dependent.contains(&binding.target) {
+                    continue;
+                }
+                let expr_vars = binding.expr.variables();
+                if expr_vars.iter().any(|v| dependent.contains(v)) {
+                    dependent.insert(&binding.target);
+                    changed = true;
                 }
             }
-            candidates = next;
+            if !changed {
+                break;
+            }
         }
 
-        debug_assert_eq!(candidates.len() as u64, combination_count);
+        // Partition bindings: fixed_bindings are those whose expr variables are
+        // entirely outside the dependent set (safe to resolve once).
+        // decision_bindings must be re-resolved each iteration (original order kept).
+        // Clone into owned Vecs so we can pass slices to resolve_bindings_into.
+        let (mut fixed_bindings, mut decision_bindings): (Vec<_>, Vec<_>) = problem
+            .bindings
+            .iter()
+            .cloned()
+            .partition(|b| b.expr.variables().iter().all(|v| !dependent.contains(v)));
+
+        // Hardening (Scenario B): a binding whose target IS a decision variable
+        // name must NOT be hoisted into fixed_bindings.  Pre-seeding base with a
+        // constant value for that target would shadow the decision variable write
+        // that happens in the inner loop (via get_mut), causing the binding result
+        // to persist in scratch rather than the chosen domain value.
+        //
+        // Only decision variable names are reclassified here — NOT transitively
+        // dependent targets, which are handled correctly by contested_decision_first.
+        let (still_fixed, must_be_decision): (Vec<_>, Vec<_>) = fixed_bindings
+            .into_iter()
+            .partition(|b| !decision_names.contains(&b.target));
+        fixed_bindings = still_fixed;
+        decision_bindings.extend(must_be_decision);
+
+        // Build the contested_decision_first set: targets that appear in BOTH
+        // fixed_bindings AND decision_bindings, where the FIRST occurrence in
+        // problem.bindings is a decision-dependent binding.  Only for these targets
+        // does the hoist incorrectly let the fixed binding win; removing the
+        // pre-resolved value from scratch restores list-order priority.
+        //
+        // Targets that are fixed_param keys or decision variable names are excluded:
+        //   - fixed_param key: base already holds the param value and must keep it.
+        //   - decision variable name: the decision slot written above must win.
+        let decision_binding_targets: std::collections::HashSet<&VariableName> =
+            decision_bindings.iter().map(|b| &b.target).collect();
+
+        // Walk problem.bindings once to record, for each collision target, whether
+        // its FIRST occurrence is decision-dependent.
+        let mut first_is_decision: std::collections::HashMap<&VariableName, bool> =
+            std::collections::HashMap::new();
+        for binding in &problem.bindings {
+            if !first_is_decision.contains_key(&binding.target) {
+                let depends_on_decision = binding
+                    .expr
+                    .variables()
+                    .iter()
+                    .any(|v| dependent.contains(v));
+                first_is_decision.insert(&binding.target, depends_on_decision);
+            }
+        }
+
+        let contested_decision_first: std::collections::HashSet<&VariableName> =
+            decision_binding_targets
+                .iter()
+                .filter(|t| {
+                    // Must also have a fixed binding (truly contested)
+                    fixed_bindings.iter().any(|b| &b.target == **t)
+                    // Must NOT be a fixed_param (its value must win)
+                    && !problem.fixed_params.contains_key(*t)
+                    // Must NOT be a decision variable name (its slot value must win)
+                    && !decision_names.contains(*t)
+                    // FIRST entry in problem.bindings for this target is decision-dependent
+                    && first_is_decision.get(*t).copied().unwrap_or(false)
+                })
+                .copied()
+                .collect();
+
+        // Build the base params map once: fixed_params + fixed bindings resolved.
+        // Pre-insert slots for decision variables so that the inner loop can
+        // update values via get_mut without cloning keys.
+        //
+        // Priority contract (after hardening reclassification above):
+        //   - fixed_param with same name as a binding target → fixed value wins
+        //     (already in base; resolve_bindings_into skips keys already present).
+        //   - decision variable with same name as a binding target → decision
+        //     value wins (written by get_mut after clone_from; skipped by
+        //     resolve_bindings_into).  Hardening ensures the binding was moved to
+        //     decision_bindings, so it is never pre-seeded into base.
+        //   - pure binding target (neither fixed_param nor decision var) with its
+        //     FIRST occurrence as a fixed binding → fixed value wins (pre-seeded
+        //     into base; resolve_bindings_into skips it).
+        //   - contested target whose FIRST occurrence in problem.bindings is a
+        //     decision-dependent binding → removed from scratch each iteration
+        //     (contested_decision_first); decision binding re-evaluates and wins.
+        let mut base: Params = problem
+            .fixed_params
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+
+        // Resolve fixed bindings into base (these are decision-independent).
+        // resolve_bindings_into does not fail — it absorbs errors internally
+        // (unresolvable bindings are warned and skipped).
+        resolve_bindings_into(&mut base, &fixed_bindings);
+
+        // Pre-allocate slots for decision variables (value filled each iteration).
+        // This pre-seed is required so that get_mut(&vars[k].name).expect(…)
+        // in the inner loop can update values without a fresh allocation.
+        for dv in vars {
+            base.entry(dv.name.clone()).or_insert(0.0);
+        }
+
+        // Scratch buffer: reused every iteration via clone_from to avoid
+        // allocating a new HashMap each time.  clone_from replaces all contents
+        // of scratch with those of base (reusing the underlying allocation where
+        // possible; each String key is still cloned, but no heap realloc occurs
+        // as long as the load factor stays stable).
+        let mut scratch = base.clone();
 
         let mut best: Option<Solution> = None;
+        let mut evaluation_failures: u64 = 0;
+        let mut first_evaluation_error: Option<String> = None;
 
-        for assignment in candidates {
-            // Resolve bindings so derived variables are available before
-            // feasibility / objective evaluation.  Resolution errors are treated
-            // as infeasible (same policy as evaluation errors below).
-            let params = match effective_params(problem, &assignment) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+        for i in 0..combination_count {
+            // Restore scratch to the fixed base state (reuses existing allocation).
+            // After this, scratch contains exactly the keys in base:
+            //   - fixed_params values
+            //   - fixed binding targets (already resolved)
+            //   - decision variable slots (placeholder 0.0, overwritten below)
+            // Pure decision_binding targets are NOT in scratch here (not pre-seeded).
+            scratch.clone_from(&base);
+
+            // Decode flat index i and write decision variable values directly
+            // into scratch.  The slots were pre-seeded into base, so get_mut
+            // always succeeds — the unwrap is an invariant, not a runtime check.
+            for k in 0..n {
+                let idx = ((i / weights[k]) as usize) % vars[k].domain.len();
+                *scratch.get_mut(&vars[k].name).expect(
+                    "decision variable slot pre-seeded into base before the enumeration loop",
+                ) = vars[k].domain[idx];
+            }
+
+            // Restore list-order priority for contested_decision_first targets:
+            // these are targets that appear in both fixed_bindings and
+            // decision_bindings, whose FIRST occurrence in problem.bindings is a
+            // decision-dependent binding, and that are neither a fixed_param key
+            // nor a decision variable name.
+            //
+            // Contested-first decision-dep binding gets priority if resolvable;
+            // otherwise the fallback fixed binding wins. This preserves OLD
+            // list-order "first resolvable wins" semantics exactly.
+            //
+            // Targets excluded from this set (fixed_param keys and decision
+            // variable names) are left intact in scratch so their values win.
+
+            // Save fixed-binding values for contested-first targets so we can fall
+            // back to them if the decision-dependent binding fails to resolve.
+            // This restores OLD single-pass "first resolvable wins" semantics:
+            // if the list-first (decision-dep) binding is unresolvable for this
+            // assignment, the next resolvable binding (the fixed fallback) wins.
+            let contested_fallback: Vec<(VariableName, f64)> = contested_decision_first
+                .iter()
+                .filter_map(|t| scratch.get(*t).map(|v| ((*t).clone(), *v)))
+                .collect();
+
+            for t in &contested_decision_first {
+                scratch.remove(*t);
+            }
+
+            // Resolve decision-dependent bindings against the updated scratch.
+            //
+            // Priority contract enforced by resolve_bindings_into's
+            // `contains_key` skip:
+            //   - decision variable == binding target → scratch already holds the
+            //     decision value (written above); resolve_bindings_into skips it
+            //     → decision value wins.  Hardening (above) ensures such bindings
+            //     were moved to decision_bindings, so they are never in base.
+            //   - fixed_param == binding target → base (and thus scratch after
+            //     clone_from) already holds the fixed value; skipped → fixed
+            //     value wins.
+            //   - pure binding target → absent from scratch after clone_from
+            //     (not pre-seeded); resolve_bindings_into inserts the fresh
+            //     computed value → correct recomputation each iteration.
+            //   - contested_decision_first target → removed above; resolve_bindings_into
+            //     inserts the decision-dependent value → list-order priority
+            //     restored for targets whose first occurrence is decision-dependent.
+            //
+            // resolve_bindings_into does not return a value — errors are absorbed
+            // internally (division-by-zero or missing variables are warned and
+            // the target is left absent, causing infeasibility below).
+            resolve_bindings_into(&mut scratch, &decision_bindings);
+
+            // Restore fixed-binding value for any contested-first target whose
+            // decision-dependent binding failed to resolve.
+            for (t, v) in contested_fallback {
+                scratch.entry(t).or_insert(v);
+            }
 
             // Evaluate and check all constraints; skip this combination on any
             // evaluation error (treat as infeasible).
-            if !is_feasible(problem, &params) {
+            if !is_feasible(problem, &scratch) {
                 continue;
             }
 
             // Evaluate the objective; skip on error.
-            let obj = match evaluate::evaluate(&problem.objective, &params) {
+            let obj = match evaluate::evaluate(&problem.objective, &scratch) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    evaluation_failures += 1;
+                    if first_evaluation_error.is_none() {
+                        first_evaluation_error = Some(format!("{e}"));
+                    }
+                    continue;
+                }
             };
 
             let better = match &best {
@@ -136,19 +363,49 @@ impl Solver for EnumerationSolver {
             };
 
             if better {
+                // Build the assignments map only when a new best is found
+                // (this path is taken at most O(combination_count) times but
+                // typically far fewer).
+                let assignments: HashMap<VariableName, f64> = vars
+                    .iter()
+                    .map(|dv| {
+                        (
+                            dv.name.clone(),
+                            *scratch
+                                .get(&dv.name)
+                                .expect("decision variable slot pre-seeded into base before the enumeration loop"),
+                        )
+                    })
+                    .collect();
                 best = Some(Solution {
-                    assignments: assignment,
+                    assignments,
                     objective_value: obj,
                     feasible: true,
+                    // Diagnostic counters are finalized after the loop; these
+                    // placeholder values are overwritten before the function returns.
+                    evaluation_failures: 0,
+                    total_combinations: combination_count,
+                    first_evaluation_error: None,
                 });
             }
         }
 
-        Ok(best.unwrap_or(Solution {
-            assignments: HashMap::new(),
-            objective_value: f64::NAN,
-            feasible: false,
-        }))
+        // Finalize diagnostic counters now that the full loop is complete.
+        Ok(match best {
+            Some(mut sol) => {
+                sol.evaluation_failures = evaluation_failures;
+                sol.first_evaluation_error = first_evaluation_error;
+                sol
+            }
+            None => Solution {
+                assignments: HashMap::new(),
+                objective_value: f64::NAN,
+                feasible: false,
+                evaluation_failures,
+                total_combinations: combination_count,
+                first_evaluation_error,
+            },
+        })
     }
 }
 
@@ -175,33 +432,6 @@ fn combination_count(problem: &OptimizationProblem) -> Result<u64, SolverError> 
     Ok(count)
 }
 
-/// Build an evaluation `Params` map by merging `fixed_params` with an
-/// assignment of decision variables.  Decision variable values take
-/// precedence over fixed params with the same name.
-fn build_params(problem: &OptimizationProblem, assignment: &HashMap<VariableName, f64>) -> Params {
-    let mut params: Params = problem.fixed_params.clone();
-    for (name, &val) in assignment {
-        params.insert(name.clone(), val);
-    }
-    params
-}
-
-/// Build the effective `Params` for a given assignment by merging fixed params,
-/// decision variable values, and then resolving any bindings in the problem.
-///
-/// This mirrors the behaviour of `evaluate_architecture`, which calls
-/// `resolve_bindings` before evaluating resource expressions.  Bindings only
-/// fill in variables that are *not* already present (fixed or decision), so
-/// decision-variable values are never overwritten by a binding even if the
-/// decision variable is also a binding source.
-fn effective_params(
-    problem: &OptimizationProblem,
-    assignment: &HashMap<VariableName, f64>,
-) -> Result<Params, SolverError> {
-    let base = build_params(problem, assignment);
-    resolve_bindings(&problem.bindings, &base).map_err(SolverError::Eval)
-}
-
 /// Return `true` iff every constraint in the problem is satisfied by `params`.
 ///
 /// An evaluation error on any constraint's LHS is treated as a failure (the
@@ -222,27 +452,6 @@ fn is_feasible(problem: &OptimizationProblem, params: &Params) -> bool {
         }
     }
     true
-}
-
-/// Solve the degenerate case of zero decision variables (single combination).
-fn solve_single(
-    problem: &OptimizationProblem,
-    assignment: HashMap<VariableName, f64>,
-) -> Result<Solution, SolverError> {
-    let params = effective_params(problem, &assignment)?;
-    if !is_feasible(problem, &params) {
-        return Ok(Solution {
-            assignments: HashMap::new(),
-            objective_value: f64::NAN,
-            feasible: false,
-        });
-    }
-    let obj = evaluate::evaluate(&problem.objective, &params).map_err(SolverError::Eval)?;
-    Ok(Solution {
-        assignments: assignment,
-        objective_value: obj,
-        feasible: true,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -641,5 +850,794 @@ mod tests {
         );
         assert_eq!(sol.assignments[&var("x")], 1.0, "x=1 minimises x*x*rate");
         assert_eq!(sol.objective_value, 3.0); // 1 * (1 * 3)
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for partition-based refactor correctness
+    // -----------------------------------------------------------------------
+
+    /// Mixed bindings: one fixed-only binding and one decision-dependent binding.
+    ///
+    /// `base_cost` is a fixed binding (`fixed_rate * 2`).
+    /// `total_cost` is a decision-dependent binding (`x * base_cost`).
+    ///
+    /// Objective = `total_cost`. Minimize over x ∈ {1, 3, 5}.
+    ///
+    /// Expected: x=1, total_cost = 1 * (fixed_rate * 2) = 1 * 10 = 10.
+    #[test]
+    fn mixed_fixed_and_decision_bindings_correct_optimal() {
+        use yevice_core::cost::VariableBinding;
+
+        // fixed_rate = 5.0 (fixed param)
+        // base_cost  = fixed_rate * 2   (fixed binding — no decision dependency)
+        // total_cost = x * base_cost    (decision-dependent binding)
+        let fixed_binding = VariableBinding {
+            target: var("base_cost"),
+            expr: Expr::product(vec![Expr::variable("fixed_rate"), Expr::constant(2.0)]),
+            description: "base_cost = fixed_rate * 2".into(),
+            source: "test".into(),
+        };
+        let decision_binding = VariableBinding {
+            target: var("total_cost"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::variable("base_cost")]),
+            description: "total_cost = x * base_cost".into(),
+            source: "test".into(),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("fixed_rate"), 5.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("total_cost"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 3.0, 5.0])],
+            constraints: vec![],
+            fixed_params: fixed,
+            // fixed_binding listed second (adversarial order for partition correctness)
+            bindings: vec![decision_binding, fixed_binding],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible);
+        assert_eq!(
+            sol.assignments[&var("x")],
+            1.0,
+            "x=1 gives total_cost=10 (minimum)"
+        );
+        assert_eq!(sol.objective_value, 10.0); // 1 * (5 * 2)
+    }
+
+    /// Full exhaustive equivalence check: for a small problem containing both
+    /// fixed-only and decision-dependent bindings, verify that the refactored
+    /// `EnumerationSolver` produces the same (solution, objective) as a naive
+    /// reference computation that re-evaluates every combination from scratch.
+    ///
+    /// Problem setup:
+    ///   x ∈ {1, 2, 3},  y ∈ {10, 20}
+    ///   fixed param:  scale = 3.0
+    ///   fixed binding:  offset = scale * 4   (= 12, decision-independent)
+    ///   decision binding: result = x * y + offset
+    ///   objective: result   (minimize)
+    ///   constraint: result >= 30
+    ///
+    /// Feasible combos where result >= 30 (enumeration order: x slow, y fast):
+    ///   x=1, y=10 → result = 10 + 12 = 22  (infeasible)
+    ///   x=1, y=20 → result = 20 + 12 = 32  (feasible, first minimum at result=32)
+    ///   x=2, y=10 → result = 20 + 12 = 32  (feasible, ties with above)
+    ///   x=2, y=20 → result = 40 + 12 = 52  (feasible)
+    ///   x=3, y=10 → result = 30 + 12 = 42  (feasible)
+    ///   x=3, y=20 → result = 60 + 12 = 72  (feasible)
+    ///
+    /// Minimum feasible result = 32, first occurrence at x=1, y=20 (x is the
+    /// slow-moving variable in enumeration order, so x=1 is visited first).
+    #[test]
+    fn exhaustive_equivalence_with_naive_reference() {
+        use yevice_core::cost::VariableBinding;
+        use yevice_core::evaluate::resolve_bindings;
+
+        let fixed_binding = VariableBinding {
+            target: var("offset"),
+            expr: Expr::product(vec![Expr::variable("scale"), Expr::constant(4.0)]),
+            description: "offset = scale * 4".into(),
+            source: "test".into(),
+        };
+        let decision_binding = VariableBinding {
+            target: var("result"),
+            expr: Expr::sum(vec![
+                Expr::product(vec![Expr::variable("x"), Expr::variable("y")]),
+                Expr::variable("offset"),
+            ]),
+            description: "result = x * y + offset".into(),
+            source: "test".into(),
+        };
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("result"),
+            relation: Relation::Ge,
+            rhs: 30.0,
+            label: Some("result_ge_30".into()),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("scale"), 3.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("result"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0]), dv("y", vec![10.0, 20.0])],
+            constraints: vec![constraint],
+            fixed_params: fixed.clone(),
+            bindings: vec![fixed_binding.clone(), decision_binding.clone()],
+        };
+
+        // --- Naive reference computation ---
+        let x_domain = [1.0_f64, 2.0, 3.0];
+        let y_domain = [10.0_f64, 20.0];
+        let mut naive_best: Option<(f64, f64, f64)> = None; // (obj, x, y)
+        for &xv in &x_domain {
+            for &yv in &y_domain {
+                let mut params: Params = fixed.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                params.insert(var("x"), xv);
+                params.insert(var("y"), yv);
+                let all_bindings = vec![fixed_binding.clone(), decision_binding.clone()];
+                let resolved = resolve_bindings(&all_bindings, &params).unwrap();
+                let result_val = match resolved.get(&var("result")) {
+                    Some(&v) => v,
+                    None => continue,
+                };
+                if result_val < 30.0 - 1e-9 {
+                    continue;
+                }
+                match naive_best {
+                    None => naive_best = Some((result_val, xv, yv)),
+                    Some((best_obj, _, _)) if result_val < best_obj => {
+                        naive_best = Some((result_val, xv, yv));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let (naive_obj, naive_x, naive_y) = naive_best.expect("naive must find a solution");
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "solver must find a feasible solution");
+
+        // Golden assertion (independent oracle): minimum feasible result = 32,
+        // first occurrence in enumeration order at x=1, y=20.
+        assert_eq!(sol.objective_value, 32.0, "expected objective = 32");
+        assert_eq!(sol.assignments[&var("x")], 1.0, "expected x = 1");
+        assert_eq!(sol.assignments[&var("y")], 20.0, "expected y = 20");
+
+        // Equivalence with naive reference.
+        assert!(
+            (sol.objective_value - naive_obj).abs() < 1e-9,
+            "objective mismatch: solver={} naive={}",
+            sol.objective_value,
+            naive_obj
+        );
+        assert_eq!(
+            sol.assignments[&var("x")],
+            naive_x,
+            "x mismatch: solver={} naive={}",
+            sol.assignments[&var("x")],
+            naive_x
+        );
+        assert_eq!(
+            sol.assignments[&var("y")],
+            naive_y,
+            "y mismatch: solver={} naive={}",
+            sol.assignments[&var("y")],
+            naive_y
+        );
+    }
+
+    /// Chained decision-dependent bindings: `a = x * 2`, `b = a + y`.
+    /// Objective = `b`, minimize. x ∈ {1, 2}, y ∈ {0, 5}.
+    ///
+    /// Values: (x=1,y=0)→b=2, (x=1,y=5)→b=7, (x=2,y=0)→b=4, (x=2,y=5)→b=9
+    /// Minimum: x=1, y=0, b=2.
+    #[test]
+    fn chained_decision_bindings_resolve_correctly() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_a = VariableBinding {
+            target: var("a"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "a = x * 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = VariableBinding {
+            target: var("b"),
+            expr: Expr::sum(vec![Expr::variable("a"), Expr::variable("y")]),
+            description: "b = a + y".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0]), dv("y", vec![0.0, 5.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            // Adversarial order: b before a (a must be resolved first)
+            bindings: vec![binding_b, binding_a],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible);
+        assert_eq!(sol.assignments[&var("x")], 1.0);
+        assert_eq!(sol.assignments[&var("y")], 0.0);
+        assert_eq!(sol.objective_value, 2.0); // 1*2 + 0
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for binding priority (bug-1 and bug-2 fixes)
+    // -----------------------------------------------------------------------
+
+    /// Regression (bug-1): when a fixed_param name collides with the target of a
+    /// decision-dependent binding, the fixed_param value must win — the binding
+    /// must NOT overwrite the explicit user-supplied value.
+    ///
+    /// Setup:
+    ///   fixed_params: x = 99.0      (explicit user override)
+    ///   decision variable: y ∈ {1, 2, 3}
+    ///   binding: x = y + 100         (decision-dependent — target collides with fixed_param)
+    ///   objective: x                 (minimize)
+    ///
+    /// Expected: objective = 99.0 (fixed_param wins; binding never overwrites it).
+    /// Buggy behaviour: objective = 101.0 (binding overwrites fixed_param for y=1).
+    #[test]
+    fn fixed_param_overrides_colliding_decision_binding() {
+        use yevice_core::cost::VariableBinding;
+
+        // binding: x = y + 100  (x is also a fixed_param)
+        let binding = VariableBinding {
+            target: var("x"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+            description: "x = y + 100".into(),
+            source: "test".into(),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 99.0); // explicit fixed_param — must win
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        // Fixed param x=99.0 must be used as objective, not x = y + 100 = 101..103.
+        assert_eq!(
+            sol.objective_value, 99.0,
+            "fixed_param x=99 must override the colliding decision binding (expected 99, got {})",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (bug-2): when a decision variable name collides with the target
+    /// of a binding whose expression references another decision variable, the
+    /// decision variable's own domain value must be used — the binding must NOT
+    /// overwrite the decision value.
+    ///
+    /// Setup:
+    ///   decision variables: x ∈ {1, 2, 3},  y ∈ {10, 20}
+    ///   binding: x = y + 100            (target collides with decision variable x)
+    ///   objective: x                    (minimize)
+    ///
+    /// Expected: x=1, objective=1 (decision value wins; binding never overwrites).
+    /// Buggy behaviour: x=110, objective=110 (binding overwrites decision value).
+    #[test]
+    fn decision_var_not_overwritten_by_colliding_binding() {
+        use yevice_core::cost::VariableBinding;
+
+        // binding: x = y + 100  (x is also a decision variable)
+        let binding = VariableBinding {
+            target: var("x"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+            description: "x = y + 100".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0]), dv("y", vec![10.0, 20.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        // Decision variable x must keep its own domain value (1), not y + 100 (110 or 120).
+        assert_eq!(
+            sol.assignments[&var("x")],
+            1.0,
+            "decision variable x must not be overwritten by binding (expected x=1, got {})",
+            sol.assignments[&var("x")]
+        );
+        assert_eq!(
+            sol.objective_value, 1.0,
+            "objective must be decision x=1, not binding result (expected 1, got {})",
+            sol.objective_value
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for contested-target (binding-order) fix
+    // -----------------------------------------------------------------------
+
+    /// Regression: when the SAME target `T` appears in both a decision-dependent
+    /// binding and a fixed binding, and the decision-dependent binding is listed
+    /// FIRST in `problem.bindings`, the decision-dependent value must win.
+    ///
+    /// Setup:
+    ///   decision variable: y ∈ {1, 2, 3}
+    ///   binding (first):  T = y + 0    (decision-dependent — listed first)
+    ///   binding (second): T = 100      (fixed literal — listed second)
+    ///   objective: T                   (minimize)
+    ///
+    /// Old single-pass semantics: first resolvable binding wins → T = y + 0 wins.
+    /// Expected: optimal T = min(y) = 1.
+    /// Buggy behaviour (before this fix): T = 100 always wins (fixed partition).
+    #[test]
+    fn binding_order_decision_dependent_wins_over_fixed_binding() {
+        use yevice_core::cost::VariableBinding;
+
+        // First binding: T = y + 0  (decision-dependent; y is a decision variable)
+        let binding_decision = VariableBinding {
+            target: var("T"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(0.0)]),
+            description: "T = y + 0".into(),
+            source: "test".into(),
+        };
+        // Second binding: T = 100  (fixed literal; no decision-variable reference)
+        let binding_fixed = VariableBinding {
+            target: var("T"),
+            expr: Expr::constant(100.0),
+            description: "T = 100".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("T"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            // Decision-dependent binding is listed first → it must win.
+            bindings: vec![binding_decision, binding_fixed],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.objective_value, 1.0,
+            "decision-dependent binding (T = y + 0) must win over fixed binding (T = 100); \
+             expected T = min(y) = 1, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Sanity: when only the fixed binding for `T` is present (no contested
+    /// target), the fixed value is still resolved correctly.
+    ///
+    /// Setup:
+    ///   decision variable: y ∈ {1, 2, 3}   (y is NOT bound to T)
+    ///   binding: T = 100                    (fixed literal, only binding for T)
+    ///   objective: T                        (minimize)
+    ///
+    /// Expected: T = 100 (the fixed binding is the sole source).
+    #[test]
+    fn binding_order_fixed_wins_when_no_decision_binding() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("T"),
+            expr: Expr::constant(100.0),
+            description: "T = 100".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("T"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_fixed],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.objective_value, 100.0,
+            "sole fixed binding T=100 must be resolved correctly; expected 100, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (Scenario A): when a contested target T equals a fixed_params
+    /// key, the fixed_param value must win — the decision-dependent binding must
+    /// NOT overwrite it.
+    ///
+    /// Setup:
+    ///   fixed_params: x = 99.0
+    ///   decision variable: y ∈ {1, 2, 3}
+    ///   binding (first):  x = 50           (fixed literal — listed first)
+    ///   binding (second): x = y + 100      (decision-dependent — listed second)
+    ///   objective: x                       (minimize)
+    ///
+    /// Expected: feasible=true, objective=99.0, assignments\["x"\]=99.0.
+    /// Buggy behaviour (old patch): scratch.remove("x") deleted the fixed_param
+    /// value; decision binding wrote x = y+100 = 101..103.
+    #[test]
+    fn contested_target_equals_fixed_param_uses_fixed_param_value() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("x"),
+            expr: Expr::constant(50.0),
+            description: "x = 50".into(),
+            source: "test".into(),
+        };
+        let binding_decision = VariableBinding {
+            target: var("x"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+            description: "x = y + 100".into(),
+            source: "test".into(),
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 99.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding_fixed, binding_decision],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.objective_value, 99.0,
+            "fixed_param x=99 must win over contested bindings; expected 99, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (Scenario B): when a contested target T equals a decision
+    /// variable name, the decision variable's own domain value must win — the
+    /// binding must NOT overwrite the slot value.
+    ///
+    /// Setup:
+    ///   decision variables: x ∈ {1, 2, 3},  y ∈ {1, 2, 3}
+    ///   binding (first):  x = 50            (fixed literal — listed first)
+    ///   binding (second): x = y + 100       (decision-dependent — listed second)
+    ///   objective: x                        (minimize)
+    ///
+    /// Expected: feasible=true, objective=1.0, assignments\["x"\]=1.0 (NOT 101+).
+    /// Buggy behaviour (old patch): scratch.remove("x") deleted the decision
+    /// slot value; decision binding wrote x = y+100.
+    #[test]
+    fn contested_target_equals_decision_var_uses_decision_value() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("x"),
+            expr: Expr::constant(50.0),
+            description: "x = 50".into(),
+            source: "test".into(),
+        };
+        let binding_decision = VariableBinding {
+            target: var("x"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+            description: "x = y + 100".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0]), dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_fixed, binding_decision],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.assignments[&var("x")],
+            1.0,
+            "decision variable x must keep its domain value; expected x=1, got {}",
+            sol.assignments[&var("x")]
+        );
+        assert_eq!(
+            sol.objective_value, 1.0,
+            "objective must be decision x=1, not binding result; expected 1, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression (Scenario C): when the SAME target T appears in both a fixed
+    /// binding and a decision-dependent binding, and the FIXED binding is listed
+    /// FIRST, the fixed value must win — list-order priority must not be reversed.
+    ///
+    /// Setup:
+    ///   decision variable: y ∈ {1, 2, 3}
+    ///   binding (first):  T = 100          (fixed literal — listed first)
+    ///   binding (second): T = y + 0        (decision-dependent — listed second)
+    ///   objective: T                       (minimize)
+    ///
+    /// Expected: feasible=true, objective=100.0.
+    /// Buggy behaviour (old patch): scratch.remove(T) stripped the pre-seeded
+    /// value for every contested target, so the decision binding always won
+    /// regardless of order → objective=1 instead of 100.
+    #[test]
+    fn binding_order_fixed_wins_over_decision_dependent_when_listed_first() {
+        use yevice_core::cost::VariableBinding;
+
+        let binding_fixed = VariableBinding {
+            target: var("T"),
+            expr: Expr::constant(100.0),
+            description: "T = 100".into(),
+            source: "test".into(),
+        };
+        let binding_decision = VariableBinding {
+            target: var("T"),
+            expr: Expr::sum(vec![Expr::variable("y"), Expr::constant(0.0)]),
+            description: "T = y + 0".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("T"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            // Fixed binding listed first → fixed value must win.
+            bindings: vec![binding_fixed, binding_decision],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible, "expected feasible solution");
+        assert_eq!(
+            sol.objective_value, 100.0,
+            "fixed binding (T = 100) listed first must win over decision binding (T = y+0); \
+             expected T=100, got {}",
+            sol.objective_value
+        );
+    }
+
+    /// Regression: when a contested-first target's decision-dependent binding is
+    /// UNRESOLVABLE (references an undefined variable), the solver must fall back
+    /// to the fixed binding's value rather than leaving the target absent.
+    ///
+    /// Setup:
+    ///   decision variable: x ∈ {1, 2, 3}
+    ///   binding (first):  z = x + missing_param   (decision-dep, UNRESOLVABLE)
+    ///   binding (second): z = 5                   (fixed fallback)
+    ///   objective: z                              (minimize)
+    ///
+    /// OLD single-pass semantics: first resolvable binding wins → z = 5.
+    /// Expected: feasible=true, objective≈5.0, assignments\["z"\] is absent
+    ///   (z is not a decision variable, so it won't be in assignments) but
+    ///   the objective evaluates via scratch to 5.0.
+    /// Buggy behaviour (before this fix): z absent after unresolvable decision
+    ///   binding; objective eval fails; evaluation_failures=3/3, feasible=false.
+    #[test]
+    fn contested_decision_first_falls_back_to_fixed_when_decision_unresolvable() {
+        use yevice_core::cost::VariableBinding;
+
+        // First binding: z = x + missing_param  (decision-dep; missing_param undefined)
+        let binding_unresolvable = VariableBinding {
+            target: var("z"),
+            expr: Expr::sum(vec![Expr::variable("x"), Expr::variable("missing_param")]),
+            description: "z = x + missing_param".into(),
+            source: "test".into(),
+        };
+        // Second binding: z = 5  (fixed literal fallback)
+        let binding_fixed = VariableBinding {
+            target: var("z"),
+            expr: Expr::constant(5.0),
+            description: "z = 5".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("z"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            // Decision-dep binding listed first, fixed fallback listed second.
+            bindings: vec![binding_unresolvable, binding_fixed],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            sol.feasible,
+            "expected feasible: fixed fallback z=5 must apply when decision binding is unresolvable; \
+             got evaluation_failures={}/{}",
+            sol.evaluation_failures, sol.total_combinations,
+        );
+        assert!(
+            (sol.objective_value - 5.0).abs() < 1e-9,
+            "expected objective=5.0 (from fixed fallback z=5), got {}",
+            sol.objective_value
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MAX_COMBINATIONS boundary tests
+    // -----------------------------------------------------------------------
+
+    /// Domain product exactly equal to MAX_COMBINATIONS must succeed (Ok).
+    #[test]
+    fn max_combinations_boundary_exact_ok() {
+        // 1000 * 1000 = 1_000_000 = MAX_COMBINATIONS → must not error.
+        let dvs = vec![
+            dv("x", (0..1000).map(f64::from).collect()),
+            dv("y", (0..1000).map(f64::from).collect()),
+        ];
+
+        let problem = problem_with(
+            Expr::constant(0.0),
+            ObjectiveDirection::Minimize,
+            dvs,
+            vec![],
+            HashMap::new(),
+        );
+
+        let result = EnumerationSolver.solve(&problem);
+        assert!(
+            result.is_ok(),
+            "exactly MAX_COMBINATIONS must be Ok, got {result:?}"
+        );
+        assert!(result.unwrap().feasible);
+    }
+
+    /// Domain product of MAX_COMBINATIONS + 1 must return TooManyCombinations.
+    #[test]
+    fn max_combinations_boundary_plus_one_errors() {
+        // 1000 * 1001 = 1_001_000 > MAX_COMBINATIONS → must error.
+        let dvs = vec![
+            dv("x", (0..1000).map(f64::from).collect()),
+            dv("y", (0..1001).map(f64::from).collect()),
+        ];
+
+        let problem = problem_with(
+            Expr::constant(0.0),
+            ObjectiveDirection::Minimize,
+            dvs,
+            vec![],
+            HashMap::new(),
+        );
+
+        let result = EnumerationSolver.solve(&problem);
+        assert!(
+            matches!(result, Err(SolverError::TooManyCombinations { .. })),
+            "MAX_COMBINATIONS+1 must be TooManyCombinations, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Binding error skip / stale-value leak test
+    // -----------------------------------------------------------------------
+
+    /// When a decision-dependent binding evaluates to an error for some domain
+    /// values (e.g. division by zero), those rows are treated as infeasible and
+    /// skipped.  The stale binding result from a previous row must not leak into
+    /// the evaluation of the next row.
+    ///
+    /// Setup:
+    ///   decision variable: x ∈ {1, 2, 3}
+    ///   binding: safe = 10.0 / (x - 2)     (undefined / error at x=2)
+    ///   objective: safe                     (minimize)
+    ///
+    /// At x=1: safe = 10 / (1-2) = -10  (feasible)
+    /// At x=2: safe = 10 / 0     → error (infeasible/skipped)
+    /// At x=3: safe = 10 / (3-2) = 10   (feasible)
+    ///
+    /// Minimize: x=1 gives safe=-10 (global minimum), so solver must return
+    /// objective=-10 and x=1.  If a stale value from x=3 leaked into x=1's
+    /// evaluation the objective would be 10 instead.
+    #[test]
+    fn binding_error_skip_no_stale_leak() {
+        use yevice_core::cost::VariableBinding;
+
+        // binding: safe = 10 / (x - 2)
+        let binding = VariableBinding {
+            target: var("safe"),
+            expr: Expr::div(
+                Expr::constant(10.0),
+                Expr::sum(vec![Expr::variable("x"), Expr::constant(-2.0)]),
+            ),
+            description: "safe = 10 / (x - 2)".into(),
+            source: "test".into(),
+        };
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("safe"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0, 3.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            sol.feasible,
+            "expected feasible: x=1 and x=3 are valid rows"
+        );
+        // x=1 gives safe=-10 (minimum); x=3 gives safe=10.
+        // x=2 is skipped (division by zero in binding).
+        assert_eq!(
+            sol.assignments[&var("x")],
+            1.0,
+            "expected x=1 (gives minimum safe=-10), got x={}",
+            sol.assignments[&var("x")]
+        );
+        assert!(
+            (sol.objective_value - (-10.0)).abs() < 1e-9,
+            "expected objective=-10, got {}",
+            sol.objective_value
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic field tests (Fix 3)
+    // -----------------------------------------------------------------------
+
+    /// When the objective references an undefined variable for every combination,
+    /// all evaluations fail.  The solver must return:
+    ///   - feasible = false
+    ///   - evaluation_failures == total_combinations
+    ///   - first_evaluation_error = Some(..)
+    ///
+    /// This distinguishes "all evaluations errored" from genuine infeasibility.
+    #[test]
+    fn all_evaluations_fail_reports_diagnostic_fields() {
+        // objective = undefined_var  (not in domain or fixed_params)
+        // domain x ∈ {1.0, 2.0, 3.0} → 3 combinations, all fail to evaluate
+        let problem = problem_with(
+            Expr::variable("undefined_var"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![],
+            HashMap::new(),
+        );
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            !sol.feasible,
+            "expected infeasible when all objective evaluations fail"
+        );
+        assert_eq!(
+            sol.evaluation_failures, 3,
+            "expected 3 evaluation failures (one per combination), got {}",
+            sol.evaluation_failures
+        );
+        assert_eq!(
+            sol.total_combinations, 3,
+            "expected total_combinations=3, got {}",
+            sol.total_combinations
+        );
+        assert!(
+            sol.first_evaluation_error.is_some(),
+            "expected first_evaluation_error to be Some(..) when all evaluations fail"
+        );
     }
 }

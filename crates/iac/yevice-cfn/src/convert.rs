@@ -1,6 +1,6 @@
 //! CFn template → Architecture conversion using the adapter registry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use serde_yaml_ng::Value as YamlValue;
 use yevice_core::{
@@ -66,7 +66,7 @@ pub fn build_architecture(
 /// - All new structured-property edges: `require_source_in_resources = true`
 fn try_push_connection(
     conn: Connection,
-    resources: &HashMap<String, CfnResource>,
+    resources: &BTreeMap<String, CfnResource>,
     require_source_in_resources: bool,
     seen: &mut HashSet<(String, String, String)>,
     connections: &mut Vec<Connection>,
@@ -87,17 +87,13 @@ fn try_push_connection(
     }
 }
 
-fn build_connections(resources: &HashMap<String, CfnResource>) -> Vec<Connection> {
+fn build_connections(resources: &BTreeMap<String, CfnResource>) -> Vec<Connection> {
     let mut connections = Vec::new();
     // Dedup key: (source, target, connection_type) — prevents double-counting
     // when both EventSourceMapping and SAM Events create the same edge.
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
 
-    // Sort by logical ID for deterministic output (HashMap iteration order is unspecified).
-    let mut entries: Vec<(&String, &CfnResource)> = resources.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-
-    for (id, cfn) in entries {
+    for (id, cfn) in resources {
         match cfn.resource_type.as_str() {
             // ESM: source may be an external ARN not in resources; only target must exist.
             "AWS::Lambda::EventSourceMapping" => {
@@ -140,7 +136,7 @@ fn build_connections(resources: &HashMap<String, CfnResource>) -> Vec<Connection
 
 fn extract_event_source_connection(
     esm: &CfnResource,
-    resources: &HashMap<String, CfnResource>,
+    resources: &BTreeMap<String, CfnResource>,
 ) -> Option<Connection> {
     let props = esm.properties.as_mapping()?;
 
@@ -174,7 +170,7 @@ fn extract_function_logical_id(props: &serde_yaml_ng::Mapping) -> Option<String>
 
 fn extract_source_logical_id(
     props: &serde_yaml_ng::Mapping,
-    resources: &HashMap<String, CfnResource>,
+    resources: &BTreeMap<String, CfnResource>,
 ) -> Option<(String, String)> {
     let source_arn = props.get(YamlValue::String("EventSourceArn".into()))?;
 
@@ -201,7 +197,7 @@ fn extract_source_logical_id(
 
 fn detect_source_type(
     logical_id: &str,
-    resources: &HashMap<String, CfnResource>,
+    resources: &BTreeMap<String, CfnResource>,
 ) -> Option<String> {
     let resource = resources.get(logical_id)?;
     match resource.resource_type.as_str() {
@@ -248,7 +244,10 @@ fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
 /// - no matching property is found,
 /// - the resolved logical ID does not exist in `resources` (dangling parent), or
 /// - the resolved logical ID equals the resource's own logical ID (self-reference).
-fn extract_group(cfn: &CfnResource, resources: &HashMap<String, CfnResource>) -> Option<LogicalId> {
+fn extract_group(
+    cfn: &CfnResource,
+    resources: &BTreeMap<String, CfnResource>,
+) -> Option<LogicalId> {
     // Ordered list of single-reference property names to probe.
     const SINGLE_REF_PROPS: &[&str] = &["Cluster", "ClusterName", "SubnetId", "VpcId"];
 
@@ -546,7 +545,7 @@ fn sam_s3_events_has_object_created(event_props: &serde_yaml_ng::Mapping) -> boo
 fn extract_sam_function_event_connections(
     function_id: &str,
     cfn: &CfnResource,
-    resources: &HashMap<String, CfnResource>,
+    resources: &BTreeMap<String, CfnResource>,
 ) -> Vec<Connection> {
     let mut conns = Vec::new();
     let Some(props) = cfn.properties.as_mapping() else {
@@ -753,7 +752,7 @@ mod containment_tests {
         let vpc = cfn_resource("MyVpc", yaml_map(&[]));
         let subnet = cfn_resource("MySubnet", yaml_map(&[("VpcId", "{{ref:MyVpc}}")]));
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyVpc".to_string(), vpc);
         resources.insert("MySubnet".to_string(), subnet);
 
@@ -766,7 +765,7 @@ mod containment_tests {
         let subnet = cfn_resource("MySubnet", yaml_map(&[]));
         let nat = cfn_resource("MyNat", yaml_map(&[("SubnetId", "{{ref:MySubnet}}")]));
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MySubnet".to_string(), subnet);
         resources.insert("MyNat".to_string(), nat);
 
@@ -779,7 +778,7 @@ mod containment_tests {
         let cluster = cfn_resource("MyCluster", yaml_map(&[]));
         let service = cfn_resource("MyService", yaml_map(&[("Cluster", "{{ref:MyCluster}}")]));
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyCluster".to_string(), cluster);
         resources.insert("MyService".to_string(), service);
 
@@ -797,7 +796,7 @@ mod containment_tests {
             yaml_map(&[("Cluster", "{{ref:MyCluster}}"), ("VpcId", "{{ref:MyVpc}}")]),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyCluster".to_string(), cluster);
         resources.insert("MyVpc".to_string(), vpc);
         resources.insert("MyResource".to_string(), resource);
@@ -814,7 +813,7 @@ mod containment_tests {
             yaml_map(&[("SubnetId", "{{ref:NonExistentSubnet}}")]),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyNat".to_string(), nat);
 
         let group = extract_group(&resources["MyNat"], &resources);
@@ -826,7 +825,7 @@ mod containment_tests {
         // A plain string (not a sentinel) must not be treated as a logical ID.
         let nat = cfn_resource("MyNat", yaml_map(&[("SubnetId", "subnet-12345678")]));
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyNat".to_string(), nat);
 
         let group = extract_group(&resources["MyNat"], &resources);
@@ -837,7 +836,7 @@ mod containment_tests {
     fn no_containment_properties_yields_no_group() {
         let lambda = cfn_resource("MyFunction", yaml_map(&[("MemorySize", "256")]));
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyFunction".to_string(), lambda);
 
         let group = extract_group(&resources["MyFunction"], &resources);
@@ -852,7 +851,7 @@ mod containment_tests {
             yaml_map(&[("SubnetId", "{{getatt:MySubnet.SubnetId}}")]),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MySubnet".to_string(), subnet);
         resources.insert("MyInstance".to_string(), instance);
 
@@ -912,7 +911,7 @@ mod connection_tests {
         let rule_props = yaml_map_values(vec![("Targets", yaml_seq(vec![target_entry]))]);
         let rule = cfn_resource_typed("MyRule", "AWS::Events::Rule", rule_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("HandlerFunction".to_string(), lambda);
         resources.insert("MyRule".to_string(), rule);
 
@@ -948,7 +947,7 @@ mod connection_tests {
         let rule_props = yaml_map_values(vec![("Targets", yaml_seq(vec![target_entry]))]);
         let rule = cfn_resource_typed("MyRule", "AWS::Events::Rule", rule_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("HandlerFunction".to_string(), lambda);
         resources.insert("MyRule".to_string(), rule);
 
@@ -1012,7 +1011,7 @@ mod connection_tests {
         let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
         let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyFunction".to_string(), lambda);
         resources.insert("MyBucket".to_string(), bucket);
 
@@ -1046,7 +1045,7 @@ mod connection_tests {
         let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
         let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyFunction".to_string(), lambda);
         resources.insert("MyBucket".to_string(), bucket);
 
@@ -1071,7 +1070,7 @@ mod connection_tests {
         let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
         let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyQueue".to_string(), queue);
         resources.insert("MyBucket".to_string(), bucket);
 
@@ -1096,7 +1095,7 @@ mod connection_tests {
         let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
         let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyTopic".to_string(), topic);
         resources.insert("MyBucket".to_string(), bucket);
 
@@ -1122,7 +1121,7 @@ mod connection_tests {
         let bucket_props = yaml_map_values(vec![("NotificationConfiguration", notif_config)]);
         let bucket = cfn_resource_typed("MyBucket", "AWS::S3::Bucket", bucket_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("FnA".to_string(), lambda_a);
         resources.insert("FnB".to_string(), lambda_b);
         resources.insert("MyBucket".to_string(), bucket);
@@ -1174,7 +1173,7 @@ mod connection_tests {
             yaml_str("s3:ObjectCreated:*"),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MediaBucket".to_string(), bucket);
         resources.insert("MyFunction".to_string(), function);
 
@@ -1201,7 +1200,7 @@ mod connection_tests {
             yaml_seq(vec![yaml_str("s3:ObjectCreated:Put")]),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MediaBucket".to_string(), bucket);
         resources.insert("MyFunction".to_string(), function);
 
@@ -1227,7 +1226,7 @@ mod connection_tests {
             yaml_str("s3:ObjectRemoved:*"),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MediaBucket".to_string(), bucket);
         resources.insert("MyFunction".to_string(), function);
 
@@ -1249,7 +1248,7 @@ mod connection_tests {
             yaml_str("s3:ObjectCreated:*"),
         );
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyFunction".to_string(), function);
 
         let conns = build_connections(&resources);
@@ -1278,7 +1277,7 @@ mod connection_tests {
         let topic_props = yaml_map_values(vec![("Subscription", yaml_seq(vec![sub_item]))]);
         let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", topic_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyFunction".to_string(), lambda);
         resources.insert("MyTopic".to_string(), topic);
 
@@ -1314,7 +1313,7 @@ mod connection_tests {
         let topic = cfn_resource_typed("MyTopic", "AWS::SNS::Topic", topic_props);
         let lambda = cfn_resource_typed("MyFn", "AWS::Lambda::Function", yaml_map_values(vec![]));
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyTopic".to_string(), topic);
         resources.insert("MyFn".to_string(), lambda);
 
@@ -1342,7 +1341,7 @@ mod connection_tests {
         ]);
         let sub = cfn_resource_typed("MySub", "AWS::SNS::Subscription", sub_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyTopic".to_string(), topic);
         resources.insert("MyFunction".to_string(), lambda);
         resources.insert("MySub".to_string(), sub);
@@ -1380,7 +1379,7 @@ mod connection_tests {
         ]);
         let sub = cfn_resource_typed("MySub", "AWS::SNS::Subscription", sub_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyTopic".to_string(), topic);
         resources.insert("MyFunction".to_string(), lambda);
         resources.insert("MySub".to_string(), sub);
@@ -1415,7 +1414,7 @@ mod connection_tests {
         ]);
         let esm = cfn_resource_typed("MyESM", "AWS::Lambda::EventSourceMapping", esm_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyQueue".to_string(), queue);
         resources.insert("MyFn".to_string(), lambda);
         resources.insert("MyESM".to_string(), esm);
@@ -1448,7 +1447,7 @@ mod connection_tests {
         ]);
         let esm = cfn_resource_typed("MyESM", "AWS::Lambda::EventSourceMapping", esm_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MyQueue".to_string(), queue);
         resources.insert("MyFn".to_string(), lambda);
         resources.insert("MyESM".to_string(), esm);
@@ -1494,7 +1493,7 @@ mod connection_tests {
         let fn_props = yaml_map_values(vec![("Events", YamlValue::Mapping(events_map))]);
         let function = cfn_resource_typed("MyFunction", "AWS::Serverless::Function", fn_props);
 
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         resources.insert("MediaBucket".to_string(), bucket);
         resources.insert("MyQueue".to_string(), queue);
         resources.insert("MyFunction".to_string(), function);
@@ -1517,6 +1516,65 @@ mod connection_tests {
         assert!(
             esm.is_some(),
             "expected EventSource edge for SQS event; connections = {conns:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use yevice_service_api::CfnAdapterRegistry;
+
+    /// Build a minimal `CfnTemplate` whose `resources` map contains one entry
+    /// per logical ID in `names`, inserted in the order given.
+    fn make_template_with_resources(names: &[&str]) -> CfnTemplate {
+        let mut resources = BTreeMap::new();
+        for &name in names {
+            resources.insert(
+                name.to_string(),
+                CfnResource {
+                    logical_id: name.to_string(),
+                    resource_type: "AWS::CloudFormation::WaitConditionHandle".to_string(),
+                    properties: YamlValue::Mapping(serde_yaml_ng::Mapping::new()),
+                    condition: None,
+                    depends_on: Vec::new(),
+                },
+            );
+        }
+        CfnTemplate {
+            parameters: HashMap::new(),
+            mappings: HashMap::new(),
+            conditions: HashMap::new(),
+            resources,
+        }
+    }
+
+    #[test]
+    fn build_architecture_resource_order_is_deterministic() {
+        // Use a template with at least 3 resources whose logical IDs are not in
+        // alphabetical insert order. Expected: resources are returned in logical_id
+        // sort order, identical across two invocations.
+        let template = make_template_with_resources(&["ZooLogs", "AlphaFn", "MidTable"]);
+        let adapters = CfnAdapterRegistry::new();
+        let arch1 = build_architecture("test", "us-east-1", &template, &adapters);
+        let arch2 = build_architecture("test", "us-east-1", &template, &adapters);
+        let names1: Vec<&str> = arch1
+            .resources
+            .iter()
+            .map(|r| r.logical_id.as_str())
+            .collect();
+        let names2: Vec<&str> = arch2
+            .resources
+            .iter()
+            .map(|r| r.logical_id.as_str())
+            .collect();
+        assert_eq!(names1, names2, "resource order must be deterministic");
+        assert_eq!(
+            names1,
+            vec!["AlphaFn", "MidTable", "ZooLogs"],
+            "resource order must be sorted by logical_id"
         );
     }
 }

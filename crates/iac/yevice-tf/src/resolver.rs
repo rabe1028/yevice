@@ -27,6 +27,19 @@ pub fn resolve_config(
         vars.extend(overrides);
     }
 
+    // Warn about variables that have no default and no tfvars override — references
+    // to these will stay as `TfValue::VarRef` after resolution, causing adapter
+    // defaults to be used and potentially understating cost.
+    for (name, variable) in &config.variables {
+        if variable.default.is_none() && !vars.contains_key(name.as_str()) {
+            tracing::warn!(
+                variable = %name,
+                "variable has no default and no tfvars value; \
+                 references to var.{name} will not resolve"
+            );
+        }
+    }
+
     let vars = vars
         .iter()
         .map(|(name, value)| {
@@ -169,6 +182,95 @@ fn resolve_value(
                 .collect();
             Some(TfValue::Array(resolved_items))
         }
+    }
+}
+
+#[cfg(test)]
+mod defaultless_var_tests {
+    use super::*;
+    use crate::parser::{TfConfig, TfResource, TfValue, TfVariable};
+
+    /// A variable declared with no default and supplied no tfvars value must
+    /// remain as `TfValue::VarRef` in the resource attrs after `resolve_config`.
+    /// This pins the behavior that adapters will see `None` for that attr and
+    /// fall back to their hardcoded defaults (and warn accordingly).
+    #[test]
+    fn defaultless_var_without_tfvars_stays_unresolved() {
+        let mut variables = HashMap::new();
+        variables.insert("instance_type".to_string(), TfVariable { default: None });
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "instance_type".to_string(),
+            TfValue::VarRef("instance_type".to_string()),
+        );
+
+        let config = TfConfig {
+            variables,
+            locals: HashMap::new(),
+            resources: vec![TfResource {
+                resource_type: "aws_instance".to_string(),
+                name: "web".to_string(),
+                attrs,
+                blocks: HashMap::new(),
+            }],
+        };
+
+        let resolved = resolve_config(config, None).unwrap();
+
+        let resource = &resolved.resources[0];
+        let val = resource
+            .attrs
+            .get("instance_type")
+            .expect("instance_type attr must be present");
+        assert!(
+            matches!(val, TfValue::VarRef(_)),
+            "defaultless var without tfvars must stay as VarRef; got {val:?}"
+        );
+    }
+
+    /// A variable declared with no default but supplied via tfvars resolves to
+    /// the tfvars value (concrete string).
+    #[test]
+    fn defaultless_var_with_tfvars_resolves() {
+        let mut variables = HashMap::new();
+        variables.insert("instance_type".to_string(), TfVariable { default: None });
+
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "instance_type".to_string(),
+            TfValue::VarRef("instance_type".to_string()),
+        );
+
+        let config = TfConfig {
+            variables,
+            locals: HashMap::new(),
+            resources: vec![TfResource {
+                resource_type: "aws_instance".to_string(),
+                name: "web".to_string(),
+                attrs,
+                blocks: HashMap::new(),
+            }],
+        };
+
+        let mut tfvars = HashMap::new();
+        tfvars.insert(
+            "instance_type".to_string(),
+            TfValue::String("m5.4xlarge".to_string()),
+        );
+
+        let resolved = resolve_config(config, Some(tfvars)).unwrap();
+
+        let resource = &resolved.resources[0];
+        let val = resource
+            .attrs
+            .get("instance_type")
+            .expect("instance_type attr must be present");
+        assert_eq!(
+            val,
+            &TfValue::String("m5.4xlarge".to_string()),
+            "var supplied via tfvars must resolve to the concrete string; got {val:?}"
+        );
     }
 }
 

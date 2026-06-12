@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use yevice_core::io::read_to_string_capped;
 use yevice_core::{
     resource::{Architecture, Connection, ConnectionType, Provider, Resource, ResourceShell},
     types::{LogicalId, Region, ResourceType},
@@ -93,7 +94,7 @@ struct RawDoBinding {
 
 /// Parse a Wrangler config file into an Architecture.
 pub fn parse_wrangler(path: &Path) -> Result<Architecture, WranglerError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_to_string_capped(path)?;
     let default_name = path
         .parent()
         .and_then(|p| p.file_name())
@@ -484,6 +485,23 @@ fn build_architecture(raw: &RawWrangler, default_name: &str) -> Architecture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Integration (wiring): a file exceeding `MAX_IAC_FILE_BYTES` is rejected
+    /// by the parser's read path (`read_to_string_capped`). Ignored by default
+    /// because it writes a >16 MiB temp file.
+    #[test]
+    #[ignore = "writes a >16 MiB temp file; run with `cargo test -- --ignored`"]
+    fn parse_wrangler_rejects_oversized_file() {
+        use yevice_core::io::MAX_IAC_FILE_BYTES;
+        let path = std::env::temp_dir().join(format!(
+            "yevice_wrangler_oversized_{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![b' '; (MAX_IAC_FILE_BYTES + 1) as usize]).unwrap();
+        let result = parse_wrangler(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "oversized wrangler file must be rejected");
+    }
 
     #[test]
     fn parses_jsonc_wranger_config() {

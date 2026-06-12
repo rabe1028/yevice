@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use yevice_core::{
     evaluate::{Params, evaluate},
     expr::Expr,
@@ -61,7 +59,7 @@ fn rt(name: &str) -> ResourceType {
 }
 
 fn params<const N: usize>(entries: [(VariableName, f64); N]) -> Params {
-    HashMap::from(entries)
+    entries.into_iter().collect()
 }
 
 fn cloud_sql_instance_monthly(vcpu: f64, ram_gb: f64, ha_multiplier: f64) -> f64 {

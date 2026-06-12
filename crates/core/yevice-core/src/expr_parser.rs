@@ -21,6 +21,7 @@ pub enum ParseError {
     UnexpectedChar(char),
     UnexpectedEnd,
     ExpectedCloseParen,
+    InvalidNumber { literal: String, pos: usize },
 }
 
 impl std::fmt::Display for ParseError {
@@ -29,6 +30,9 @@ impl std::fmt::Display for ParseError {
             Self::UnexpectedChar(c) => write!(f, "unexpected character: '{c}'"),
             Self::UnexpectedEnd => write!(f, "unexpected end of expression"),
             Self::ExpectedCloseParen => write!(f, "expected ')'"),
+            Self::InvalidNumber { literal, pos } => {
+                write!(f, "invalid number literal '{literal}' at position {pos}")
+            }
         }
     }
 }
@@ -155,7 +159,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-        let value: f64 = s.parse().map_err(|_| ParseError::UnexpectedChar('?'))?;
+        let value: f64 = s.parse().map_err(|_| ParseError::InvalidNumber {
+            literal: s.to_string(),
+            pos: start,
+        })?;
         Ok(Expr::constant(value))
     }
 
@@ -218,8 +225,8 @@ mod tests {
 
     #[test]
     fn test_constant() {
-        assert_eq!(compute("42", &Params::new()), 42.0);
-        assert_eq!(compute("0.7", &Params::new()), 0.7);
+        assert_eq!(compute("42", &Params::default()), 42.0);
+        assert_eq!(compute("0.7", &Params::default()), 0.7);
     }
 
     #[test]
@@ -265,5 +272,15 @@ mod tests {
     fn test_batch_invocations() {
         let p = params_from(&[("transitions", 3000.0)]);
         assert_eq!(compute("ceil(transitions / 3)", &p), 1000.0);
+    }
+
+    #[test]
+    fn test_malformed_number_error_contains_literal() {
+        let err = parse_expr("1.2.3").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1.2.3"),
+            "error message must contain the offending literal; got: {msg}"
+        );
     }
 }

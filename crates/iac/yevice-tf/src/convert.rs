@@ -60,12 +60,29 @@ pub fn build_architecture(
 }
 
 /// Convert a `TfResource` (with resolved `TfValue` attrs/blocks) into a `RawTfResource`.
+///
+/// Top-level attrs whose value is `VarRef`, `LocalRef`, or `Unknown` — i.e. references
+/// that could not be resolved — are dropped from the output and logged as `tracing::warn!`.
+/// Adapters that fall back to a hardcoded default for missing attrs will therefore use that
+/// default, so the warning names both the resource and the attr so operators can supply the
+/// variable via tfvars for accurate pricing.
 fn tf_resource_to_raw(resource: &TfResource, logical_id: &str) -> RawTfResource {
-    let attrs: HashMap<String, JsonValue> = resource
-        .attrs
-        .iter()
-        .filter_map(|(k, v)| tf_value_to_json(v).map(|jv| (k.clone(), jv)))
-        .collect();
+    let mut attrs: HashMap<String, JsonValue> = HashMap::new();
+    for (k, v) in &resource.attrs {
+        match tf_value_to_json(v) {
+            Some(jv) => {
+                attrs.insert(k.clone(), jv);
+            }
+            None => {
+                tracing::warn!(
+                    resource = %logical_id,
+                    attr = %k,
+                    "unresolved Terraform reference dropped; adapter default will be used — \
+                     supply the variable via tfvars for accurate pricing"
+                );
+            }
+        }
+    }
 
     let blocks: HashMap<String, Vec<HashMap<String, JsonValue>>> = resource
         .blocks
@@ -930,6 +947,98 @@ mod sns_subscription_tests {
         assert_eq!(conns[0].source.as_str(), "aws_sns_topic_my_topic");
         assert_eq!(conns[0].target.as_str(), "aws_sqs_queue_my_queue");
         assert_eq!(conns[0].connection_type, ConnectionType::Notification);
+    }
+}
+
+#[cfg(test)]
+mod tf_resource_to_raw_tests {
+    use super::*;
+
+    /// A resource with one concrete attr and one unresolved VarRef attr must
+    /// produce a `RawTfResource` where only the concrete attr is present.
+    /// The unresolved key must be absent from `raw.attrs`.
+    #[test]
+    fn unresolved_varref_attr_is_absent_from_raw() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "instance_type".to_string(),
+            TfValue::VarRef("instance_type_var".to_string()),
+        );
+        attrs.insert("ami".to_string(), TfValue::String("ami-12345".to_string()));
+
+        let resource = TfResource {
+            resource_type: "aws_instance".to_string(),
+            name: "web".to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        };
+
+        let raw = tf_resource_to_raw(&resource, "aws_instance_web");
+
+        // The concrete attr must be present.
+        assert_eq!(
+            raw.get_str("ami"),
+            Some("ami-12345"),
+            "concrete attr must be present in raw"
+        );
+        // The unresolved VarRef attr must be absent.
+        assert!(
+            !raw.attrs.contains_key("instance_type"),
+            "unresolved VarRef attr must be absent from raw; raw.attrs = {:?}",
+            raw.attrs
+        );
+    }
+
+    /// Same check for `LocalRef`.
+    #[test]
+    fn unresolved_localref_attr_is_absent_from_raw() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "node_type".to_string(),
+            TfValue::LocalRef("node_type_local".to_string()),
+        );
+
+        let resource = TfResource {
+            resource_type: "aws_elasticache_cluster".to_string(),
+            name: "cache".to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        };
+
+        let raw = tf_resource_to_raw(&resource, "aws_elasticache_cluster_cache");
+
+        assert!(
+            !raw.attrs.contains_key("node_type"),
+            "unresolved LocalRef attr must be absent from raw; raw.attrs = {:?}",
+            raw.attrs
+        );
+    }
+
+    /// Same check for `Unknown`.
+    #[test]
+    fn unknown_attr_is_absent_from_raw() {
+        let mut attrs = HashMap::new();
+        attrs.insert("memory_size".to_string(), TfValue::Unknown);
+        attrs.insert(
+            "runtime".to_string(),
+            TfValue::String("python3.12".to_string()),
+        );
+
+        let resource = TfResource {
+            resource_type: "aws_lambda_function".to_string(),
+            name: "fn".to_string(),
+            attrs,
+            blocks: HashMap::new(),
+        };
+
+        let raw = tf_resource_to_raw(&resource, "aws_lambda_function_fn");
+
+        assert!(
+            !raw.attrs.contains_key("memory_size"),
+            "Unknown attr must be absent from raw; raw.attrs = {:?}",
+            raw.attrs
+        );
+        assert_eq!(raw.get_str("runtime"), Some("python3.12"));
     }
 }
 

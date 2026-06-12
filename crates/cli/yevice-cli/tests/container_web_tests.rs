@@ -100,7 +100,7 @@ fn test_elasticache_constant_cost() {
 
     // cost = 0.084 * 730 * 2 nodes = $122.64/month
     let expected = CACHE_T3_MEDIUM_HOURLY * HOURS * 2.0;
-    let expr_result = yevice_core::evaluate::evaluate(&cache.expr, &Params::new()).unwrap();
+    let expr_result = yevice_core::evaluate::evaluate(&cache.expr, &Params::default()).unwrap();
 
     assert!(
         expr_result > 0.0,
@@ -131,7 +131,7 @@ fn test_rds_cost_includes_instance_and_storage() {
     let storage_cost = RDS_GP2_STORAGE_PER_GB * 100.0;
     let expected_total = instance_cost + storage_cost;
 
-    let actual = yevice_core::evaluate::evaluate(&rds.expr, &Params::new()).unwrap();
+    let actual = yevice_core::evaluate::evaluate(&rds.expr, &Params::default()).unwrap();
 
     assert!(
         actual > instance_cost,
@@ -237,8 +237,8 @@ fn test_multiaz_rds_costs_more_than_singleaz() {
         .find(|r| r.label.starts_with("RDS:"))
         .expect("ProdDatabase not found");
 
-    let web_rds_cost = yevice_core::evaluate::evaluate(&web_rds.expr, &Params::new()).unwrap();
-    let prd_rds_cost = yevice_core::evaluate::evaluate(&prd_rds.expr, &Params::new()).unwrap();
+    let web_rds_cost = yevice_core::evaluate::evaluate(&web_rds.expr, &Params::default()).unwrap();
+    let prd_rds_cost = yevice_core::evaluate::evaluate(&prd_rds.expr, &Params::default()).unwrap();
 
     // production: r5.large MultiAZ = 0.290 * 730 * 2 + 0.138 * 500 * 2 = 423.40 + 138.00 = 561.40
     //   (Multi-AZ replicates storage to the standby, so storage is billed twice)

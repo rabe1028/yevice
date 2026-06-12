@@ -9,7 +9,7 @@
 mod common;
 use common::load_fixture;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use yevice_cfn::{convert, parser};
 use yevice_core::resource::ConnectionType;
@@ -20,7 +20,7 @@ const REGION: &str = "ap-northeast-1";
 
 fn build_arch_connections(
     name: &str,
-    resources: &HashMap<String, parser::CfnResource>,
+    resources: &BTreeMap<String, parser::CfnResource>,
 ) -> yevice_core::resource::Architecture {
     let tmpl = parser::CfnTemplate {
         parameters: HashMap::new(),
