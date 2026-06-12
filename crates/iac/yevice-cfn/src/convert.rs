@@ -165,7 +165,7 @@ fn extract_function_logical_id(props: &serde_yaml_ng::Mapping) -> Option<String>
     let s = fn_name.as_str()?;
     // Whole-string sentinel first, then embedded (e.g. Fn::Sub ARN like
     // "arn:...:function:{{ref:MyFn}}").
-    if let Some(cfn_ref) = sentinel::parse(s).or_else(|| sentinel::find_embedded(s)) {
+    if let Some(cfn_ref) = sentinel::parse_or_find_embedded(s) {
         return Some(cfn_ref.logical_id);
     }
     Some(s.to_string())
@@ -228,9 +228,7 @@ fn arn_last_segment(arn: &str) -> String {
 /// - Embedded sentinels (e.g. `Fn::Sub` ARNs after resolution):
 ///   `"arn:...:function:{{ref:X}}"` → `Some("X")` (first embedded sentinel wins)
 fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
-    sentinel::parse(s)
-        .or_else(|| sentinel::find_embedded(s))
-        .map(|r| r.logical_id)
+    sentinel::parse_or_find_embedded(s).map(|r| r.logical_id)
 }
 
 /// Determine the containment parent for a CFn resource.

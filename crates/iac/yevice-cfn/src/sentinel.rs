@@ -67,6 +67,26 @@ pub(crate) fn parse(s: &str) -> Option<CfnRef> {
     None
 }
 
+/// Try to parse `s` as a whole-string sentinel; if that fails, search for an
+/// embedded sentinel — but only when `s` does not start with a sentinel prefix.
+///
+/// The prefix guard prevents extracting a partial match from a *concatenation*
+/// of sentinels such as `{{ref:A}}{{ref:B}}`.  For such strings `parse` now
+/// correctly returns `None` (concatenation is not a single reference), but
+/// `find_embedded` would otherwise pick up `A`, producing a spurious edge.
+/// By refusing to call `find_embedded` when the string opens with `{{ref:` or
+/// `{{getatt:`, we preserve the pre-fix semantics (no edge for multi-reference
+/// joins).
+pub(crate) fn parse_or_find_embedded(s: &str) -> Option<CfnRef> {
+    parse(s).or_else(|| {
+        if s.starts_with(REF_PREFIX) || s.starts_with(GETATT_PREFIX) {
+            None
+        } else {
+            find_embedded(s)
+        }
+    })
+}
+
 /// Search for the **first** embedded sentinel (`{{ref:...}}` or
 /// `{{getatt:...}}`) within a larger string and parse it into a [`CfnRef`].
 ///
@@ -235,5 +255,29 @@ mod tests {
         let result = find_embedded(s).expect("should find sentinel amid pseudo-params");
         assert_eq!(result.logical_id, "HandlerFunction");
         assert_eq!(result.attr, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_or_find_embedded
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_or_find_embedded_whole_string_sentinel() {
+        let result = parse_or_find_embedded("{{ref:MyQueue}}").expect("should match");
+        assert_eq!(result.logical_id, "MyQueue");
+    }
+
+    #[test]
+    fn parse_or_find_embedded_embedded_in_arn() {
+        let s = "arn:aws:lambda:us-east-1:123:function:{{ref:MyFn}}";
+        let result = parse_or_find_embedded(s).expect("should find embedded");
+        assert_eq!(result.logical_id, "MyFn");
+    }
+
+    #[test]
+    fn parse_or_find_embedded_rejects_concatenated_sentinels() {
+        // A concatenation must NOT produce a spurious edge to the first resource.
+        assert!(parse_or_find_embedded("{{ref:A}}{{ref:B}}").is_none());
+        assert!(parse_or_find_embedded("{{getatt:A.Attr}}{{ref:B}}").is_none());
     }
 }
