@@ -469,46 +469,6 @@ pub fn optimize(
         decision_variables.push(DecisionVariable { name, domain });
     }
 
-    // Every variable in the objective must be bound — either fixed via --params,
-    // chosen as a --decision, or derivable via a binding whose own inputs are
-    // themselves bound.  Compute the set via a fixed-point closure so that only
-    // bindings whose source variables are already satisfied propagate their
-    // targets into the bound set.  This prevents a binding whose source is
-    // missing from silently masking an unbound variable in the objective.
-    let mut bound: std::collections::HashSet<VariableName> = fixed_params.keys().cloned().collect();
-    for dv in &decision_variables {
-        bound.insert(dv.name.clone());
-    }
-    loop {
-        let mut progressed = false;
-        for b in arch.all_bindings() {
-            if bound.contains(&b.target) {
-                continue;
-            }
-            if b.expr.variables().iter().all(|v| bound.contains(v)) {
-                bound.insert(b.target.clone());
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    let unbound: Vec<String> = objective
-        .variables()
-        .into_iter()
-        .filter(|v| !bound.contains(v))
-        .map(|v| v.to_string())
-        .collect();
-    if !unbound.is_empty() {
-        bail!(
-            "cannot optimize: {} objective variable(s) are unbound; provide them via --params \
-             or as a --decision: {}",
-            unbound.len(),
-            unbound.join(", ")
-        );
-    }
-
     let obj_direction = match direction {
         "min" => ObjectiveDirection::Minimize,
         "max" => ObjectiveDirection::Maximize,
@@ -524,8 +484,19 @@ pub fn optimize(
         bindings: arch.all_bindings().to_vec(),
     };
 
+    // The solver validates up-front that every variable in the objective is
+    // bound — either fixed via --params, chosen as a --decision, or derivable
+    // via a binding whose own inputs are themselves bound (transitively).
     let sol = match EnumerationSolver.solve(&problem) {
         Ok(s) => s,
+        Err(SolverError::UnboundVariables { variables }) => {
+            bail!(
+                "cannot optimize: {} objective variable(s) are unbound; provide them via --params \
+                 or as a --decision: {}",
+                variables.len(),
+                variables.join(", ")
+            );
+        }
         Err(SolverError::TooManyCombinations { count, limit }) => {
             bail!(
                 "too many combinations to enumerate ({count} > {limit}). \

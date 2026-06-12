@@ -53,6 +53,59 @@ pub trait Solver {
     fn solve(&self, problem: &OptimizationProblem) -> Result<Solution, SolverError>;
 }
 
+/// Verify that every variable referenced by the problem's objective is bound.
+///
+/// A variable counts as bound when it is a fixed parameter, a decision
+/// variable, or the target of a binding whose own source variables are all
+/// (transitively) bound. The bound set is computed as a fixed-point closure so
+/// that a binding whose source variable is missing does not silently mask an
+/// unbound variable in the objective.
+///
+/// Returns [`SolverError::UnboundVariables`] naming the offending variables
+/// (in sorted order) when the objective cannot be fully evaluated.
+///
+/// All solver backends should call this before solving; [`EnumerationSolver`]
+/// does so at the start of [`Solver::solve`], turning a would-be
+/// "all combinations failed to evaluate" outcome into an actionable error.
+pub fn validate_bindings(problem: &OptimizationProblem) -> Result<(), SolverError> {
+    let mut bound: std::collections::HashSet<VariableName> =
+        problem.fixed_params.keys().cloned().collect();
+    for dv in &problem.decision_variables {
+        bound.insert(dv.name.clone());
+    }
+
+    // Fixed-point closure: a binding propagates its target into the bound set
+    // only once all of its source variables are themselves bound.
+    loop {
+        let mut progressed = false;
+        for b in &problem.bindings {
+            if bound.contains(&b.target) {
+                continue;
+            }
+            if b.expr.variables().iter().all(|v| bound.contains(v)) {
+                bound.insert(b.target.clone());
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let unbound: Vec<String> = problem
+        .objective
+        .variables()
+        .into_iter()
+        .filter(|v| !bound.contains(v))
+        .map(|v| v.to_string())
+        .collect();
+    if unbound.is_empty() {
+        Ok(())
+    } else {
+        Err(SolverError::UnboundVariables { variables: unbound })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EnumerationSolver
 // ---------------------------------------------------------------------------
@@ -76,6 +129,11 @@ pub struct EnumerationSolver;
 
 impl Solver for EnumerationSolver {
     fn solve(&self, problem: &OptimizationProblem) -> Result<Solution, SolverError> {
+        // Reject objectives that reference unbound variables up-front: every
+        // combination would fail to evaluate anyway, and an explicit error
+        // names the missing variables instead of reporting INFEASIBLE.
+        validate_bindings(problem)?;
+
         // Guard: if any decision variable has an empty domain, no assignment
         // can ever be constructed — immediately return infeasible.
         // This check must come before combination_count so that a problem
@@ -1838,19 +1896,29 @@ mod tests {
     // Diagnostic field tests (Fix 3)
     // -----------------------------------------------------------------------
 
-    /// When the objective references an undefined variable for every combination,
-    /// all evaluations fail.  The solver must return:
+    /// When the objective fails to evaluate for every combination (here:
+    /// division by zero — the denominator `x - x` is always 0), the solver
+    /// must return:
     ///   - feasible = false
     ///   - evaluation_failures == total_combinations
     ///   - first_evaluation_error = Some(..)
     ///
     /// This distinguishes "all evaluations errored" from genuine infeasibility.
+    /// (An objective referencing an *unbound* variable is rejected up-front by
+    /// `validate_bindings` instead — see the validate_bindings tests.)
     #[test]
     fn all_evaluations_fail_reports_diagnostic_fields() {
-        // objective = undefined_var  (not in domain or fixed_params)
+        // objective = 1 / (x + (-1 * x)) = 1 / 0 for every x
         // domain x ∈ {1.0, 2.0, 3.0} → 3 combinations, all fail to evaluate
+        let objective = Expr::div(
+            Expr::constant(1.0),
+            Expr::sum(vec![
+                Expr::variable("x"),
+                Expr::product(vec![Expr::constant(-1.0), Expr::variable("x")]),
+            ]),
+        );
         let problem = problem_with(
-            Expr::variable("undefined_var"),
+            objective,
             ObjectiveDirection::Minimize,
             vec![dv("x", vec![1.0, 2.0, 3.0])],
             vec![],
@@ -1933,6 +2001,114 @@ mod tests {
             (result.objective_value - 1.0).abs() < 1e-9,
             "T1 must be 1 (first-pass resolvable wins under fixed-point semantics), got {}",
             result.objective_value
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_bindings tests
+    // -----------------------------------------------------------------------
+
+    /// An objective variable bound by nothing must be rejected with an error
+    /// that names it.
+    #[test]
+    fn validate_bindings_rejects_unbound_objective_variable() {
+        let problem = problem_with(
+            Expr::variable("undefined_var"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![],
+            HashMap::new(),
+        );
+
+        let err = validate_bindings(&problem).unwrap_err();
+        match &err {
+            SolverError::UnboundVariables { variables } => {
+                assert_eq!(variables, &vec!["undefined_var".to_string()]);
+            }
+            other => panic!("expected UnboundVariables, got {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("undefined_var"),
+            "error message must name the unbound variable: {err}"
+        );
+    }
+
+    /// A binding whose source variables are all bound (transitively, through
+    /// chained bindings) satisfies the objective variable.
+    #[test]
+    fn validate_bindings_accepts_transitively_bound_variable() {
+        use yevice_core::cost::VariableBinding;
+
+        // x (decision) → T2 = x → T1 = T2 + 1; objective references T1.
+        let problem = OptimizationProblem {
+            objective: Expr::variable("T1"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv("x", vec![1.0, 2.0])],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![
+                VariableBinding {
+                    target: var("T1"),
+                    expr: Expr::sum(vec![Expr::variable("T2"), Expr::constant(1.0)]),
+                    description: String::new(),
+                    source: "test".into(),
+                },
+                VariableBinding {
+                    target: var("T2"),
+                    expr: Expr::variable("x"),
+                    description: String::new(),
+                    source: "test".into(),
+                },
+            ],
+        };
+
+        assert!(validate_bindings(&problem).is_ok());
+    }
+
+    /// A binding whose own source variable is missing must NOT mask the
+    /// unbound objective variable.
+    #[test]
+    fn validate_bindings_rejects_binding_with_unbound_source() {
+        use yevice_core::cost::VariableBinding;
+
+        // binding: derived = missing * 0.01; objective references derived.
+        let problem = OptimizationProblem {
+            objective: Expr::variable("derived"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![VariableBinding {
+                target: var("derived"),
+                expr: Expr::product(vec![Expr::variable("missing"), Expr::constant(0.01)]),
+                description: String::new(),
+                source: "test".into(),
+            }],
+        };
+
+        let err = validate_bindings(&problem).unwrap_err();
+        assert!(
+            matches!(&err, SolverError::UnboundVariables { variables } if variables == &vec!["derived".to_string()]),
+            "expected UnboundVariables naming 'derived', got {err:?}"
+        );
+    }
+
+    /// `EnumerationSolver::solve` must reject an unbound objective up-front
+    /// instead of reporting an infeasible solution.
+    #[test]
+    fn solve_rejects_unbound_objective_variable_up_front() {
+        let problem = problem_with(
+            Expr::variable("undefined_var"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![],
+            HashMap::new(),
+        );
+
+        let result = EnumerationSolver.solve(&problem);
+        assert!(
+            matches!(result, Err(SolverError::UnboundVariables { .. })),
+            "expected UnboundVariables error, got {result:?}"
         );
     }
 }
