@@ -23,7 +23,7 @@ pub fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
-pub fn load_fixture(name: &str) -> BTreeMap<String, parser::CfnResource> {
+pub fn load_fixture(name: &str) -> BTreeMap<String, parser::ResolvedResource> {
     let path = fixtures_dir().join(name);
     let tmpl = parser::parse_template(path.as_ref()).unwrap();
     parser::resolve_template(&tmpl, &HashMap::new(), &HashMap::new()).unwrap()
@@ -31,7 +31,7 @@ pub fn load_fixture(name: &str) -> BTreeMap<String, parser::CfnResource> {
 
 pub fn build_arch(
     name: &str,
-    resources: &BTreeMap<String, parser::CfnResource>,
+    resources: &BTreeMap<String, parser::ResolvedResource>,
     strict: bool,
 ) -> ArchitectureCost {
     let tmpl = parser::CfnTemplate {

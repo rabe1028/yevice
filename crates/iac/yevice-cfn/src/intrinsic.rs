@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_yaml_ng::Value;
 
 use crate::error::CfnError;
-use crate::sentinel;
+use crate::resolved::{ResolvedValue, StringPart};
 
 /// Maximum nesting depth for intrinsic function resolution.
 ///
@@ -40,8 +40,10 @@ impl ResolveContext {
 /// Handles: !Ref, !Sub, !`FindInMap`, !Select, !If, `Fn::ImportValue`,
 /// !Join, !`GetAtt` (partial).
 ///
-/// Unresolvable values are returned as-is (for forward compatibility).
-pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+/// References to resource logical IDs (which cannot be resolved statically)
+/// are preserved as typed [`ResolvedValue`] variants. Unresolvable values are
+/// returned as `Concrete` pass-throughs (for forward compatibility).
+pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<ResolvedValue, CfnError> {
     resolve_inner(value, ctx, 0)
 }
 
@@ -50,7 +52,11 @@ pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
 /// `depth` is incremented at every recursive call site. When it exceeds
 /// [`MAX_INTRINSIC_DEPTH`] an error is returned instead of recursing further,
 /// preventing stack overflows on deeply-nested templates.
-fn resolve_inner(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
+fn resolve_inner(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
     if depth > MAX_INTRINSIC_DEPTH {
         return Err(CfnError::IntrinsicError(format!(
             "intrinsic nesting exceeds maximum depth ({MAX_INTRINSIC_DEPTH})"
@@ -73,25 +79,29 @@ fn resolve_inner(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Va
                     "Fn::If" => return resolve_if(val, ctx, depth),
                     "Fn::ImportValue" => return resolve_import_value(val, ctx, depth),
                     "Fn::Join" => return resolve_join(val, ctx, depth),
-                    "Fn::GetAtt" => return resolve_get_att(val, ctx),
+                    "Fn::GetAtt" => return resolve_get_att(val),
                     _ => {}
                 }
             }
             // Recursively resolve all values in the mapping
-            let mut new_map = serde_yaml_ng::Mapping::new();
+            let mut new_map = BTreeMap::new();
             for (k, v) in map {
-                new_map.insert(k.clone(), resolve_inner(v, ctx, depth + 1)?);
+                let Some(key) = k.as_str() else {
+                    tracing::warn!(key = ?k, "non-string mapping key in properties; skipping");
+                    continue;
+                };
+                new_map.insert(key.to_string(), resolve_inner(v, ctx, depth + 1)?);
             }
-            Ok(Value::Mapping(new_map))
+            Ok(ResolvedValue::Map(new_map))
         }
         Value::Sequence(seq) => {
-            let resolved: Result<Vec<Value>, CfnError> = seq
+            let resolved: Result<Vec<ResolvedValue>, CfnError> = seq
                 .iter()
                 .map(|v| resolve_inner(v, ctx, depth + 1))
                 .collect();
-            Ok(Value::Sequence(resolved?))
+            Ok(ResolvedValue::Seq(resolved?))
         }
-        _ => Ok(value.clone()),
+        _ => Ok(ResolvedValue::Concrete(value.clone())),
     }
 }
 
@@ -99,7 +109,7 @@ fn resolve_tagged(
     tagged: &serde_yaml_ng::value::TaggedValue,
     ctx: &ResolveContext,
     depth: usize,
-) -> Result<Value, CfnError> {
+) -> Result<ResolvedValue, CfnError> {
     let tag = tagged.tag.to_string();
     match tag.as_str() {
         "!Ref" => resolve_ref(&tagged.value, ctx),
@@ -109,13 +119,15 @@ fn resolve_tagged(
         "!If" => resolve_if(&tagged.value, ctx, depth),
         "!ImportValue" => resolve_import_value(&tagged.value, ctx, depth),
         "!Join" => resolve_join(&tagged.value, ctx, depth),
-        "!GetAtt" => resolve_get_att(&tagged.value, ctx),
+        "!GetAtt" => resolve_get_att(&tagged.value),
         // Return unresolvable tagged values as-is
-        _ => Ok(Value::Tagged(Box::new(tagged.clone()))),
+        _ => Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
+            tagged.clone(),
+        )))),
     }
 }
 
-fn resolve_ref(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_ref(value: &Value, ctx: &ResolveContext) -> Result<ResolvedValue, CfnError> {
     let name = value
         .as_str()
         .ok_or_else(|| CfnError::IntrinsicError("!Ref argument must be a string".into()))?;
@@ -124,30 +136,41 @@ fn resolve_ref(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
     match name {
         "AWS::Region" => {
             if let Some(region) = ctx.parameters.get("AWS::Region") {
-                return Ok(Value::String(region.clone()));
+                return Ok(ResolvedValue::Concrete(Value::String(region.clone())));
             }
-            return Ok(Value::String("ap-northeast-1".into()));
+            return Ok(ResolvedValue::Concrete(Value::String(
+                "ap-northeast-1".into(),
+            )));
         }
-        "AWS::AccountId" => return Ok(Value::String("123456789012".into())),
-        "AWS::StackName" => return Ok(Value::String("stack".into())),
-        "AWS::NoValue" => return Ok(Value::Null),
+        "AWS::AccountId" => {
+            return Ok(ResolvedValue::Concrete(Value::String(
+                "123456789012".into(),
+            )));
+        }
+        "AWS::StackName" => return Ok(ResolvedValue::Concrete(Value::String("stack".into()))),
+        "AWS::NoValue" => return Ok(ResolvedValue::Concrete(Value::Null)),
         _ => {}
     }
 
     // Look up in parameters
     if let Some(val) = ctx.parameters.get(name) {
-        return Ok(Value::String(val.clone()));
+        return Ok(ResolvedValue::Concrete(Value::String(val.clone())));
     }
 
-    // If it's a resource logical ID, return as-is (we can't resolve resource IDs statically)
-    Ok(Value::String(sentinel::make_ref(name)))
+    // It's a resource logical ID — keep it as a typed reference (we can't
+    // resolve resource IDs statically).
+    Ok(ResolvedValue::Ref(name.to_string()))
 }
 
-fn resolve_sub(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
+fn resolve_sub(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
     match value {
         Value::String(template) => {
-            let result = substitute_variables(template, &HashMap::new(), ctx)?;
-            Ok(Value::String(result))
+            let parts = substitute_variables(template, &HashMap::new(), ctx)?;
+            Ok(ResolvedValue::from_parts(parts))
         }
         Value::Sequence(seq) => {
             if seq.len() != 2 {
@@ -164,20 +187,15 @@ fn resolve_sub(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Valu
                     for (k, v) in m {
                         if let Value::String(key) = k {
                             let resolved = resolve_inner(v, ctx, depth + 1)?;
-                            // If the resolved value is a string, use it; otherwise
-                            // insert an empty string so that ${Key} is replaced with
-                            // "" rather than being left as a bare variable name that
-                            // would fall through to the resource-ref sentinel path.
-                            let s = resolved.as_str().map_or_else(String::new, str::to_string);
-                            map.insert(key.clone(), s);
+                            map.insert(key.clone(), resolved);
                         }
                     }
                     map
                 }
                 _ => HashMap::new(),
             };
-            let result = substitute_variables(template, &vars, ctx)?;
-            Ok(Value::String(result))
+            let parts = substitute_variables(template, &vars, ctx)?;
+            Ok(ResolvedValue::from_parts(parts))
         }
         _ => Err(CfnError::IntrinsicError(
             "!Sub value must be a string or array".into(),
@@ -185,13 +203,22 @@ fn resolve_sub(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Valu
     }
 }
 
+/// Split a `Fn::Sub` template into interpolation parts, substituting local
+/// variables and template parameters and keeping resource references typed.
 fn substitute_variables(
     template: &str,
-    local_vars: &HashMap<String, String>,
+    local_vars: &HashMap<String, ResolvedValue>,
     ctx: &ResolveContext,
-) -> Result<String, CfnError> {
-    let mut result = String::new();
+) -> Result<Vec<StringPart>, CfnError> {
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut literal = String::new();
     let mut chars = template.chars().peekable();
+
+    let flush = |literal: &mut String, parts: &mut Vec<StringPart>| {
+        if !literal.is_empty() {
+            parts.push(StringPart::Literal(std::mem::take(literal)));
+        }
+    };
 
     while let Some(c) = chars.next() {
         if c == '$' && chars.peek() == Some(&'{') {
@@ -204,36 +231,64 @@ fn substitute_variables(
                 var_name.push(ch);
             }
             // ${!Literal} is the documented Fn::Sub escape for a literal ${Literal}.
-            if let Some(literal) = var_name.strip_prefix('!') {
+            if let Some(escaped) = var_name.strip_prefix('!') {
                 use std::fmt::Write;
-                let _ = write!(result, "${{{literal}}}");
+                let _ = write!(literal, "${{{escaped}}}");
             } else if let Some(val) = local_vars.get(&var_name) {
-                result.push_str(val);
+                // Local variables may themselves carry resource references.
+                match val {
+                    ResolvedValue::Concrete(Value::String(s)) => literal.push_str(s),
+                    ResolvedValue::Ref(id) => {
+                        flush(&mut literal, &mut parts);
+                        parts.push(StringPart::Ref(id.clone()));
+                    }
+                    ResolvedValue::GetAtt { logical_id, attr } => {
+                        flush(&mut literal, &mut parts);
+                        parts.push(StringPart::GetAtt {
+                            logical_id: logical_id.clone(),
+                            attr: attr.clone(),
+                        });
+                    }
+                    ResolvedValue::Interpolated(sub_parts) => {
+                        flush(&mut literal, &mut parts);
+                        parts.extend(sub_parts.iter().cloned());
+                    }
+                    // Non-string values substitute as empty string so that
+                    // ${Key} is replaced with "" rather than falling through
+                    // to the resource-ref path below.
+                    _ => {}
+                }
             } else if let Some(val) = ctx.parameters.get(&var_name) {
-                result.push_str(val);
+                literal.push_str(val);
             } else if var_name.starts_with("AWS::") {
                 // Pseudo-parameter (e.g. AWS::Region) — leave verbatim
                 use std::fmt::Write;
-                let _ = write!(result, "${{{var_name}}}");
+                let _ = write!(literal, "${{{var_name}}}");
             } else if let Some((logical, attr)) = var_name.split_once('.') {
-                // Resource attribute reference: ${Resource.Attr} → GetAtt sentinel
-                result.push_str(&sentinel::make_getatt(logical, attr));
+                // Resource attribute reference: ${Resource.Attr}
+                flush(&mut literal, &mut parts);
+                parts.push(StringPart::GetAtt {
+                    logical_id: logical.to_string(),
+                    attr: attr.to_string(),
+                });
             } else {
-                // Bare resource reference: ${Resource} → Ref sentinel
-                result.push_str(&sentinel::make_ref(&var_name));
+                // Bare resource reference: ${Resource}
+                flush(&mut literal, &mut parts);
+                parts.push(StringPart::Ref(var_name));
             }
         } else {
-            result.push(c);
+            literal.push(c);
         }
     }
-    Ok(result)
+    flush(&mut literal, &mut parts);
+    Ok(parts)
 }
 
 fn resolve_find_in_map(
     value: &Value,
     ctx: &ResolveContext,
     depth: usize,
-) -> Result<Value, CfnError> {
+) -> Result<ResolvedValue, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!FindInMap argument must be a sequence".into()))?;
@@ -256,7 +311,7 @@ fn resolve_find_in_map(
         .get(map_name)
         .and_then(|m| m.get(first_key))
         .and_then(|m| m.get(second_key))
-        .map(|v| Value::String(v.clone()))
+        .map(|v| ResolvedValue::Concrete(Value::String(v.clone())))
         .ok_or_else(|| CfnError::MappingNotFound {
             map_name: map_name.to_string(),
             first_key: first_key.to_string(),
@@ -264,7 +319,11 @@ fn resolve_find_in_map(
         })
 }
 
-fn resolve_select(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
+fn resolve_select(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!Select argument must be a sequence".into()))?;
@@ -277,12 +336,12 @@ fn resolve_select(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<V
 
     let index = resolve_inner(&seq[0], ctx, depth + 1)?;
     let index: usize = match &index {
-        Value::Number(n) => n.as_u64().ok_or_else(|| {
+        ResolvedValue::Concrete(Value::Number(n)) => n.as_u64().ok_or_else(|| {
             CfnError::IntrinsicError(format!(
                 "!Select index must be a non-negative integer, got {n}"
             ))
         })? as usize,
-        Value::String(s) => s.parse::<usize>().map_err(|_| {
+        ResolvedValue::Concrete(Value::String(s)) => s.parse::<usize>().map_err(|_| {
             CfnError::IntrinsicError(format!(
                 "!Select index must be numeric, got \"{s}\" (is the index an unresolved parameter?)"
             ))
@@ -296,15 +355,19 @@ fn resolve_select(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<V
 
     let list = resolve_inner(&seq[1], ctx, depth + 1)?;
     let list = list
-        .as_sequence()
+        .into_seq()
         .ok_or_else(|| CfnError::IntrinsicError("!Select second arg must be a list".into()))?;
 
-    list.get(index)
-        .cloned()
+    list.into_iter()
+        .nth(index)
         .ok_or_else(|| CfnError::IntrinsicError(format!("!Select index {index} out of bounds")))
 }
 
-fn resolve_if(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
+fn resolve_if(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!If argument must be a sequence".into()))?;
@@ -335,7 +398,7 @@ fn resolve_import_value(
     value: &Value,
     ctx: &ResolveContext,
     depth: usize,
-) -> Result<Value, CfnError> {
+) -> Result<ResolvedValue, CfnError> {
     let resolved = resolve_inner(value, ctx, depth + 1)?;
     let export_name = resolved.as_str().ok_or_else(|| {
         CfnError::IntrinsicError("Fn::ImportValue argument must resolve to a string".into())
@@ -343,11 +406,15 @@ fn resolve_import_value(
 
     ctx.imports
         .get(export_name)
-        .map(|v| Value::String(v.clone()))
+        .map(|v| ResolvedValue::Concrete(Value::String(v.clone())))
         .ok_or_else(|| CfnError::ImportValueNotFound(export_name.to_string()))
 }
 
-fn resolve_join(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Value, CfnError> {
+fn resolve_join(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
     let seq = value
         .as_sequence()
         .ok_or_else(|| CfnError::IntrinsicError("!Join argument must be a sequence".into()))?;
@@ -359,66 +426,97 @@ fn resolve_join(value: &Value, ctx: &ResolveContext, depth: usize) -> Result<Val
     }
 
     let delimiter = resolve_inner(&seq[0], ctx, depth + 1)?;
-    let delimiter = delimiter.as_str().unwrap_or("");
+    let delimiter = delimiter.as_str().unwrap_or("").to_string();
 
     let list = resolve_inner(&seq[1], ctx, depth + 1)?;
     let list = list
-        .as_sequence()
+        .into_seq()
         .ok_or_else(|| CfnError::IntrinsicError("!Join second arg must be a list".into()))?;
 
-    let parts: Vec<String> = list
-        .iter()
-        .filter_map(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Bool(b) => Some(b.to_string()),
+    let mut parts: Vec<StringPart> = Vec::new();
+    let mut first = true;
+    for item in list {
+        // Scalars become literals; references stay typed parts. Anything else
+        // (containers, null, …) is skipped, mirroring the previous behavior.
+        let item_parts: Option<Vec<StringPart>> = match item {
+            ResolvedValue::Concrete(Value::String(s)) => Some(vec![StringPart::Literal(s)]),
+            ResolvedValue::Concrete(Value::Number(n)) => {
+                Some(vec![StringPart::Literal(n.to_string())])
+            }
+            ResolvedValue::Concrete(Value::Bool(b)) => {
+                Some(vec![StringPart::Literal(b.to_string())])
+            }
+            ResolvedValue::Ref(id) => Some(vec![StringPart::Ref(id)]),
+            ResolvedValue::GetAtt { logical_id, attr } => {
+                Some(vec![StringPart::GetAtt { logical_id, attr }])
+            }
+            ResolvedValue::Interpolated(ps) => Some(ps),
             _ => None,
-        })
-        .collect();
+        };
+        if let Some(ps) = item_parts {
+            if !first {
+                parts.push(StringPart::Literal(delimiter.clone()));
+            }
+            parts.extend(ps);
+            first = false;
+        }
+    }
 
-    Ok(Value::String(parts.join(delimiter)))
+    Ok(ResolvedValue::from_parts(parts))
 }
 
-fn resolve_get_att(value: &Value, ctx: &ResolveContext) -> Result<Value, CfnError> {
+fn resolve_get_att(value: &Value) -> Result<ResolvedValue, CfnError> {
     // !GetAtt cannot be fully resolved statically.
-    // Return a sentinel placeholder when we have enough information (logical_id + attr),
-    // otherwise pass the value through unmodified so downstream consumers can
-    // recognise it as unresolved rather than silently dropping it.
-    let _ = ctx;
+    // Return a typed reference when we have enough information
+    // (logical_id + attr), otherwise pass the value through unmodified so
+    // downstream consumers can recognise it as unresolved rather than
+    // silently dropping it.
     match value {
         Value::String(s) => {
             // Dot-notation form: "LogicalId.Attr"
             if let Some((logical_id, attr)) = s.split_once('.') {
-                return Ok(Value::String(sentinel::make_getatt(logical_id, attr)));
+                return Ok(ResolvedValue::GetAtt {
+                    logical_id: logical_id.to_string(),
+                    attr: attr.to_string(),
+                });
             }
-            // No dot: cannot construct a valid sentinel (no attr present).
-            // Return the value as-is so downstream sees an unresolved reference.
+            // No dot: cannot construct a reference (no attr present).
+            // Return the value as-is so downstream sees an unresolved value.
             tracing::warn!(value = %s, "!GetAtt string has no dot separator — treating as unresolved");
-            Ok(value.clone())
+            Ok(ResolvedValue::Concrete(value.clone()))
         }
         Value::Sequence(seq) => {
             let parts: Vec<&str> = seq.iter().filter_map(|v| v.as_str()).collect();
             match parts.as_slice() {
-                [logical_id, attr] => Ok(Value::String(sentinel::make_getatt(logical_id, attr))),
+                [logical_id, attr] => Ok(ResolvedValue::GetAtt {
+                    logical_id: (*logical_id).to_string(),
+                    attr: (*attr).to_string(),
+                }),
                 [logical_id, rest @ ..] if !rest.is_empty() => {
                     // More than 2 elements: join remaining parts with "." as the attr.
-                    let attr = rest.join(".");
-                    Ok(Value::String(sentinel::make_getatt(logical_id, &attr)))
+                    Ok(ResolvedValue::GetAtt {
+                        logical_id: (*logical_id).to_string(),
+                        attr: rest.join("."),
+                    })
                 }
                 _ => {
                     // Empty or single-element sequence: unresolvable, pass through.
                     tracing::warn!(parts = ?parts, "!GetAtt sequence has fewer than 2 elements — treating as unresolved");
-                    Ok(value.clone())
+                    Ok(ResolvedValue::Concrete(value.clone()))
                 }
             }
         }
-        _ => Ok(value.clone()),
+        _ => Ok(ResolvedValue::Concrete(value.clone())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn concrete_str(s: &str) -> ResolvedValue {
+        ResolvedValue::Concrete(Value::String(s.into()))
+    }
 
     fn make_ctx() -> ResolveContext {
         let mut params = HashMap::new();
@@ -446,7 +544,15 @@ mod tests {
         let ctx = make_ctx();
         let val = Value::String("Env".into());
         let result = resolve_ref(&val, &ctx).unwrap();
-        assert_eq!(result, Value::String("prod".into()));
+        assert_eq!(result, concrete_str("prod"));
+    }
+
+    #[test]
+    fn test_resolve_ref_resource_becomes_typed_ref() {
+        let ctx = make_ctx();
+        let val = Value::String("MyQueue".into());
+        let result = resolve_ref(&val, &ctx).unwrap();
+        assert_eq!(result, ResolvedValue::Ref("MyQueue".into()));
     }
 
     #[test]
@@ -454,7 +560,7 @@ mod tests {
         let ctx = make_ctx();
         let val = Value::String("arn:aws:s3:::${Env}-bucket".into());
         let result = resolve_sub(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("arn:aws:s3:::prod-bucket".into()));
+        assert_eq!(result, concrete_str("arn:aws:s3:::prod-bucket"));
     }
 
     #[test]
@@ -466,7 +572,7 @@ mod tests {
             Value::String("AMI".into()),
         ]);
         let result = resolve_find_in_map(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("ami-12345".into()));
+        assert_eq!(result, concrete_str("ami-12345"));
     }
 
     #[test]
@@ -478,7 +584,7 @@ mod tests {
             Value::String("dev-value".into()),
         ]);
         let result = resolve_if(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("prod-value".into()));
+        assert_eq!(result, concrete_str("prod-value"));
     }
 
     #[test]
@@ -486,108 +592,112 @@ mod tests {
         let ctx = make_ctx();
         let val = Value::String("SharedVpcId".into());
         let result = resolve_import_value(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("vpc-12345".into()));
+        assert_eq!(result, concrete_str("vpc-12345"));
     }
 
     // --- GetAtt edge cases (#5) ---
 
-    /// A dot-notation GetAtt must produce the correct sentinel.
+    /// A dot-notation GetAtt must produce a typed GetAtt.
     #[test]
-    fn test_getatt_dot_notation_produces_sentinel() {
-        let ctx = make_ctx();
+    fn test_getatt_dot_notation_produces_typed_getatt() {
         let val = Value::String("MyBucket.Arn".into());
-        let result = resolve_get_att(&val, &ctx).unwrap();
+        let result = resolve_get_att(&val).unwrap();
         assert_eq!(
             result,
-            Value::String("{{getatt:MyBucket.Arn}}".into()),
-            "dot-notation GetAtt must produce sentinel"
+            ResolvedValue::GetAtt {
+                logical_id: "MyBucket".into(),
+                attr: "Arn".into()
+            },
+            "dot-notation GetAtt must produce a typed GetAtt"
         );
     }
 
-    /// A string with no dot must NOT produce a sentinel — it must be passed
+    /// A string with no dot must NOT produce a reference — it must be passed
     /// through as-is (unresolved).
     #[test]
     fn test_getatt_no_dot_passes_through() {
-        let ctx = make_ctx();
         let val = Value::String("MyBucketNoAttr".into());
-        let result = resolve_get_att(&val, &ctx).unwrap();
-        // Must return the original value unchanged (no sentinel generated).
+        let result = resolve_get_att(&val).unwrap();
+        // Must return the original value unchanged (no reference generated).
         assert_eq!(
             result,
-            Value::String("MyBucketNoAttr".into()),
-            "GetAtt without dot must be a pass-through, not a sentinel"
-        );
-        // And specifically must NOT contain the getatt sentinel format.
-        assert!(
-            !result.as_str().unwrap_or("").contains("{{getatt:"),
-            "no-dot GetAtt must not produce a getatt sentinel: {result:?}"
+            concrete_str("MyBucketNoAttr"),
+            "GetAtt without dot must be a pass-through, not a reference"
         );
     }
 
-    /// A sequence with exactly 2 elements must produce the correct sentinel.
+    /// A sequence with exactly 2 elements must produce the typed GetAtt.
     #[test]
-    fn test_getatt_sequence_two_elements_produces_sentinel() {
-        let ctx = make_ctx();
+    fn test_getatt_sequence_two_elements_produces_typed_getatt() {
         let val = Value::Sequence(vec![
             Value::String("MyQueue".into()),
             Value::String("Arn".into()),
         ]);
-        let result = resolve_get_att(&val, &ctx).unwrap();
-        assert_eq!(result, Value::String("{{getatt:MyQueue.Arn}}".into()));
+        let result = resolve_get_att(&val).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::GetAtt {
+                logical_id: "MyQueue".into(),
+                attr: "Arn".into()
+            }
+        );
     }
 
-    /// A sequence with 3+ elements must produce a sentinel via `make_getatt`,
-    /// joining the extra parts with ".".
+    /// A sequence with 3+ elements must join the extra parts with "." as the attr.
     #[test]
-    fn test_getatt_sequence_three_elements_uses_make_getatt() {
-        let ctx = make_ctx();
+    fn test_getatt_sequence_three_elements_joins_attr() {
         let val = Value::Sequence(vec![
             Value::String("MyResource".into()),
             Value::String("SomeNested".into()),
             Value::String("Attr".into()),
         ]);
-        let result = resolve_get_att(&val, &ctx).unwrap();
-        // make_getatt("MyResource", "SomeNested.Attr") = "{{getatt:MyResource.SomeNested.Attr}}"
+        let result = resolve_get_att(&val).unwrap();
         assert_eq!(
             result,
-            Value::String("{{getatt:MyResource.SomeNested.Attr}}".into()),
-            "3-element sequence must join tail with '.' via make_getatt"
+            ResolvedValue::GetAtt {
+                logical_id: "MyResource".into(),
+                attr: "SomeNested.Attr".into()
+            },
+            "3-element sequence must join tail with '.'"
         );
     }
 
-    // --- Sub sentinel-isation (#1) ---
+    // --- Sub reference typing (#1, reworked for #14) ---
 
-    /// `!Sub '${Fn.Arn}'` (bare resource.attr) must produce a getatt sentinel,
-    /// not the literal `${{HandlerFunction.Arn}}`.
+    /// `!Sub '${Fn.Arn}'` (bare resource.attr) must produce a typed GetAtt,
+    /// not the literal `${HandlerFunction.Arn}`.
     #[test]
-    fn test_sub_resource_attr_becomes_getatt_sentinel() {
+    fn test_sub_resource_attr_becomes_typed_getatt() {
         let ctx = make_ctx();
         let val = Value::String("${HandlerFunction.Arn}".into());
         let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("{{getatt:HandlerFunction.Arn}}".into()),
-            "!Sub '${{Resource.Attr}}' must produce a getatt sentinel"
+            ResolvedValue::GetAtt {
+                logical_id: "HandlerFunction".into(),
+                attr: "Arn".into()
+            },
+            "!Sub '${{Resource.Attr}}' must produce a typed GetAtt"
         );
     }
 
     /// `!Sub '${MyQueue}'` (bare resource ref, not in parameters) must produce
-    /// a ref sentinel, not the literal `${{MyQueue}}`.
+    /// a typed Ref, not the literal `${MyQueue}`.
     #[test]
-    fn test_sub_resource_ref_becomes_ref_sentinel() {
+    fn test_sub_resource_ref_becomes_typed_ref() {
         let ctx = make_ctx();
-        // "MyQueue" is not a parameter in make_ctx(), so it must sentinel-ise.
+        // "MyQueue" is not a parameter in make_ctx(), so it must become a Ref.
         let val = Value::String("${MyQueue}".into());
         let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("{{ref:MyQueue}}".into()),
-            "!Sub '${{Resource}}' must produce a ref sentinel"
+            ResolvedValue::Ref("MyQueue".into()),
+            "!Sub '${{Resource}}' must produce a typed Ref"
         );
     }
 
     /// `!Sub '${AWS::Region}'` must remain verbatim — pseudo-parameters are
-    /// never sentinel-ised.
+    /// never turned into references.
     #[test]
     fn test_sub_pseudo_parameter_stays_verbatim() {
         let ctx = make_ctx();
@@ -595,35 +705,54 @@ mod tests {
         let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("${AWS::Region}".into()),
-            "!Sub '${{AWS::Region}}' must remain verbatim (no sentinel)"
+            concrete_str("${AWS::Region}"),
+            "!Sub '${{AWS::Region}}' must remain verbatim (no reference)"
         );
     }
 
-    /// An embedded `!Sub` such as `'arn:...:${MyQueue}/p'` puts the sentinel
-    /// inside a longer string. The whole result is still a single string (not a
-    /// standalone sentinel), which is expected — edge extraction requires a
-    /// whole-string sentinel.
+    /// An embedded `!Sub` such as `'arn:...:${MyQueue}/p'` keeps the reference
+    /// inside an Interpolated value together with the literal text.
     #[test]
-    fn test_sub_embedded_resource_ref_is_not_standalone_sentinel() {
+    fn test_sub_embedded_resource_ref_is_interpolated() {
         let ctx = make_ctx();
         let val = Value::String("arn:aws:sqs:us-east-1:123456789012:${MyQueue}/suffix".into());
         let result = resolve_sub(&val, &ctx, 0).unwrap();
-        let s = result.as_str().unwrap();
-        // The sentinel is embedded, not the whole string.
-        assert!(
-            s.contains("{{ref:MyQueue}}"),
-            "embedded ref should contain the sentinel: {s}"
+        assert_eq!(
+            result,
+            ResolvedValue::Interpolated(vec![
+                StringPart::Literal("arn:aws:sqs:us-east-1:123456789012:".into()),
+                StringPart::Ref("MyQueue".into()),
+                StringPart::Literal("/suffix".into()),
+            ]),
+            "embedded ref must be kept as an Interpolated part"
         );
-        assert_ne!(
-            s, "{{ref:MyQueue}}",
-            "embedded ref must NOT be a standalone sentinel"
-        );
+    }
+
+    /// `!Sub` with multiple resource references must keep ALL of them as parts
+    /// (the previous sentinel design silently dropped the second one).
+    #[test]
+    fn test_sub_multiple_references_all_kept() {
+        let ctx = make_ctx();
+        let val = Value::String("${Fn1.Arn}:${Fn2.Arn}".into());
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
+        match &result {
+            ResolvedValue::Interpolated(parts) => {
+                let refs: Vec<_> = parts
+                    .iter()
+                    .filter(|p| !matches!(p, StringPart::Literal(_)))
+                    .collect();
+                assert_eq!(refs.len(), 2, "both references must be kept: {parts:?}");
+            }
+            other => panic!("expected Interpolated, got {other:?}"),
+        }
+        let refs = result.references();
+        assert_eq!(refs[0].logical_id, "Fn1");
+        assert_eq!(refs[1].logical_id, "Fn2");
     }
 
     // --- Fn::Sub ${!Literal} escape (#2) ---
 
-    /// `${!NotAVar}` must resolve to the literal `${NotAVar}` (no sentinel).
+    /// `${!NotAVar}` must resolve to the literal `${NotAVar}` (no reference).
     #[test]
     fn test_sub_bang_escape_produces_literal() {
         let ctx = make_ctx();
@@ -631,40 +760,38 @@ mod tests {
         let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("foo-${NotAVar}-bar".into()),
-            "!Sub '${{!Literal}}' must produce literal '${{Literal}}', not a sentinel"
+            concrete_str("foo-${NotAVar}-bar"),
+            "!Sub '${{!Literal}}' must produce literal '${{Literal}}', not a reference"
         );
     }
 
-    /// The escape must NOT produce any sentinel marker.
+    /// The escape must NOT produce any reference.
     #[test]
-    fn test_sub_bang_escape_does_not_sentinel() {
+    fn test_sub_bang_escape_does_not_create_reference() {
         let ctx = make_ctx();
         let val = Value::String("${!SomeVar}".into());
         let result = resolve_sub(&val, &ctx, 0).unwrap();
-        let s = result.as_str().unwrap();
         assert!(
-            !s.contains("{{ref:"),
-            "escaped variable must not produce a ref sentinel: {s}"
+            result.references().is_empty(),
+            "escaped variable must not produce a reference: {result:?}"
         );
-        assert!(
-            !s.contains("{{getatt:"),
-            "escaped variable must not produce a getatt sentinel: {s}"
-        );
-        assert_eq!(s, "${SomeVar}");
+        assert_eq!(result, concrete_str("${SomeVar}"));
     }
 
     /// Normal `${Resource}` refs alongside `${!Escaped}` must both work correctly.
     #[test]
     fn test_sub_bang_escape_mixed_with_resource_ref() {
         let ctx = make_ctx();
-        // MyQueue is not a parameter in make_ctx(), so it becomes a ref sentinel.
+        // MyQueue is not a parameter in make_ctx(), so it becomes a Ref part.
         let val = Value::String("${MyQueue}-${!NotAVar}".into());
         let result = resolve_sub(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("{{ref:MyQueue}}-${NotAVar}".into()),
-            "resource ref must sentinel-ise while escaped var stays literal"
+            ResolvedValue::Interpolated(vec![
+                StringPart::Ref("MyQueue".into()),
+                StringPart::Literal("-${NotAVar}".into()),
+            ]),
+            "resource ref must stay typed while escaped var stays literal"
         );
     }
 
@@ -686,7 +813,7 @@ mod tests {
         let result = resolve_join(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("true:suffix:false".into()),
+            concrete_str("true:suffix:false"),
             "Bool elements must be included in !Join result"
         );
     }
@@ -702,22 +829,40 @@ mod tests {
         let result = resolve_join(&val, &ctx, 0).unwrap();
         assert_eq!(
             result,
-            Value::String("false".into()),
+            concrete_str("false"),
             "single Bool element must not be silently dropped"
         );
+    }
+
+    /// `!Join` over resource references must keep every reference as a typed
+    /// part — joining two refs must NOT collapse into an ambiguous string.
+    #[test]
+    fn test_join_keeps_all_references() {
+        let ctx = make_ctx();
+        // Join [":", [{"Ref": A}, {"Ref": B}]] (long form)
+        let long_ref = |id: &str| {
+            let mut m = serde_yaml_ng::Mapping::new();
+            m.insert(Value::String("Ref".into()), Value::String(id.into()));
+            Value::Mapping(m)
+        };
+        let val = Value::Sequence(vec![
+            Value::String(":".into()),
+            Value::Sequence(vec![long_ref("ResourceA"), long_ref("ResourceB")]),
+        ]);
+        let result = resolve_join(&val, &ctx, 0).unwrap();
+        let refs = result.references();
+        assert_eq!(refs.len(), 2, "both join refs must survive: {result:?}");
+        assert_eq!(refs[0].logical_id, "ResourceA");
+        assert_eq!(refs[1].logical_id, "ResourceB");
     }
 
     // --- resolve_sub 2-arg non-string local var (#6) ---
 
     /// 2-arg `!Sub` where a local var resolves to a non-string (e.g. Number)
-    /// must substitute the key with empty string, NOT produce a `{{ref:Key}}`
-    /// sentinel.
+    /// must substitute the key with empty string, NOT produce a reference.
     #[test]
-    fn test_sub_two_arg_non_string_local_var_becomes_empty_not_sentinel() {
+    fn test_sub_two_arg_non_string_local_var_becomes_empty_not_reference() {
         let ctx = make_ctx();
-        // Template: "${NumVar}-suffix"
-        // vars mapping: NumVar -> !Ref InstanceType resolves to "t3.micro" (a string).
-        // But we want to test a Number value: use a Number literal in the mapping.
         let val = Value::Sequence(vec![
             Value::String("prefix-${NumVar}-suffix".into()),
             Value::Mapping({
@@ -730,16 +875,14 @@ mod tests {
             }),
         ]);
         let result = resolve_sub(&val, &ctx, 0).unwrap();
-        let s = result.as_str().unwrap();
-        // NumVar resolves to a Number, which is not a string — must be inserted
-        // as empty string, producing "prefix--suffix", NOT "prefix-{{ref:NumVar}}-suffix".
         assert!(
-            !s.contains("{{ref:NumVar}}"),
-            "non-string local var must not produce a ref sentinel: {s}"
+            result.references().is_empty(),
+            "non-string local var must not produce a reference: {result:?}"
         );
         assert_eq!(
-            s, "prefix--suffix",
-            "non-string local var must become empty: {s}"
+            result,
+            concrete_str("prefix--suffix"),
+            "non-string local var must become empty"
         );
     }
 
@@ -756,7 +899,35 @@ mod tests {
             }),
         ]);
         let result = resolve_sub(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("hello-world".into()));
+        assert_eq!(result, concrete_str("hello-world"));
+    }
+
+    /// 2-arg `!Sub` where a local var resolves to a resource reference must
+    /// keep the reference typed.
+    #[test]
+    fn test_sub_two_arg_ref_local_var_stays_typed() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String("arn:${V}/x".into()),
+            Value::Mapping({
+                let mut m = serde_yaml_ng::Mapping::new();
+                m.insert(Value::String("V".into()), {
+                    let mut r = serde_yaml_ng::Mapping::new();
+                    r.insert(Value::String("Ref".into()), Value::String("MyQueue".into()));
+                    Value::Mapping(r)
+                });
+                m
+            }),
+        ]);
+        let result = resolve_sub(&val, &ctx, 0).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Interpolated(vec![
+                StringPart::Literal("arn:".into()),
+                StringPart::Ref("MyQueue".into()),
+                StringPart::Literal("/x".into()),
+            ])
+        );
     }
 
     // --- resolve_select error on bad index (Fix 3) ---
@@ -798,7 +969,7 @@ mod tests {
             ]),
         ]);
         let result = resolve_select(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("second".into()));
+        assert_eq!(result, concrete_str("second"));
     }
 
     /// `!Select` with a valid Number index must still resolve correctly.
@@ -813,7 +984,7 @@ mod tests {
             ]),
         ]);
         let result = resolve_select(&val, &ctx, 0).unwrap();
-        assert_eq!(result, Value::String("first".into()));
+        assert_eq!(result, concrete_str("first"));
     }
 
     // --- Depth guard tests ---
@@ -877,7 +1048,7 @@ mod tests {
         );
         // The leaf value "leaf" joined with "-" at each level is just "leaf"
         // (only one element per list), so the final string is "leaf".
-        assert_eq!(result.unwrap(), Value::String("leaf".into()));
+        assert_eq!(result.unwrap(), concrete_str("leaf"));
     }
 
     /// Exactly at MAX_INTRINSIC_DEPTH levels must still succeed (boundary case).

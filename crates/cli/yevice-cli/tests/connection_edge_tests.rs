@@ -20,7 +20,7 @@ const REGION: &str = "ap-northeast-1";
 
 fn build_arch_connections(
     name: &str,
-    resources: &BTreeMap<String, parser::CfnResource>,
+    resources: &BTreeMap<String, parser::ResolvedResource>,
 ) -> yevice_core::resource::Architecture {
     let tmpl = parser::CfnTemplate {
         parameters: HashMap::new(),
@@ -343,7 +343,8 @@ Resources:
     let tmpl = parser::parse_template_str(template_str).unwrap();
     // DependsOn is stored but does NOT produce connection edges.
     assert_eq!(tmpl.resources.len(), 3);
-    let arch = build_arch_connections("depends-on-test", &tmpl.resources);
+    let resources = parser::resolve_template(&tmpl, &HashMap::new(), &HashMap::new()).unwrap();
+    let arch = build_arch_connections("depends-on-test", &resources);
     // No connection edges — DependsOn is metadata only.
     assert_eq!(
         arch.connections.len(),

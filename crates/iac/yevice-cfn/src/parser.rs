@@ -6,13 +6,20 @@ use yevice_core::io::read_to_string_capped;
 
 use crate::error::CfnError;
 use crate::intrinsic::{ResolveContext, resolve};
+use crate::resolved::ResolvedValue;
 
 /// Parsed `CloudFormation` template.
-pub struct CfnTemplate {
+///
+/// Generic over the resource property representation `P`:
+/// - freshly parsed templates use the default `serde_yaml_ng::Value`
+///   (raw YAML, intrinsics still tagged),
+/// - after [`resolve_template`] the properties become [`ResolvedValue`]
+///   (intrinsics evaluated, resource references typed).
+pub struct CfnTemplate<P = Value> {
     pub parameters: HashMap<String, ParameterDef>,
     pub mappings: HashMap<String, HashMap<String, HashMap<String, String>>>,
     pub conditions: HashMap<String, Value>,
-    pub resources: BTreeMap<String, CfnResource>,
+    pub resources: BTreeMap<String, CfnResource<P>>,
 }
 
 /// A `CloudFormation` parameter definition.
@@ -23,17 +30,25 @@ pub struct ParameterDef {
 }
 
 /// A `CloudFormation` resource.
+///
+/// Generic over the property representation `P` (see [`CfnTemplate`]).
 #[derive(Clone)]
-pub struct CfnResource {
+pub struct CfnResource<P = Value> {
     pub logical_id: String,
     pub resource_type: String,
-    pub properties: Value,
+    pub properties: P,
     pub condition: Option<String>,
     /// Logical IDs listed in `DependsOn` (strings or arrays of strings).
     /// Parsed for future use; not converted to edges (no `DependsOn` `ConnectionType`).
     #[allow(dead_code)]
     pub depends_on: Vec<String>,
 }
+
+/// A resource whose intrinsic functions have been resolved.
+pub type ResolvedResource = CfnResource<ResolvedValue>;
+
+/// A template whose resource properties have been resolved.
+pub type ResolvedTemplate = CfnTemplate<ResolvedValue>;
 
 /// Parse a `CloudFormation` YAML template from a file.
 pub fn parse_template(path: &Path) -> Result<CfnTemplate, CfnError> {
@@ -236,7 +251,7 @@ pub fn resolve_template(
     template: &CfnTemplate,
     param_values: &HashMap<String, String>,
     import_values: &HashMap<String, String>,
-) -> Result<BTreeMap<String, CfnResource>, CfnError> {
+) -> Result<BTreeMap<String, ResolvedResource>, CfnError> {
     // Build effective parameters: supplied values override defaults
     let mut effective_params = HashMap::new();
     for (name, def) in &template.parameters {
@@ -530,13 +545,11 @@ Resources:
 
         // MyInstance should have resolved InstanceType
         let instance = &resources["MyInstance"];
-        let inst_type = instance
-            .properties
-            .as_mapping()
-            .unwrap()
-            .get(Value::String("InstanceType".into()))
-            .unwrap();
-        assert_eq!(inst_type, &Value::String("t3.micro".into()));
+        let inst_type = instance.properties.get("InstanceType").unwrap();
+        assert_eq!(
+            inst_type,
+            &ResolvedValue::Concrete(Value::String("t3.micro".into()))
+        );
     }
 
     #[test]
@@ -594,13 +607,8 @@ Resources:
 
         // Verify FIFO queue property is preserved
         let fifo = &resources["OrderQueueFIFO"];
-        let fifo_val = fifo
-            .properties
-            .as_mapping()
-            .unwrap()
-            .get(Value::String("FifoQueue".into()))
-            .unwrap();
-        assert_eq!(fifo_val, &Value::Bool(true));
+        let fifo_val = fifo.properties.get("FifoQueue").unwrap();
+        assert_eq!(fifo_val, &ResolvedValue::Concrete(Value::Bool(true)));
     }
 
     /// Kinesis with Mappings: environment-dependent `ShardCount` via !`FindInMap`
@@ -635,25 +643,21 @@ Resources:
         params.insert("Stage".into(), "prd".into());
         let resources = resolve_template(&tmpl, &params, &HashMap::new()).unwrap();
         let stream = &resources["DataStream"];
-        let shard_count = stream
-            .properties
-            .as_mapping()
-            .unwrap()
-            .get(Value::String("ShardCount".into()))
-            .unwrap();
-        assert_eq!(shard_count, &Value::String("2".into()));
+        let shard_count = stream.properties.get("ShardCount").unwrap();
+        assert_eq!(
+            shard_count,
+            &ResolvedValue::Concrete(Value::String("2".into()))
+        );
 
         // dev -> ShardCount=1
         params.insert("Stage".into(), "dev".into());
         let resources = resolve_template(&tmpl, &params, &HashMap::new()).unwrap();
         let stream = &resources["DataStream"];
-        let shard_count = stream
-            .properties
-            .as_mapping()
-            .unwrap()
-            .get(Value::String("ShardCount".into()))
-            .unwrap();
-        assert_eq!(shard_count, &Value::String("1".into()));
+        let shard_count = stream.properties.get("ShardCount").unwrap();
+        assert_eq!(
+            shard_count,
+            &ResolvedValue::Concrete(Value::String("1".into()))
+        );
     }
 
     /// `OpenSearch` Serverless with Condition using !`FindInMap` boolean
@@ -780,26 +784,25 @@ Resources:
         let func = &resources["IngestFunction"];
         let env_vars = func
             .properties
-            .as_mapping()
+            .get("Environment")
             .unwrap()
-            .get(Value::String("Environment".into()))
-            .unwrap()
-            .as_mapping()
-            .unwrap()
-            .get(Value::String("Variables".into()))
-            .unwrap()
-            .as_mapping()
+            .get("Variables")
             .unwrap();
 
-        let stream_arn = env_vars.get(Value::String("STREAM_ARN".into())).unwrap();
+        let stream_arn = env_vars.get("STREAM_ARN").unwrap();
         assert_eq!(
             stream_arn,
-            &Value::String("arn:aws:kinesis:ap-northeast-1:123:stream/test".into())
+            &ResolvedValue::Concrete(Value::String(
+                "arn:aws:kinesis:ap-northeast-1:123:stream/test".into()
+            ))
         );
 
         // Verify FindInMap resolved
-        let log_level = env_vars.get(Value::String("LOG_LEVEL".into())).unwrap();
-        assert_eq!(log_level, &Value::String("INFO".into()));
+        let log_level = env_vars.get("LOG_LEVEL").unwrap();
+        assert_eq!(
+            log_level,
+            &ResolvedValue::Concrete(Value::String("INFO".into()))
+        );
     }
 
     /// `DynamoDB` with many tables (like base/dynamodb.yml with 18+ tables)

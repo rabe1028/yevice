@@ -49,7 +49,7 @@ fn resolve_cfn_template(
     template_path: &str,
     parameters_path: Option<&str>,
     imports_path: Option<&str>,
-) -> Result<yevice_cfn::parser::CfnTemplate> {
+) -> Result<yevice_cfn::parser::ResolvedTemplate> {
     let template = parser::parse_template(Path::new(template_path))
         .context("failed to parse CloudFormation template")?;
 
