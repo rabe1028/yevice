@@ -47,6 +47,55 @@ pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<ResolvedValue, Cfn
     resolve_inner(value, ctx, 0)
 }
 
+/// Normalize an intrinsic function name to its canonical long-form, or return
+/// `None` if the name is not a known intrinsic.
+///
+/// Both tag-form (`!Sub`, `!Ref`, …) and long-form (`Fn::Sub`, `Ref`, …) are
+/// accepted and mapped to the canonical long-form name. The returned string is
+/// always one of the keys handled in [`dispatch_intrinsic`].
+///
+/// This helper is the single source of truth for "is this name a known
+/// intrinsic?" and is extracted so it can be unit-tested independently.
+fn normalize_intrinsic_name(name: &str) -> Option<&'static str> {
+    match name {
+        "!Ref" | "Ref" => Some("Ref"),
+        "!Sub" | "Fn::Sub" => Some("Fn::Sub"),
+        "!FindInMap" | "Fn::FindInMap" => Some("Fn::FindInMap"),
+        "!Select" | "Fn::Select" => Some("Fn::Select"),
+        "!If" | "Fn::If" => Some("Fn::If"),
+        "!ImportValue" | "Fn::ImportValue" => Some("Fn::ImportValue"),
+        "!Join" | "Fn::Join" => Some("Fn::Join"),
+        "!GetAtt" | "Fn::GetAtt" => Some("Fn::GetAtt"),
+        "!Split" | "Fn::Split" => Some("Fn::Split"),
+        _ => None,
+    }
+}
+
+/// Dispatch a resolved canonical intrinsic name to its handler.
+///
+/// `canonical` must be a value returned by [`normalize_intrinsic_name`].
+/// `value` is the argument node of the intrinsic.
+fn dispatch_intrinsic(
+    canonical: &str,
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
+    match canonical {
+        "Ref" => resolve_ref(value, ctx),
+        "Fn::Sub" => resolve_sub(value, ctx, depth),
+        "Fn::FindInMap" => resolve_find_in_map(value, ctx, depth),
+        "Fn::Select" => resolve_select(value, ctx, depth),
+        "Fn::If" => resolve_if(value, ctx, depth),
+        "Fn::ImportValue" => resolve_import_value(value, ctx, depth),
+        "Fn::Join" => resolve_join(value, ctx, depth),
+        "Fn::GetAtt" => resolve_get_att(value),
+        "Fn::Split" => resolve_split(value, ctx, depth),
+        // Safety: callers must only pass canonical names from normalize_intrinsic_name.
+        other => unreachable!("unknown canonical intrinsic: {other}"),
+    }
+}
+
 /// Depth-aware implementation of [`resolve`].
 ///
 /// `depth` is incremented at every recursive call site. When it exceeds
@@ -64,23 +113,35 @@ fn resolve_inner(
     }
 
     match value {
-        Value::Tagged(tagged) => resolve_tagged(tagged, ctx, depth),
+        Value::Tagged(tagged) => {
+            let tag = tagged.tag.to_string();
+            if let Some(canonical) = normalize_intrinsic_name(tag.as_str()) {
+                dispatch_intrinsic(canonical, &tagged.value, ctx, depth)
+            } else {
+                // Unknown tag — warn and pass through.
+                tracing::warn!(
+                    tag = %tag,
+                    "unknown intrinsic tag encountered; passing through as-is"
+                );
+                Ok(ResolvedValue::Concrete(Value::Tagged(tagged.clone())))
+            }
+        }
         Value::Mapping(map) => {
             // Check for long-form intrinsic functions (e.g., {"Fn::Sub": "..."})
             if map.len() == 1
                 && let Some((key, val)) = map.iter().next()
                 && let Value::String(fn_name) = key
             {
-                match fn_name.as_str() {
-                    "Ref" => return resolve_ref(val, ctx),
-                    "Fn::Sub" => return resolve_sub(val, ctx, depth),
-                    "Fn::FindInMap" => return resolve_find_in_map(val, ctx, depth),
-                    "Fn::Select" => return resolve_select(val, ctx, depth),
-                    "Fn::If" => return resolve_if(val, ctx, depth),
-                    "Fn::ImportValue" => return resolve_import_value(val, ctx, depth),
-                    "Fn::Join" => return resolve_join(val, ctx, depth),
-                    "Fn::GetAtt" => return resolve_get_att(val),
-                    _ => {}
+                if let Some(canonical) = normalize_intrinsic_name(fn_name.as_str()) {
+                    return dispatch_intrinsic(canonical, val, ctx, depth);
+                } else if fn_name.starts_with("Fn::") {
+                    // Single-key map whose key looks like an intrinsic but is
+                    // not one we handle — warn and fall through to the generic
+                    // map resolver below.
+                    tracing::warn!(
+                        fn_name = %fn_name,
+                        "unknown intrinsic function encountered; passing through as-is"
+                    );
                 }
             }
             // Recursively resolve all values in the mapping
@@ -102,28 +163,6 @@ fn resolve_inner(
             Ok(ResolvedValue::Seq(resolved?))
         }
         _ => Ok(ResolvedValue::Concrete(value.clone())),
-    }
-}
-
-fn resolve_tagged(
-    tagged: &serde_yaml_ng::value::TaggedValue,
-    ctx: &ResolveContext,
-    depth: usize,
-) -> Result<ResolvedValue, CfnError> {
-    let tag = tagged.tag.to_string();
-    match tag.as_str() {
-        "!Ref" => resolve_ref(&tagged.value, ctx),
-        "!Sub" => resolve_sub(&tagged.value, ctx, depth),
-        "!FindInMap" => resolve_find_in_map(&tagged.value, ctx, depth),
-        "!Select" => resolve_select(&tagged.value, ctx, depth),
-        "!If" => resolve_if(&tagged.value, ctx, depth),
-        "!ImportValue" => resolve_import_value(&tagged.value, ctx, depth),
-        "!Join" => resolve_join(&tagged.value, ctx, depth),
-        "!GetAtt" => resolve_get_att(&tagged.value),
-        // Return unresolvable tagged values as-is
-        _ => Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
-            tagged.clone(),
-        )))),
     }
 }
 
@@ -353,8 +392,42 @@ fn resolve_select(
         }
     };
 
-    let list = resolve_inner(&seq[1], ctx, depth + 1)?;
-    let list = list
+    let list_resolved = resolve_inner(&seq[1], ctx, depth + 1)?;
+
+    // Helper: detect whether the resolved list is something we cannot iterate
+    // statically (tagged pass-through, resource reference, or interpolated
+    // string that happens to be the list argument, or a long-form unknown
+    // intrinsic represented as a single-key Fn::* Map).
+    let is_unresolvable_list = matches!(
+        &list_resolved,
+        ResolvedValue::Concrete(Value::Tagged(_))
+            | ResolvedValue::Ref(_)
+            | ResolvedValue::GetAtt { .. }
+            | ResolvedValue::Interpolated(_)
+    ) || matches!(&list_resolved, ResolvedValue::Map(map)
+        if map.len() == 1 && map.keys().next().is_some_and(|k| k.starts_with("Fn::")));
+
+    if is_unresolvable_list {
+        // We cannot select from an unresolvable list, but we must preserve any
+        // resource references that are already encoded in the resolved list
+        // value.  Returning the raw YAML wrapped in a Concrete(Tagged) would
+        // discard those typed references (they live inside list_resolved, not
+        // inside the original YAML node), causing downstream reference-
+        // extraction walks in convert.rs to miss them.
+        //
+        // Instead, return the already-resolved list value directly.  "Index
+        // selection is impossible at static-analysis time" but "the
+        // dependencies (references) must not be lost" — callers that consume
+        // the result as a sequence already handle non-sequence pass-throughs
+        // with their own guard (resolve_split does the same for its source).
+        tracing::warn!(
+            index = index,
+            "!Select list is unresolvable; passing through resolved list value to preserve references"
+        );
+        return Ok(list_resolved);
+    }
+
+    let list = list_resolved
         .into_seq()
         .ok_or_else(|| CfnError::IntrinsicError("!Select second arg must be a list".into()))?;
 
@@ -507,6 +580,113 @@ fn resolve_get_att(value: &Value) -> Result<ResolvedValue, CfnError> {
             }
         }
         _ => Ok(ResolvedValue::Concrete(value.clone())),
+    }
+}
+
+/// Resolve `Fn::Split` / `!Split`.
+///
+/// Argument format: `[separator, source_string]`.
+///
+/// Resolution rules:
+/// - If `source` resolves to a fully-concrete `String` (i.e. contains no
+///   resource references), the split is performed immediately and the result
+///   is returned as `ResolvedValue::Seq`.
+/// - If `source` is `Interpolated` (contains unresolved resource references),
+///   the split positions are indeterminate at static-analysis time, so we
+///   emit a warning and pass the value through unchanged as `Concrete`.
+fn resolve_split(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
+    let seq = value
+        .as_sequence()
+        .ok_or_else(|| CfnError::IntrinsicError("Fn::Split argument must be a sequence".into()))?;
+
+    if seq.len() != 2 {
+        return Err(CfnError::IntrinsicError(
+            "Fn::Split must have exactly 2 elements".into(),
+        ));
+    }
+
+    let separator = resolve_inner(&seq[0], ctx, depth + 1)?;
+    let separator = separator.as_str().ok_or_else(|| {
+        CfnError::IntrinsicError(
+            "Fn::Split separator (first element) must resolve to a string".into(),
+        )
+    })?;
+    let separator = separator.to_string();
+
+    let source = resolve_inner(&seq[1], ctx, depth + 1)?;
+
+    match &source {
+        ResolvedValue::Concrete(Value::String(s)) => {
+            // Source is fully known — split immediately.
+            let parts: Vec<ResolvedValue> = s
+                .split(separator.as_str())
+                .map(|part| ResolvedValue::Concrete(Value::String(part.to_string())))
+                .collect();
+            Ok(ResolvedValue::Seq(parts))
+        }
+        ResolvedValue::Interpolated(_) | ResolvedValue::Ref(_) | ResolvedValue::GetAtt { .. } => {
+            // Source contains unresolved resource references; the exact split
+            // positions cannot be determined statically.  Warn and return the
+            // *resolved source value directly* so that its typed references
+            // (Ref / GetAtt / Interpolated parts) remain accessible to the
+            // downstream reference-extraction walks in convert.rs.  Callers
+            // that need a sequence (e.g. resolve_select) already handle
+            // non-sequence pass-throughs with their own guard.
+            tracing::warn!(
+                separator = %separator,
+                source = ?source,
+                "Fn::Split source contains unresolved references; \
+                 split positions are indeterminate — passing through source as-is"
+            );
+            Ok(source)
+        }
+        ResolvedValue::Concrete(Value::Tagged(_)) => {
+            // Source resolved to an unknown pass-through intrinsic in
+            // tag-form (e.g. `!Base64 "a,b"`).  We cannot split statically.
+            // Preserve the original !Split tagged expression so the caller
+            // sees it as an unresolved sequence-like value.
+            tracing::warn!(
+                separator = %separator,
+                source = ?source,
+                "Fn::Split source is an unresolved intrinsic; passing through as-is"
+            );
+            Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
+                serde_yaml_ng::value::TaggedValue {
+                    tag: serde_yaml_ng::value::Tag::new("!Split"),
+                    value: value.clone(),
+                },
+            ))))
+        }
+        ResolvedValue::Map(map)
+            if map.len() == 1 && map.keys().next().is_some_and(|k| k.starts_with("Fn::")) =>
+        {
+            // Source resolved to a single-key map whose key has the `Fn::`
+            // prefix — this is the long-form equivalent of an unknown tagged
+            // intrinsic (e.g. `{"Fn::Base64": "a,b"}`).  Treat identically
+            // to the `Concrete(Value::Tagged(_))` case above so that tagged
+            // and long-form templates behave consistently.
+            tracing::warn!(
+                separator = %separator,
+                source = ?source,
+                "Fn::Split source is an unresolved long-form intrinsic; passing through as-is"
+            );
+            Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
+                serde_yaml_ng::value::TaggedValue {
+                    tag: serde_yaml_ng::value::Tag::new("!Split"),
+                    value: value.clone(),
+                },
+            ))))
+        }
+        _ => {
+            // Any other non-string source (null, map, seq, …) — error out.
+            Err(CfnError::IntrinsicError(format!(
+                "Fn::Split source (second element) must be a string, got {source:?}"
+            )))
+        }
     }
 }
 
@@ -1079,6 +1259,385 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err one level past MAX_INTRINSIC_DEPTH, got: {result:?}"
+        );
+    }
+
+    // --- normalize_intrinsic_name unit tests ---
+
+    /// All tag-form and long-form variants of known intrinsics must return a
+    /// canonical name (not `None`).
+    #[test]
+    fn test_normalize_known_intrinsics_returns_some() {
+        let known = [
+            ("!Ref", "Ref"),
+            ("Ref", "Ref"),
+            ("!Sub", "Fn::Sub"),
+            ("Fn::Sub", "Fn::Sub"),
+            ("!FindInMap", "Fn::FindInMap"),
+            ("Fn::FindInMap", "Fn::FindInMap"),
+            ("!Select", "Fn::Select"),
+            ("Fn::Select", "Fn::Select"),
+            ("!If", "Fn::If"),
+            ("Fn::If", "Fn::If"),
+            ("!ImportValue", "Fn::ImportValue"),
+            ("Fn::ImportValue", "Fn::ImportValue"),
+            ("!Join", "Fn::Join"),
+            ("Fn::Join", "Fn::Join"),
+            ("!GetAtt", "Fn::GetAtt"),
+            ("Fn::GetAtt", "Fn::GetAtt"),
+            ("!Split", "Fn::Split"),
+            ("Fn::Split", "Fn::Split"),
+        ];
+        for (input, expected) in known {
+            assert_eq!(
+                normalize_intrinsic_name(input),
+                Some(expected),
+                "normalize_intrinsic_name({input:?}) should be Some({expected:?})"
+            );
+        }
+    }
+
+    /// Unknown names must return `None`.
+    #[test]
+    fn test_normalize_unknown_intrinsic_returns_none() {
+        let unknown = [
+            "Fn::Base64",
+            "Fn::Cidr",
+            "Fn::Transform",
+            "Fn::Length",
+            "Fn::ToJsonString",
+            "Fn::ForEach",
+            "!Base64",
+            "SomeRandomKey",
+        ];
+        for name in unknown {
+            assert_eq!(
+                normalize_intrinsic_name(name),
+                None,
+                "normalize_intrinsic_name({name:?}) should be None"
+            );
+        }
+    }
+
+    // --- Fn::Split tests ---
+
+    /// `Fn::Split` on a concrete string must produce a `Seq` of the parts.
+    #[test]
+    fn test_split_concrete_string() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String(",".into()),
+            Value::String("a,b,c".into()),
+        ]);
+        let result = resolve_split(&val, &ctx, 0).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Seq(vec![
+                concrete_str("a"),
+                concrete_str("b"),
+                concrete_str("c"),
+            ]),
+            "Fn::Split on a concrete string must produce a Seq of parts"
+        );
+    }
+
+    /// `Fn::Split` long-form via `resolve` must also work.
+    #[test]
+    fn test_split_long_form_via_resolve() {
+        let ctx = make_ctx();
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert(
+            Value::String("Fn::Split".into()),
+            Value::Sequence(vec![Value::String(",".into()), Value::String("x,y".into())]),
+        );
+        let result = resolve(&Value::Mapping(m), &ctx).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Seq(vec![concrete_str("x"), concrete_str("y")]),
+        );
+    }
+
+    /// `!Split` tag-form via `resolve` must also work.
+    #[test]
+    fn test_split_tag_form_via_resolve() {
+        let ctx = make_ctx();
+        let tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Split"),
+            value: Value::Sequence(vec![
+                Value::String("|".into()),
+                Value::String("one|two|three".into()),
+            ]),
+        }));
+        let result = resolve(&tagged, &ctx).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Seq(vec![
+                concrete_str("one"),
+                concrete_str("two"),
+                concrete_str("three"),
+            ]),
+        );
+    }
+
+    /// `!Select [1, !Split [",", "a,b,c"]]` must resolve to "b".
+    #[test]
+    fn test_select_with_split_nested() {
+        let ctx = make_ctx();
+        // Build: !Select [1, !Split [",", "a,b,c"]]
+        let split_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Split"),
+            value: Value::Sequence(vec![
+                Value::String(",".into()),
+                Value::String("a,b,c".into()),
+            ]),
+        }));
+        let select_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Select"),
+            value: Value::Sequence(vec![
+                Value::Number(serde_yaml_ng::value::Number::from(1_u64)),
+                split_tagged,
+            ]),
+        }));
+        let result = resolve(&select_tagged, &ctx).unwrap();
+        assert_eq!(
+            result,
+            concrete_str("b"),
+            "!Select [1, !Split [\",\", \"a,b,c\"]] must yield \"b\""
+        );
+    }
+
+    /// `!Select [0, !Split [",", !Sub "${MyQueue},x"]]` — when the Split
+    /// source is Interpolated, the whole expression must pass through without
+    /// error AND the `MyQueue` reference that lives inside the Interpolated
+    /// value must be visible via `references()`.
+    ///
+    /// The previous behaviour wrapped the raw YAML in
+    /// `Concrete(Tagged(!Select ...))`, which discarded the already-resolved
+    /// typed references.  The fix returns the resolved list value directly.
+    #[test]
+    fn test_select_with_unresolvable_split_passes_through_preserving_references() {
+        let ctx = make_ctx();
+        // !Sub "${MyQueue},x" → Interpolated (MyQueue is not a parameter)
+        let sub_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Sub"),
+            value: Value::String("${MyQueue},x".into()),
+        }));
+        let split_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Split"),
+            value: Value::Sequence(vec![Value::String(",".into()), sub_tagged]),
+        }));
+        let select_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Select"),
+            value: Value::Sequence(vec![
+                Value::Number(serde_yaml_ng::value::Number::from(0_u64)),
+                split_tagged,
+            ]),
+        }));
+        let result = resolve(&select_tagged, &ctx);
+        assert!(
+            result.is_ok(),
+            "!Select over unresolvable !Split must not error, got: {result:?}"
+        );
+        let resolved = result.unwrap();
+        // The result must NOT be Concrete(Tagged(!Select ...)) — that form
+        // discards the typed references stored in the resolved list value.
+        // Instead the resolved list value (Interpolated) is returned directly,
+        // so references() surfaces MyQueue to the downstream graph builder.
+        let refs = resolved.references();
+        assert!(
+            !refs.is_empty(),
+            "!Select pass-through must preserve references from the list; got none for {resolved:?}"
+        );
+        assert_eq!(
+            refs[0].logical_id, "MyQueue",
+            "expected MyQueue reference, got {refs:?}"
+        );
+    }
+
+    /// `Fn::Select [0, {Fn::GetAZs: ""}]` — long-form unknown intrinsic as
+    /// the Select list must degrade gracefully (pass-through, no error), just
+    /// like the tag-form `!Select [0, !GetAZs ""]` (parity fix identified by
+    /// codex review, Refs #19).
+    #[test]
+    fn test_select_long_form_unknown_intrinsic_list_passes_through() {
+        let ctx = make_ctx();
+
+        // Build: {"Fn::Select": [0, {"Fn::GetAZs": ""}]}
+        let mut getazs_map = serde_yaml_ng::Mapping::new();
+        getazs_map.insert(
+            Value::String("Fn::GetAZs".into()),
+            Value::String(String::new()),
+        );
+        let val = Value::Sequence(vec![
+            Value::Number(serde_yaml_ng::value::Number::from(0_u64)),
+            Value::Mapping(getazs_map),
+        ]);
+        let result = resolve_select(&val, &ctx, 0);
+        assert!(
+            result.is_ok(),
+            "Fn::Select with long-form unknown intrinsic list must not error, got: {result:?}"
+        );
+    }
+
+    /// `!Split [",", !Base64 "a,b"]` — when the source is an unknown
+    /// pass-through intrinsic (Concrete(Tagged)), Split must not error.
+    #[test]
+    fn test_split_unknown_intrinsic_source_passes_through() {
+        let ctx = make_ctx();
+        let base64_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Base64"),
+            value: Value::String("a,b".into()),
+        }));
+        let val = Value::Sequence(vec![Value::String(",".into()), base64_tagged]);
+        let result = resolve_split(&val, &ctx, 0);
+        assert!(
+            result.is_ok(),
+            "Fn::Split with unknown intrinsic source must not error, got: {result:?}"
+        );
+        // Must be a Concrete(Tagged(!Split ...)) pass-through, not a Seq.
+        match result.unwrap() {
+            ResolvedValue::Concrete(Value::Tagged(t)) => {
+                assert_eq!(
+                    t.tag.to_string(),
+                    "!Split",
+                    "pass-through must be tagged !Split, got {:?}",
+                    t.tag
+                );
+            }
+            other => panic!("expected Concrete(Tagged(!Split ...)), got {other:?}"),
+        }
+    }
+
+    /// `Fn::Split [",", {"Fn::Base64": "a,b"}]` — long-form unknown intrinsic
+    /// as the Split source must behave identically to the tag-form
+    /// `!Split [",", !Base64 "a,b"]`: both must pass through without error and
+    /// produce a `Concrete(Tagged(!Split ...))` result.
+    ///
+    /// This tests parity between tagged and long-form representations of the
+    /// same template construct (Issue #19 comment 3404981486).
+    #[test]
+    fn test_split_long_form_unknown_intrinsic_source_same_as_tag_form() {
+        let ctx = make_ctx();
+
+        // --- tag-form: !Split [",", !Base64 "a,b"] ---
+        let base64_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Base64"),
+            value: Value::String("a,b".into()),
+        }));
+        let tag_val = Value::Sequence(vec![Value::String(",".into()), base64_tagged]);
+        let tag_result = resolve_split(&tag_val, &ctx, 0);
+        assert!(
+            tag_result.is_ok(),
+            "tag-form: Fn::Split with !Base64 source must not error, got: {tag_result:?}"
+        );
+
+        // --- long-form: {"Fn::Split": [",", {"Fn::Base64": "a,b"}]} ---
+        let mut base64_map = serde_yaml_ng::Mapping::new();
+        base64_map.insert(
+            Value::String("Fn::Base64".into()),
+            Value::String("a,b".into()),
+        );
+        let long_val = Value::Sequence(vec![Value::String(",".into()), Value::Mapping(base64_map)]);
+        let long_result = resolve_split(&long_val, &ctx, 0);
+        assert!(
+            long_result.is_ok(),
+            "long-form: Fn::Split with {{\"Fn::Base64\": ...}} source must not error, got: {long_result:?}"
+        );
+
+        // Both must produce a Concrete(Tagged(!Split ...)) pass-through.
+        for (label, result) in [
+            ("tag-form", tag_result.unwrap()),
+            ("long-form", long_result.unwrap()),
+        ] {
+            match result {
+                ResolvedValue::Concrete(Value::Tagged(ref t)) => {
+                    assert_eq!(
+                        t.tag.to_string(),
+                        "!Split",
+                        "{label}: pass-through must be tagged !Split, got {:?}",
+                        t.tag
+                    );
+                }
+                other => panic!("{label}: expected Concrete(Tagged(!Split ...)), got {other:?}"),
+            }
+        }
+    }
+
+    /// `Fn::Split` where source is an `Interpolated` value (unresolved ref)
+    /// must pass through as the source value (not error, not a Seq), and
+    /// the resource references in the source must be preserved.
+    #[test]
+    fn test_split_interpolated_source_passes_through() {
+        let ctx = make_ctx();
+        // Build a source that resolves to an Interpolated value: !Sub "a,${MyQueue},c"
+        let sub_val = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Sub"),
+            value: Value::String("a,${MyQueue},c".into()),
+        }));
+        // We call resolve_split directly with the pre-built argument sequence.
+        // The second element is the !Sub expression.
+        let val = Value::Sequence(vec![Value::String(",".into()), sub_val]);
+        let result = resolve_split(&val, &ctx, 0);
+        assert!(
+            result.is_ok(),
+            "Fn::Split on an Interpolated source must not error, got: {result:?}"
+        );
+        let resolved = result.unwrap();
+        // Must be a pass-through, not a Seq.
+        assert!(
+            !matches!(resolved, ResolvedValue::Seq(_)),
+            "Fn::Split on Interpolated source must not produce a Seq"
+        );
+        // The resource reference inside the Interpolated source must be
+        // preserved so downstream reference-extraction walks still find it.
+        let refs = resolved.references();
+        assert!(
+            !refs.is_empty(),
+            "Fn::Split pass-through must preserve source references; got none"
+        );
+        assert_eq!(
+            refs[0].logical_id, "MyQueue",
+            "expected MyQueue reference, got {refs:?}"
+        );
+    }
+
+    // --- Unknown intrinsic pass-through (warn) ---
+
+    /// An unknown `!Tag` must pass through as `Concrete` without returning an
+    /// error (silent degradation, but a warning is emitted at runtime).
+    #[test]
+    fn test_unknown_tag_passes_through() {
+        let ctx = make_ctx();
+        let tagged_val = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Base64"),
+            value: Value::String("hello".into()),
+        }));
+        let result = resolve(&tagged_val, &ctx);
+        assert!(
+            result.is_ok(),
+            "unknown tag must not return an error, got: {result:?}"
+        );
+        // The returned value must be Concrete (pass-through), not a reference.
+        assert!(
+            result.unwrap().references().is_empty(),
+            "unknown tag pass-through must carry no references"
+        );
+    }
+
+    /// An unknown `Fn::*` single-key map must pass through as a resolved map
+    /// (the key and value are kept) without returning an error.
+    #[test]
+    fn test_unknown_fn_map_passes_through() {
+        let ctx = make_ctx();
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert(
+            Value::String("Fn::Transform".into()),
+            Value::String("some-macro".into()),
+        );
+        let result = resolve(&Value::Mapping(m), &ctx);
+        assert!(
+            result.is_ok(),
+            "unknown Fn::* map must not return an error, got: {result:?}"
         );
     }
 }
