@@ -66,6 +66,7 @@ fn normalize_intrinsic_name(name: &str) -> Option<&'static str> {
         "!ImportValue" | "Fn::ImportValue" => Some("Fn::ImportValue"),
         "!Join" | "Fn::Join" => Some("Fn::Join"),
         "!GetAtt" | "Fn::GetAtt" => Some("Fn::GetAtt"),
+        "!Split" | "Fn::Split" => Some("Fn::Split"),
         _ => None,
     }
 }
@@ -89,6 +90,7 @@ fn dispatch_intrinsic(
         "Fn::ImportValue" => resolve_import_value(value, ctx, depth),
         "Fn::Join" => resolve_join(value, ctx, depth),
         "Fn::GetAtt" => resolve_get_att(value),
+        "Fn::Split" => resolve_split(value, ctx, depth),
         // Safety: callers must only pass canonical names from normalize_intrinsic_name.
         other => unreachable!("unknown canonical intrinsic: {other}"),
     }
@@ -544,6 +546,78 @@ fn resolve_get_att(value: &Value) -> Result<ResolvedValue, CfnError> {
             }
         }
         _ => Ok(ResolvedValue::Concrete(value.clone())),
+    }
+}
+
+/// Resolve `Fn::Split` / `!Split`.
+///
+/// Argument format: `[separator, source_string]`.
+///
+/// Resolution rules:
+/// - If `source` resolves to a fully-concrete `String` (i.e. contains no
+///   resource references), the split is performed immediately and the result
+///   is returned as `ResolvedValue::Seq`.
+/// - If `source` is `Interpolated` (contains unresolved resource references),
+///   the split positions are indeterminate at static-analysis time, so we
+///   emit a warning and pass the value through unchanged as `Concrete`.
+fn resolve_split(
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
+    let seq = value
+        .as_sequence()
+        .ok_or_else(|| CfnError::IntrinsicError("Fn::Split argument must be a sequence".into()))?;
+
+    if seq.len() != 2 {
+        return Err(CfnError::IntrinsicError(
+            "Fn::Split must have exactly 2 elements".into(),
+        ));
+    }
+
+    let separator = resolve_inner(&seq[0], ctx, depth + 1)?;
+    let separator = separator.as_str().ok_or_else(|| {
+        CfnError::IntrinsicError(
+            "Fn::Split separator (first element) must resolve to a string".into(),
+        )
+    })?;
+    let separator = separator.to_string();
+
+    let source = resolve_inner(&seq[1], ctx, depth + 1)?;
+
+    match &source {
+        ResolvedValue::Concrete(Value::String(s)) => {
+            // Source is fully known — split immediately.
+            let parts: Vec<ResolvedValue> = s
+                .split(separator.as_str())
+                .map(|part| ResolvedValue::Concrete(Value::String(part.to_string())))
+                .collect();
+            Ok(ResolvedValue::Seq(parts))
+        }
+        ResolvedValue::Interpolated(_) | ResolvedValue::Ref(_) | ResolvedValue::GetAtt { .. } => {
+            // Source contains unresolved resource references; the exact split
+            // positions cannot be determined statically.  Warn and pass through
+            // so downstream logic sees the raw value rather than silently
+            // producing incorrect results.
+            tracing::warn!(
+                separator = %separator,
+                source = ?source,
+                "Fn::Split source contains unresolved references; \
+                 split positions are indeterminate — passing through as-is"
+            );
+            Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
+                serde_yaml_ng::value::TaggedValue {
+                    tag: serde_yaml_ng::value::Tag::new("!Split"),
+                    value: value.clone(),
+                },
+            ))))
+        }
+        _ => {
+            // Any other non-string source (null, map, seq, …) — error out.
+            Err(CfnError::IntrinsicError(format!(
+                "Fn::Split source (second element) must be a string, got {source:?}"
+            )))
+        }
     }
 }
 
@@ -1142,6 +1216,8 @@ mod tests {
             ("Fn::Join", "Fn::Join"),
             ("!GetAtt", "Fn::GetAtt"),
             ("Fn::GetAtt", "Fn::GetAtt"),
+            ("!Split", "Fn::Split"),
+            ("Fn::Split", "Fn::Split"),
         ];
         for (input, expected) in known {
             assert_eq!(
@@ -1162,9 +1238,7 @@ mod tests {
             "Fn::Length",
             "Fn::ToJsonString",
             "Fn::ForEach",
-            "Fn::Split",
             "!Base64",
-            "!Split",
             "SomeRandomKey",
         ];
         for name in unknown {
@@ -1174,6 +1248,118 @@ mod tests {
                 "normalize_intrinsic_name({name:?}) should be None"
             );
         }
+    }
+
+    // --- Fn::Split tests ---
+
+    /// `Fn::Split` on a concrete string must produce a `Seq` of the parts.
+    #[test]
+    fn test_split_concrete_string() {
+        let ctx = make_ctx();
+        let val = Value::Sequence(vec![
+            Value::String(",".into()),
+            Value::String("a,b,c".into()),
+        ]);
+        let result = resolve_split(&val, &ctx, 0).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Seq(vec![
+                concrete_str("a"),
+                concrete_str("b"),
+                concrete_str("c"),
+            ]),
+            "Fn::Split on a concrete string must produce a Seq of parts"
+        );
+    }
+
+    /// `Fn::Split` long-form via `resolve` must also work.
+    #[test]
+    fn test_split_long_form_via_resolve() {
+        let ctx = make_ctx();
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert(
+            Value::String("Fn::Split".into()),
+            Value::Sequence(vec![Value::String(",".into()), Value::String("x,y".into())]),
+        );
+        let result = resolve(&Value::Mapping(m), &ctx).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Seq(vec![concrete_str("x"), concrete_str("y")]),
+        );
+    }
+
+    /// `!Split` tag-form via `resolve` must also work.
+    #[test]
+    fn test_split_tag_form_via_resolve() {
+        let ctx = make_ctx();
+        let tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Split"),
+            value: Value::Sequence(vec![
+                Value::String("|".into()),
+                Value::String("one|two|three".into()),
+            ]),
+        }));
+        let result = resolve(&tagged, &ctx).unwrap();
+        assert_eq!(
+            result,
+            ResolvedValue::Seq(vec![
+                concrete_str("one"),
+                concrete_str("two"),
+                concrete_str("three"),
+            ]),
+        );
+    }
+
+    /// `!Select [1, !Split [",", "a,b,c"]]` must resolve to "b".
+    #[test]
+    fn test_select_with_split_nested() {
+        let ctx = make_ctx();
+        // Build: !Select [1, !Split [",", "a,b,c"]]
+        let split_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Split"),
+            value: Value::Sequence(vec![
+                Value::String(",".into()),
+                Value::String("a,b,c".into()),
+            ]),
+        }));
+        let select_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Select"),
+            value: Value::Sequence(vec![
+                Value::Number(serde_yaml_ng::value::Number::from(1_u64)),
+                split_tagged,
+            ]),
+        }));
+        let result = resolve(&select_tagged, &ctx).unwrap();
+        assert_eq!(
+            result,
+            concrete_str("b"),
+            "!Select [1, !Split [\",\", \"a,b,c\"]] must yield \"b\""
+        );
+    }
+
+    /// `Fn::Split` where source is an `Interpolated` value (unresolved ref)
+    /// must pass through as Concrete (not error) and emit a warning.
+    #[test]
+    fn test_split_interpolated_source_passes_through() {
+        let ctx = make_ctx();
+        // Build a source that resolves to an Interpolated value: !Sub "a,${MyQueue},c"
+        let sub_val = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Sub"),
+            value: Value::String("a,${MyQueue},c".into()),
+        }));
+        // We call resolve_split directly with the pre-built argument sequence.
+        // The second element is the !Sub expression.
+        let val = Value::Sequence(vec![Value::String(",".into()), sub_val]);
+        let result = resolve_split(&val, &ctx, 0);
+        assert!(
+            result.is_ok(),
+            "Fn::Split on an Interpolated source must not error, got: {result:?}"
+        );
+        // Must be a pass-through (Concrete), not a Seq.
+        assert!(
+            !matches!(result.unwrap(), ResolvedValue::Seq(_)),
+            "Fn::Split on Interpolated source must not produce a Seq"
+        );
     }
 
     // --- Unknown intrinsic pass-through (warn) ---
