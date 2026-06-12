@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::bulk_api::{PricingEntry, find_entries, first_price, parse_bulk_pricing};
+use crate::bulk_api::{
+    PricingEntry, find_entries, find_entries_by_family, first_price, parse_bulk_pricing,
+};
 use crate::error::PricingError;
 use crate::model::*;
 
@@ -206,12 +208,10 @@ impl FilePricingRegistry {
     /// independently of the RDS instance-pricing fallback.
     pub fn rds_gp3_storage_price(&self) -> f64 {
         if let Some(entries) = self.entries("rds") {
-            let matches = find_entries(
+            let matches = find_entries_by_family(
                 entries,
-                &[
-                    ("productFamily", "Database Storage"),
-                    ("volumeType", "General Purpose-GP3"),
-                ],
+                "Database Storage",
+                &[("volumeType", "General Purpose-GP3")],
             );
             if let Some(entry) = matches.first()
                 && let Some(price) = first_price(entry)

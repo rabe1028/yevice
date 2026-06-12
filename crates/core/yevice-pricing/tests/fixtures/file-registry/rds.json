@@ -32,6 +32,20 @@
         "instanceType": "db.r5.xlarge",
         "databaseEngine": "Aurora PostgreSQL"
       }
+    },
+    "RDS-GP3-STORAGE": {
+      "sku": "RDS-GP3-STORAGE",
+      "productFamily": "Database Storage",
+      "attributes": {
+        "volumeType": "General Purpose-GP3"
+      }
+    },
+    "RDS-GP3-IOPS": {
+      "sku": "RDS-GP3-IOPS",
+      "productFamily": "System Operation",
+      "attributes": {
+        "group": "RDS-GP3-IOPS"
+      }
     }
   },
   "terms": {
@@ -95,6 +109,38 @@
               "unit": "Hrs",
               "pricePerUnit": {
                 "USD": "0.444"
+              }
+            }
+          }
+        }
+      },
+      "RDS-GP3-STORAGE": {
+        "RDS-GP3-STORAGE.JRTCKXETXF": {
+          "sku": "RDS-GP3-STORAGE",
+          "priceDimensions": {
+            "RDS-GP3-STORAGE-DIM": {
+              "description": "RDS GP3 Storage per GB-month",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "GB-Mo",
+              "pricePerUnit": {
+                "USD": "0.1300"
+              }
+            }
+          }
+        }
+      },
+      "RDS-GP3-IOPS": {
+        "RDS-GP3-IOPS.JRTCKXETXF": {
+          "sku": "RDS-GP3-IOPS",
+          "priceDimensions": {
+            "RDS-GP3-IOPS-DIM": {
+              "description": "RDS GP3 excess IOPS per IOPS-month",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "IOPS-Mo",
+              "pricePerUnit": {
+                "USD": "0.0090"
               }
             }
           }

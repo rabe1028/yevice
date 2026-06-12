@@ -24,6 +24,23 @@ fn file_registry_uses_loaded_lambda_prices_instead_of_fallback_defaults() {
     assert_close(price.free_tier_gb_seconds, 400_000.0);
 }
 
+/// The fixture rds.json contains a "Database Storage" SKU with
+/// `volumeType = "General Purpose-GP3"` and price $0.1300, and a
+/// "System Operation" SKU with `group = "RDS-GP3-IOPS"` and price $0.0090.
+/// Both prices differ from the hardcoded ap-northeast-1 constants
+/// (0.1216 and 0.008), so if the file-backed lookup falls back to hardcoded
+/// values the assertions will fail.
+#[test]
+fn file_registry_returns_gp3_prices_from_rds_json_not_hardcoded_fallback() {
+    let registry = FilePricingRegistry::load("us-east-1", fixture_dir());
+
+    let storage_price = registry.rds_gp3_storage_price();
+    assert_close(storage_price, 0.1300);
+
+    let iops_price = registry.rds_gp3_iops_price();
+    assert_close(iops_price, 0.0090);
+}
+
 #[test]
 fn file_registry_maps_rds_engine_aliases_to_bulk_api_database_engine_names() {
     let registry = FilePricingRegistry::load("ap-northeast-1", fixture_dir());
