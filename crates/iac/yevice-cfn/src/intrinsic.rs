@@ -392,8 +392,22 @@ fn resolve_select(
         }
     };
 
-    let list = resolve_inner(&seq[1], ctx, depth + 1)?;
-    let list = list
+    let list_resolved = resolve_inner(&seq[1], ctx, depth + 1)?;
+
+    // If the list resolved to a tagged pass-through (e.g. an unresolvable
+    // Fn::Split whose source contains references), we cannot select from it
+    // statically.  Warn and return the tagged value as-is so the caller sees
+    // an unresolved value rather than a hard error.
+    if let ResolvedValue::Concrete(Value::Tagged(ref tagged)) = list_resolved {
+        tracing::warn!(
+            index = index,
+            tag = %tagged.tag,
+            "!Select list resolved to an unresolvable tagged value; passing through as-is"
+        );
+        return Ok(list_resolved);
+    }
+
+    let list = list_resolved
         .into_seq()
         .ok_or_else(|| CfnError::IntrinsicError("!Select second arg must be a list".into()))?;
 
@@ -1334,6 +1348,40 @@ mod tests {
             result,
             concrete_str("b"),
             "!Select [1, !Split [\",\", \"a,b,c\"]] must yield \"b\""
+        );
+    }
+
+    /// `!Select [0, !Split [",", !Sub "${Queue},x"]]` — when the Split source
+    /// is Interpolated the whole expression must pass through without error
+    /// (both Split and the parent Select degrade gracefully).
+    #[test]
+    fn test_select_with_unresolvable_split_passes_through() {
+        let ctx = make_ctx();
+        // !Sub "${MyQueue},x" → Interpolated (MyQueue is not a parameter)
+        let sub_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Sub"),
+            value: Value::String("${MyQueue},x".into()),
+        }));
+        let split_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Split"),
+            value: Value::Sequence(vec![Value::String(",".into()), sub_tagged]),
+        }));
+        let select_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Select"),
+            value: Value::Sequence(vec![
+                Value::Number(serde_yaml_ng::value::Number::from(0_u64)),
+                split_tagged,
+            ]),
+        }));
+        let result = resolve(&select_tagged, &ctx);
+        assert!(
+            result.is_ok(),
+            "!Select over unresolvable !Split must not error, got: {result:?}"
+        );
+        // Must not produce a Seq — it should pass through as a non-concrete value.
+        assert!(
+            !matches!(result.unwrap(), ResolvedValue::Seq(_)),
+            "!Select over unresolvable !Split must not produce a Seq"
         );
     }
 
