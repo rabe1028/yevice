@@ -140,10 +140,61 @@ const EXPECTED_SERVICE_TO_CFN: &[(&str, &[&str])] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Static mapping: service_id → expected TF resource type(s)
+//
+// Lists only services that have TF adapters.  Services intentionally without a
+// TF adapter are tracked in `SERVICES_WITHOUT_TF_ADAPTER` below.
+//
+// Maintenance: when a new TF adapter is added, move the service_id out of
+// SERVICES_WITHOUT_TF_ADAPTER and add an entry here.
+// ---------------------------------------------------------------------------
+
+/// Maps each TF-covered service_id to the Terraform resource type(s) whose
+/// adapters produce it.
+///
+/// One TF adapter may handle multiple resource types (e.g. elasticache handles
+/// both `aws_elasticache_cluster` and `aws_elasticache_replication_group`). One
+/// TF adapter may also produce multiple service IDs depending on runtime input
+/// (e.g. the ECS adapter outputs either `aws.ecs_ec2` or `aws.ecs_fargate`
+/// from the same `aws_ecs_service` type).
+const EXPECTED_SERVICE_TO_TF: &[(&str, &[&str])] = &[
+    (
+        "aws.api_gateway",
+        &["aws_api_gateway_rest_api", "aws_apigatewayv2_api"],
+    ),
+    ("aws.batch", &["aws_batch_job_definition"]),
+    ("aws.cloudfront", &["aws_cloudfront_distribution"]),
+    ("aws.cloudwatch_logs", &["aws_cloudwatch_log_group"]),
+    ("aws.dynamodb", &["aws_dynamodb_table"]),
+    ("aws.ec2", &["aws_instance"]),
+    ("aws.ecr", &["aws_ecr_repository"]),
+    // One TF adapter (EcsTfAdapter) handles aws_ecs_service and produces
+    // either ecs_ec2 or ecs_fargate depending on launch_type.
+    ("aws.ecs_ec2", &["aws_ecs_service"]),
+    ("aws.ecs_fargate", &["aws_ecs_service"]),
+    (
+        "aws.elasticache",
+        &["aws_elasticache_cluster", "aws_elasticache_replication_group"],
+    ),
+    ("aws.eventbridge_scheduler", &["aws_scheduler_schedule"]),
+    ("aws.kinesis", &["aws_kinesis_stream"]),
+    ("aws.lambda", &["aws_lambda_function"]),
+    ("aws.nat_gateway", &["aws_nat_gateway"]),
+    (
+        "aws.opensearch_serverless",
+        &["aws_opensearchserverless_collection"],
+    ),
+    ("aws.rds", &["aws_db_instance", "aws_rds_cluster"]),
+    ("aws.s3", &["aws_s3_bucket"]),
+    ("aws.sqs", &["aws_sqs_queue"]),
+    ("aws.step_functions", &["aws_sfn_state_machine"]),
+];
+
+// ---------------------------------------------------------------------------
 // Allow-list: services intentionally without a TF adapter
 //
 // Rationale for each group is noted. Remove entries here ONLY when adding the
-// corresponding TF adapter.
+// corresponding TF adapter (and adding the entry to EXPECTED_SERVICE_TO_TF).
 // ---------------------------------------------------------------------------
 
 /// Service IDs that intentionally have no TF adapter.
@@ -253,8 +304,13 @@ fn build_registries() -> (ServiceCatalog, CfnAdapterRegistry, TfAdapterRegistry)
 /// Verify that every service in the catalog has at least one CFN adapter and
 /// vice-versa, using `EXPECTED_SERVICE_TO_CFN` as the ground truth.
 ///
-/// Also verifies that every service without a listed TF adapter is in the
-/// `SERVICES_WITHOUT_TF_ADAPTER` allow-list.
+/// Also verifies TF adapter coverage via `EXPECTED_SERVICE_TO_TF`:
+/// - every TF type in the expected mapping is present in the real registry
+///   (catches deleted tf.register() calls), and
+/// - every TF type in the real registry is present in the expected mapping
+///   (catches mapping-table update omissions).
+/// Services intentionally without a TF adapter are listed in
+/// `SERVICES_WITHOUT_TF_ADAPTER`.
 #[test]
 fn cfn_tf_and_service_registration_are_consistent() {
     let (catalog, cfn, tf) = build_registries();
@@ -328,36 +384,65 @@ fn cfn_tf_and_service_registration_are_consistent() {
         }
     }
 
-    // 5. Services not in the allow-list must have at least one TF adapter.
-    //    We check this by verifying that each service_id in the catalog is either
-    //    in SERVICES_WITHOUT_TF_ADAPTER or there exists a TF resource type in the
-    //    registered registry whose service ID matches.
-    //    Because we cannot easily introspect which TF types map to which service,
-    //    we rely on the allow-list being exhaustive: every service not in the
-    //    allow-list is expected to have TF coverage.
-    //    Detect newly registered services that are absent from both allow-list
-    //    and the set of TF-covered services.
-    //
-    //    We derive the TF-covered service IDs as:
-    //      registered_services - SERVICES_WITHOUT_TF_ADAPTER
-    let tf_covered_services: HashSet<&str> = registered_services
-        .iter()
-        .copied()
-        .filter(|id| !no_tf_set.contains(*id))
-        .collect();
-
-    // Verify TF type count is consistent with having TF-covered services.
-    // If a "TF-covered" service has 0 registered TF types something is wrong.
-    if !tf_covered_services.is_empty() && registered_tf_types.is_empty() {
-        failures.push(
-            "Some services are expected to have TF adapters \
-             but TfAdapterRegistry is empty"
-                .to_string(),
-        );
+    // 5. Every service_id in EXPECTED_SERVICE_TO_TF must be in the catalog.
+    for &(service_id, _) in EXPECTED_SERVICE_TO_TF {
+        if !registered_services.contains(service_id) {
+            failures.push(format!(
+                "Service '{service_id}' is listed in EXPECTED_SERVICE_TO_TF \
+                 but not registered in ServiceCatalog"
+            ));
+        }
     }
 
-    // 6. Verify the allow-list only references services that are actually registered
+    // 6. Every service not in the allow-list must be listed in EXPECTED_SERVICE_TO_TF.
+    //    This detects newly registered services that were added to the catalog but
+    //    whose TF adapter entry was never added to the mapping table.
+    let expected_tf_services: HashSet<&str> =
+        EXPECTED_SERVICE_TO_TF.iter().map(|&(id, _)| id).collect();
+    for id in &registered_services {
+        if !no_tf_set.contains(*id) && !expected_tf_services.contains(*id) {
+            failures.push(format!(
+                "Service '{id}' is registered in ServiceCatalog and not in \
+                 SERVICES_WITHOUT_TF_ADAPTER, but is missing from EXPECTED_SERVICE_TO_TF \
+                 — add it with its TF resource types or add it to the allow-list"
+            ));
+        }
+    }
+
+    // 7. Every TF resource type in EXPECTED_SERVICE_TO_TF must be registered in
+    //    the TF registry.  Catches the case where a tf.register() call is deleted.
+    for &(service_id, tf_types) in EXPECTED_SERVICE_TO_TF {
+        for &rt in tf_types {
+            if !registered_tf_types.contains(rt) {
+                failures.push(format!(
+                    "TF resource type '{rt}' (mapped to service '{service_id}') \
+                     is listed in EXPECTED_SERVICE_TO_TF \
+                     but not registered in TfAdapterRegistry"
+                ));
+            }
+        }
+    }
+
+    // 8. Every TF type in the registry must be listed in EXPECTED_SERVICE_TO_TF.
+    //    Catches the case where a TF adapter is registered but the mapping table
+    //    was not updated.
+    let expected_tf_types: HashSet<&str> = EXPECTED_SERVICE_TO_TF
+        .iter()
+        .flat_map(|&(_, types)| types.iter().copied())
+        .collect();
+    for rt in &registered_tf_types {
+        if !expected_tf_types.contains(*rt) {
+            failures.push(format!(
+                "TF resource type '{rt}' is registered in TfAdapterRegistry \
+                 but not listed in EXPECTED_SERVICE_TO_TF — add it to the mapping table"
+            ));
+        }
+    }
+
+    // 9. Verify the allow-list only references services that are actually registered
     //    (no stale entries in SERVICES_WITHOUT_TF_ADAPTER).
+    // Also verify that no service appears in both SERVICES_WITHOUT_TF_ADAPTER and
+    // EXPECTED_SERVICE_TO_TF (they should be mutually exclusive).
     for &id in SERVICES_WITHOUT_TF_ADAPTER {
         if !registered_services.contains(id) {
             failures.push(format!(
