@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
@@ -17,6 +16,7 @@ use yevice_core::resource::{Architecture, Provider};
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
 use yevice_core::types::VariableName;
+use yevice_pricing::download as pricing_download;
 use yevice_service_api::{
     CfnAdapterRegistry, MultiProviderCatalog, ProviderPlugin, Registration, ServiceCatalog,
     TfAdapterRegistry,
@@ -950,20 +950,10 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
     Ok(())
 }
 
-/// AWS services to download pricing for.
-const PRICING_SERVICES: &[(&str, &str)] = &[
-    ("AmazonEC2", "ec2"),
-    ("AWSLambda", "lambda"),
-    ("AmazonRDS", "rds"),
-    ("AmazonS3", "s3"),
-    ("AmazonDynamoDB", "dynamodb"),
-    ("AmazonECS", "ecs"),
-    ("AmazonES", "opensearch"), // OpenSearch uses the old ES pricing code
-    ("AmazonKinesis", "kinesis"),
-    ("AWSQueueService", "sqs"),
-    ("AmazonCloudWatch", "cloudwatch"),
-];
-
+/// Download AWS pricing data for `region` into `output_dir`.
+///
+/// The HTTP download logic lives in [`yevice_pricing::download`]; this
+/// function only handles directory/file I/O and progress output.
 pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create directory: {output_dir}"))?;
@@ -971,14 +961,12 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
     let region_code = region;
     println!("Downloading pricing data for region: {region_code}");
 
-    for (service_code, filename) in PRICING_SERVICES {
+    for (service_code, filename) in pricing_download::PRICING_SERVICES {
         print!("  {service_code} ...");
 
-        let url = format!(
-            "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/{service_code}/current/{region_code}/index.json"
-        );
+        let url = pricing_download::pricing_url(service_code, region_code);
 
-        match download_pricing(&url) {
+        match pricing_download::download_pricing(&url) {
             Ok(data) => {
                 let path = format!("{output_dir}/{filename}.json");
                 std::fs::write(&path, &data).with_context(|| format!("failed to write {path}"))?;
@@ -994,24 +982,6 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
 
     println!("\nPricing data saved to: {output_dir}/");
     Ok(())
-}
-
-const MAX_PRICING_BODY_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
-
-fn download_pricing(url: &str) -> Result<Vec<u8>> {
-    let mut response = ureq::get(url)
-        .config()
-        .timeout_global(Some(Duration::from_secs(300)))
-        .build()
-        .call()
-        .context("HTTP request failed")?;
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_PRICING_BODY_BYTES)
-        .read_to_vec()
-        .context("failed to read response body")?;
-    Ok(body)
 }
 
 /// Render an architecture diagram from a generated cost-model JSON file.

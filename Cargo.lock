@@ -1658,7 +1658,6 @@ dependencies = [
  "serde_yaml_ng",
  "tracing",
  "tracing-subscriber",
- "ureq",
  "yevice-cfn",
  "yevice-core",
  "yevice-output",
@@ -1700,6 +1699,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "ureq",
  "yevice-core",
 ]
 
