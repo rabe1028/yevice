@@ -18,6 +18,22 @@ pub enum SolverError {
         limit: u64,
     },
 
+    /// One or more variables referenced by the objective are not bound by a
+    /// fixed parameter, a decision variable, or a transitively-satisfiable
+    /// binding. Detected up-front by [`validate_bindings`] before enumeration.
+    ///
+    /// [`validate_bindings`]: crate::validate_bindings
+    #[error(
+        "{} objective variable(s) are unbound: {}. Bind them via fixed parameters, \
+         decision variables, or bindings.",
+        variables.len(),
+        variables.join(", ")
+    )]
+    UnboundVariables {
+        /// Names of the unbound objective variables, in sorted order.
+        variables: Vec<String>,
+    },
+
     /// Reserved for future solver backends that signal infeasibility as an
     /// error rather than through a `Solution` value.
     ///

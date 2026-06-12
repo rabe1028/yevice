@@ -1,6 +1,13 @@
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
+use thiserror::Error;
+
+use crate::bindings::{BindingsFile, to_variable_bindings};
+use crate::cost::VariableBinding;
+use crate::evaluate::Params;
+use crate::types::VariableName;
+
 /// IaC input file maximum size in bytes (OOM prevention limit).
 pub const MAX_IAC_FILE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 
@@ -28,6 +35,128 @@ pub fn read_to_string_capped(path: &Path) -> io::Result<String> {
         ));
     }
     std::fs::read_to_string(path)
+}
+
+/// A YAML scalar that could not be interpreted as an `f64`.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct YamlNumberError(String);
+
+/// A parameter-style YAML entry whose value is not a valid number.
+#[derive(Debug, Error)]
+#[error("{context} '{name}': invalid value")]
+pub struct ParamValueError {
+    /// What kind of entry failed (e.g. `param`, `profile base_param`).
+    context: &'static str,
+    /// Full (flattened) variable name of the offending entry.
+    name: String,
+    #[source]
+    source: YamlNumberError,
+}
+
+/// Interpret a YAML scalar as an `f64`. Accepts numbers and numeric strings.
+pub(crate) fn extract_f64(v: &serde_yaml_ng::Value) -> Result<f64, YamlNumberError> {
+    match v {
+        serde_yaml_ng::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| YamlNumberError(format!("cannot interpret number {v:?} as f64"))),
+        serde_yaml_ng::Value::String(s) => s
+            .parse::<f64>()
+            .map_err(|_| YamlNumberError(format!("cannot interpret string {v:?} as f64"))),
+        _ => Err(YamlNumberError(format!(
+            "cannot interpret value {v:?} as a number"
+        ))),
+    }
+}
+
+/// Flatten a parsed YAML map of usage parameters into [`Params`].
+///
+/// Supports both flat (`Foo_requests: 100`) and hierarchical
+/// (`Foo: { requests: 100 }`) entries; hierarchical entries are flattened to
+/// `{logical_id}_{short_name}`. `context` labels error messages (e.g. `param`
+/// or `profile base_param`).
+pub(crate) fn params_from_yaml_map(
+    map: std::collections::HashMap<String, serde_yaml_ng::Value>,
+    context: &'static str,
+) -> Result<Params, ParamValueError> {
+    let mut params = Params::default();
+    for (k, v) in map {
+        match v {
+            // Hierarchical: key is logical ID, value is a mapping of short var names
+            serde_yaml_ng::Value::Mapping(sub_map) => {
+                for (sub_k, sub_v) in sub_map {
+                    let Some(sub_key) = sub_k.as_str() else {
+                        tracing::warn!(key = ?sub_k, "non-string key in {context} mapping; skipping");
+                        continue;
+                    };
+                    let full_name = format!("{k}_{sub_key}");
+                    let val = extract_f64(&sub_v).map_err(|source| ParamValueError {
+                        context,
+                        name: full_name.clone(),
+                        source,
+                    })?;
+                    params.insert(VariableName::new(full_name), val);
+                }
+            }
+            // Flat: key is the full variable name
+            _ => {
+                let val = extract_f64(&v).map_err(|source| ParamValueError {
+                    context,
+                    name: k.clone(),
+                    source,
+                })?;
+                params.insert(VariableName::new(k), val);
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// Errors raised while parsing a usage-params YAML document.
+#[derive(Debug, Error)]
+pub enum ParamsParseError {
+    /// The document is not a valid YAML mapping of variable names to values.
+    #[error("failed to parse params file")]
+    Yaml(#[source] serde_yaml_ng::Error),
+
+    /// An entry holds a value that cannot be read as a number.
+    #[error(transparent)]
+    Value(#[from] ParamValueError),
+}
+
+/// Parse usage parameters from YAML text.
+///
+/// Supports both flat and hierarchical formats:
+///
+/// Flat (legacy):
+/// ```yaml
+/// IngestFunction_requests: 5000000
+/// ```
+///
+/// Hierarchical:
+/// ```yaml
+/// IngestFunction:
+///   requests: 5000000
+/// ```
+pub fn parse_params(content: &str) -> Result<Params, ParamsParseError> {
+    let map: std::collections::HashMap<String, serde_yaml_ng::Value> =
+        serde_yaml_ng::from_str(content).map_err(ParamsParseError::Yaml)?;
+    Ok(params_from_yaml_map(map, "param")?)
+}
+
+/// Error raised while parsing a user-defined bindings YAML document.
+#[derive(Debug, Error)]
+#[error("failed to parse bindings file")]
+pub struct BindingsParseError(#[source] serde_yaml_ng::Error);
+
+/// Parse user-defined variable bindings from YAML text.
+///
+/// The document must follow the [`BindingsFile`] structure; entries with
+/// invalid expressions are skipped with a warning (see
+/// [`to_variable_bindings`]).
+pub fn parse_bindings(content: &str) -> Result<Vec<VariableBinding>, BindingsParseError> {
+    let file: BindingsFile = serde_yaml_ng::from_str(content).map_err(BindingsParseError)?;
+    Ok(to_variable_bindings(&file.bindings))
 }
 
 #[cfg(test)]
@@ -93,5 +222,73 @@ mod tests {
         assert!(result.is_ok(), "exact limit should succeed");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_params_supports_flat_and_hierarchical_keys() {
+        let yaml = "\
+IngestFunction_requests: 5000000
+Table:
+  read_units: 25
+  write_units: '12.5'
+";
+        let params = parse_params(yaml).unwrap();
+        assert_eq!(
+            params.get(&VariableName::new("IngestFunction_requests")),
+            Some(&5_000_000.0)
+        );
+        assert_eq!(
+            params.get(&VariableName::new("Table_read_units")),
+            Some(&25.0)
+        );
+        assert_eq!(
+            params.get(&VariableName::new("Table_write_units")),
+            Some(&12.5),
+            "numeric strings must be accepted"
+        );
+    }
+
+    #[test]
+    fn parse_params_rejects_non_numeric_value() {
+        let err = parse_params("Foo_requests: [1, 2]\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Foo_requests") && msg.contains("invalid value"),
+            "error must name the offending param; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_params_rejects_invalid_yaml() {
+        let err = parse_params(": not yaml :\n").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse params file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_bindings_reads_simple_and_expr_modes() {
+        let yaml = "\
+bindings:
+  - target: Worker_requests
+    source: Queue_requests
+    factor: 2
+  - target: Bucket_storage_gb
+    expr: \"Job_executions * 0.5\"
+";
+        let bindings = parse_bindings(yaml).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].target, VariableName::new("Worker_requests"));
+        assert_eq!(bindings[1].target, VariableName::new("Bucket_storage_gb"));
+    }
+
+    #[test]
+    fn parse_bindings_rejects_invalid_yaml() {
+        let err = parse_bindings("bindings: 42\n").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse bindings file"),
+            "got: {err}"
+        );
     }
 }

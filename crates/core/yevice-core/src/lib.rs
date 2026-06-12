@@ -10,6 +10,7 @@ pub mod io;
 pub mod optimize;
 pub mod resource;
 pub mod schema;
+pub mod simulate;
 pub mod topology;
 pub mod types;
 

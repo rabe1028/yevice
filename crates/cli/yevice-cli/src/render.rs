@@ -7,6 +7,7 @@
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 use yevice_core::capacity::{Severity, Violation};
 use yevice_core::evaluate::ArchitectureResult;
+use yevice_core::simulate::ArchSimulation;
 
 // ---------------------------------------------------------------------------
 // eval
@@ -292,20 +293,17 @@ pub(crate) fn render_validate_table(violations: &[Violation]) -> Table {
 // simulate
 // ---------------------------------------------------------------------------
 
-/// `(arch_name, total_monthly, hourly_costs, base_resource_costs)`
-pub(crate) type SimulationArchResult = (String, f64, Vec<(u32, f64)>, Vec<(String, f64)>);
-
 /// Build the hourly load simulation table for `simulate`.
 pub(crate) fn render_simulate_table(
-    arch_results: &[SimulationArchResult],
+    arch_results: &[ArchSimulation],
     multiplier_at: impl Fn(u32) -> f64,
 ) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
 
     let mut header = vec![Cell::new("Hour"), Cell::new("Multiplier")];
-    for (name, _, _, _) in arch_results {
-        header.push(Cell::new(format!("{name} (rate/mo)")));
+    for sim in arch_results {
+        header.push(Cell::new(format!("{} (rate/mo)", sim.name)));
     }
     table.set_header(header);
 
@@ -315,8 +313,9 @@ pub(crate) fn render_simulate_table(
             Cell::new(format!("{hour:02}:00")),
             Cell::new(format!("{mult:.2}x")),
         ];
-        for (_, _, hourly, _) in arch_results {
-            let cost = hourly
+        for sim in arch_results {
+            let cost = sim
+                .hourly_costs
                 .iter()
                 .find(|(h, _)| *h == hour)
                 .map_or(0.0, |(_, c)| *c);
@@ -327,8 +326,8 @@ pub(crate) fn render_simulate_table(
 
     // Total row
     let mut total_row = vec![Cell::new("MONTHLY TOTAL").fg(Color::Green), Cell::new("")];
-    for (_, total, _, _) in arch_results {
-        total_row.push(Cell::new(format!("${total:.2}")).fg(Color::Green));
+    for sim in arch_results {
+        total_row.push(Cell::new(format!("${:.2}", sim.total_monthly_cost)).fg(Color::Green));
     }
     table.add_row(total_row);
 
@@ -337,22 +336,23 @@ pub(crate) fn render_simulate_table(
 
 /// Build the resource breakdown table for `simulate --breakdown`.
 pub(crate) fn render_simulate_breakdown_table(
-    arch_results: &[SimulationArchResult],
+    arch_results: &[ArchSimulation],
     all_labels: &[String],
 ) -> Table {
     let mut bd_table = Table::new();
     bd_table.load_preset(UTF8_FULL);
 
     let mut bd_header = vec![Cell::new("Resource")];
-    for (name, _, _, _) in arch_results {
-        bd_header.push(Cell::new(name));
+    for sim in arch_results {
+        bd_header.push(Cell::new(&sim.name));
     }
     bd_table.set_header(bd_header);
 
     for label in all_labels {
         let mut row = vec![Cell::new(label)];
-        for (_, _, _, res_costs) in arch_results {
-            let cost = res_costs
+        for sim in arch_results {
+            let cost = sim
+                .base_resource_costs
                 .iter()
                 .find(|(l, _)| l == label)
                 .map_or_else(|| "-".to_string(), |(_, c)| format!("${c:.2}"));

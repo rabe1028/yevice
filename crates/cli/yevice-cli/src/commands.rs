@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
@@ -9,13 +8,15 @@ use yevice_solver::{EnumerationSolver, Solver, SolverError};
 
 use yevice_cfn::convert as cfn_convert;
 use yevice_cfn::parser;
-use yevice_core::bindings::{BindingsFile, derive_bindings, to_variable_bindings};
+use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
 use yevice_core::resource::{Architecture, Provider};
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
+use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
 use yevice_core::types::VariableName;
+use yevice_pricing::download as pricing_download;
 use yevice_service_api::{
     CfnAdapterRegistry, MultiProviderCatalog, ProviderPlugin, Registration, ServiceCatalog,
     TfAdapterRegistry,
@@ -317,6 +318,18 @@ pub fn sensitivity(
     Ok(())
 }
 
+/// Outcome of a `validate` run that completed without an operational error.
+///
+/// `Failed` means at least one capacity constraint was violated with
+/// [`Severity::Error`]; the caller (main.rs) maps it to a non-zero exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStatus {
+    /// No error-severity violations were found.
+    Passed,
+    /// At least one error-severity violation was found.
+    Failed,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn validate(
     template_path: &str,
@@ -329,7 +342,7 @@ pub fn validate(
     output_format: &str,
     region: &str,
     input_format: Option<InputFormat>,
-) -> Result<()> {
+) -> Result<ValidationStatus> {
     let format = resolve_input_format(template_path, input_format)?;
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
@@ -416,10 +429,10 @@ pub fn validate(
     }
 
     if result.has_errors() {
-        std::process::exit(1);
+        Ok(ValidationStatus::Failed)
+    } else {
+        Ok(ValidationStatus::Passed)
     }
-
-    Ok(())
 }
 
 /// Find the optimal decision-variable assignment that minimizes (or maximizes)
@@ -468,46 +481,6 @@ pub fn optimize(
         decision_variables.push(DecisionVariable { name, domain });
     }
 
-    // Every variable in the objective must be bound — either fixed via --params,
-    // chosen as a --decision, or derivable via a binding whose own inputs are
-    // themselves bound.  Compute the set via a fixed-point closure so that only
-    // bindings whose source variables are already satisfied propagate their
-    // targets into the bound set.  This prevents a binding whose source is
-    // missing from silently masking an unbound variable in the objective.
-    let mut bound: std::collections::HashSet<VariableName> = fixed_params.keys().cloned().collect();
-    for dv in &decision_variables {
-        bound.insert(dv.name.clone());
-    }
-    loop {
-        let mut progressed = false;
-        for b in arch.all_bindings() {
-            if bound.contains(&b.target) {
-                continue;
-            }
-            if b.expr.variables().iter().all(|v| bound.contains(v)) {
-                bound.insert(b.target.clone());
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    let unbound: Vec<String> = objective
-        .variables()
-        .into_iter()
-        .filter(|v| !bound.contains(v))
-        .map(|v| v.to_string())
-        .collect();
-    if !unbound.is_empty() {
-        bail!(
-            "cannot optimize: {} objective variable(s) are unbound; provide them via --params \
-             or as a --decision: {}",
-            unbound.len(),
-            unbound.join(", ")
-        );
-    }
-
     let obj_direction = match direction {
         "min" => ObjectiveDirection::Minimize,
         "max" => ObjectiveDirection::Maximize,
@@ -523,8 +496,19 @@ pub fn optimize(
         bindings: arch.all_bindings().to_vec(),
     };
 
+    // The solver validates up-front that every variable in the objective is
+    // bound — either fixed via --params, chosen as a --decision, or derivable
+    // via a binding whose own inputs are themselves bound (transitively).
     let sol = match EnumerationSolver.solve(&problem) {
         Ok(s) => s,
+        Err(SolverError::UnboundVariables { variables }) => {
+            bail!(
+                "cannot optimize: {} objective variable(s) are unbound; provide them via --params \
+                 or as a --decision: {}",
+                variables.len(),
+                variables.join(", ")
+            );
+        }
         Err(SolverError::TooManyCombinations { count, limit }) => {
             bail!(
                 "too many combinations to enumerate ({count} > {limit}). \
@@ -915,90 +899,17 @@ fn load_quotas(path: &str) -> Result<Quotas> {
 
 /// Simulate cost over time with varying load patterns.
 ///
-/// Load profile format:
-/// ```yaml
-/// base_params:
-///   IngestFunction_avg_duration_ms: 200
-///   ...
-/// hourly_pattern:
-///   - hour: 0
-///     multiplier: 0.1
-///   - hour: 9
-///     multiplier: 1.0
-///   - hour: 12
-///     multiplier: 0.8
-///   - hour: 18
-///     multiplier: 1.5  # peak
-///   - hour: 22
-///     multiplier: 0.3
-/// scaled_variables:
-///   - DataStream_put_records
-///   - IngestFunction_requests
-/// days_per_month: 30
-/// ```
+/// Reads the load profile and cost models from disk, delegates the actual
+/// simulation to [`yevice_core::simulate`], and renders the result tables.
 pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool) -> Result<()> {
-    let profile = load_simulation_profile(profile_path)?;
+    let content = std::fs::read_to_string(profile_path)
+        .with_context(|| format!("failed to read: {profile_path}"))?;
+    let profile = SimulationProfile::from_yaml_str(&content)?;
 
-    // (arch_name, total_monthly, hourly_costs, base_resource_costs)
-    // base_resource_costs: Vec<(label, monthly_cost)> evaluated at base_params (for breakdown)
-    let mut arch_results: Vec<crate::render::SimulationArchResult> = Vec::new();
-
+    let mut arch_results: Vec<ArchSimulation> = Vec::new();
     for path in cost_model_paths {
         let arch = load_cost_model(path)?;
-        let arch_name = arch.name.to_string();
-        let mut total_monthly = 0.0;
-        let mut hourly_costs = Vec::new();
-
-        // Evaluate at base_params once for the resource breakdown display.
-        let base_resource_costs = if breakdown {
-            let result = evaluate_architecture(&arch, &profile.base_params).with_context(|| {
-                format!("failed to evaluate base cost for architecture '{arch_name}'")
-            })?;
-            result
-                .resources
-                .into_iter()
-                .map(|r| (r.label, r.monthly_cost))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        for hour in 0..24 {
-            let multiplier = profile.multiplier_at(hour);
-            let mut params = profile.base_params.clone();
-
-            // Scale designated variables by the hourly multiplier
-            for var_name in &profile.scaled_variables {
-                if let Some(base_val) = params.get(var_name).copied() {
-                    // Convert monthly value to hourly, apply multiplier
-                    let hourly_val = base_val / (24.0 * profile.days_per_month) * multiplier;
-                    params.insert(var_name.clone(), hourly_val);
-                }
-            }
-
-            // Evaluate cost for this hour's load (as monthly equivalent at this rate)
-            match evaluate_architecture(&arch, &params) {
-                Ok(result) => {
-                    // Scale hourly slice: this hour's rate * hours_in_month_at_this_hour
-                    let hours_at_rate = profile.days_per_month;
-                    let hour_cost =
-                        result.total_monthly_cost * hours_at_rate / (24.0 * profile.days_per_month);
-                    total_monthly += hour_cost;
-                    hourly_costs.push((hour, result.total_monthly_cost));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "failed to evaluate '{arch_name}' at hour {hour} in simulation \
-                             (check that the load profile's base_params provides every variable \
-                             the cost model references)"
-                        )
-                    });
-                }
-            }
-        }
-
-        arch_results.push((arch_name, total_monthly, hourly_costs, base_resource_costs));
+        arch_results.push(simulate_architecture(&arch, &profile, breakdown)?);
     }
 
     // Print hourly breakdown table
@@ -1010,20 +921,20 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
     // Winner
     if arch_results.len() == 2 {
-        let diff = arch_results[1].1 - arch_results[0].1;
+        let diff = arch_results[1].total_monthly_cost - arch_results[0].total_monthly_cost;
         if diff > 0.0 {
             println!(
                 "\n{} is ${:.2}/month cheaper than {}",
-                arch_results[0].0,
+                arch_results[0].name,
                 diff.abs(),
-                arch_results[1].0
+                arch_results[1].name
             );
         } else {
             println!(
                 "\n{} is ${:.2}/month cheaper than {}",
-                arch_results[1].0,
+                arch_results[1].name,
                 diff.abs(),
-                arch_results[0].0
+                arch_results[0].name
             );
         }
     }
@@ -1032,8 +943,8 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
     if breakdown {
         // Collect all unique resource labels across all architectures.
         let mut all_labels: Vec<String> = Vec::new();
-        for (_, _, _, res_costs) in &arch_results {
-            for (label, _) in res_costs {
+        for sim in &arch_results {
+            for (label, _) in &sim.base_resource_costs {
                 if !all_labels.contains(label) {
                     all_labels.push(label.clone());
                 }
@@ -1051,130 +962,10 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
     Ok(())
 }
 
-#[derive(Debug)]
-struct SimulationProfile {
-    base_params: Params,
-    hourly_pattern: Vec<(u32, f64)>,
-    scaled_variables: Vec<VariableName>,
-    days_per_month: f64,
-}
-
-impl SimulationProfile {
-    fn multiplier_at(&self, hour: u32) -> f64 {
-        // Find the last defined multiplier at or before this hour
-        let mut result = self.hourly_pattern.first().map_or(1.0, |(_, m)| *m);
-        for (h, m) in &self.hourly_pattern {
-            if *h <= hour {
-                result = *m;
-            }
-        }
-        result
-    }
-}
-
-fn load_simulation_profile(path: &str) -> Result<SimulationProfile> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-
-    let raw: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&content).context("failed to parse profile")?;
-    let map = raw.as_mapping().context("profile must be a mapping")?;
-
-    // Load base_params
-    let base_params_val = map
-        .get(Value::String("base_params".into()))
-        .context("profile must have base_params")?;
-    let base_map: HashMap<String, serde_yaml_ng::Value> =
-        serde_yaml_ng::from_value(base_params_val.clone())
-            .context("failed to parse base_params")?;
-
-    let mut base_params = Params::default();
-    for (k, v) in base_map {
-        match v {
-            serde_yaml_ng::Value::Mapping(sub_map) => {
-                for (sub_k, sub_v) in sub_map {
-                    let Some(sub_key) = sub_k.as_str() else {
-                        tracing::warn!(key = ?sub_k, "non-string key in profile base_params mapping; skipping");
-                        continue;
-                    };
-                    let val = extract_f64(&sub_v).with_context(|| {
-                        format!("profile base_param '{k}_{sub_key}': invalid value")
-                    })?;
-                    base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
-                }
-            }
-            _ => {
-                let val = extract_f64(&v)
-                    .with_context(|| format!("profile base_param '{k}': invalid value"))?;
-                base_params.insert(VariableName::new(k), val);
-            }
-        }
-    }
-
-    // Load hourly_pattern
-    let pattern_val = map
-        .get(Value::String("hourly_pattern".into()))
-        .and_then(|v| v.as_sequence())
-        .context("profile must have hourly_pattern array")?;
-
-    let mut hourly_pattern: Vec<(u32, f64)> = Vec::new();
-    for entry in pattern_val {
-        let entry_map = entry
-            .as_mapping()
-            .context("hourly entry must be a mapping")?;
-        let hour = entry_map
-            .get(Value::String("hour".into()))
-            .and_then(serde_yaml_ng::Value::as_u64)
-            .context("hourly entry must have hour")? as u32;
-        let multiplier = entry_map
-            .get(Value::String("multiplier".into()))
-            .and_then(serde_yaml_ng::Value::as_f64)
-            .context("hourly entry must have multiplier")?;
-        hourly_pattern.push((hour, multiplier));
-    }
-    hourly_pattern.sort_by_key(|(h, _)| *h);
-
-    // Load scaled_variables
-    let scaled = map
-        .get(Value::String("scaled_variables".into()))
-        .and_then(|v| v.as_sequence())
-        .map(|seq| {
-            seq.iter()
-                .filter_map(|v| v.as_str().map(VariableName::new))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Days per month
-    let days = map
-        .get(Value::String("days_per_month".into()))
-        .and_then(serde_yaml_ng::Value::as_f64)
-        .unwrap_or(30.0);
-
-    Ok(SimulationProfile {
-        base_params,
-        hourly_pattern,
-        scaled_variables: scaled,
-        days_per_month: days,
-    })
-}
-
-use serde_yaml_ng::Value;
-
-/// AWS services to download pricing for.
-const PRICING_SERVICES: &[(&str, &str)] = &[
-    ("AmazonEC2", "ec2"),
-    ("AWSLambda", "lambda"),
-    ("AmazonRDS", "rds"),
-    ("AmazonS3", "s3"),
-    ("AmazonDynamoDB", "dynamodb"),
-    ("AmazonECS", "ecs"),
-    ("AmazonES", "opensearch"), // OpenSearch uses the old ES pricing code
-    ("AmazonKinesis", "kinesis"),
-    ("AWSQueueService", "sqs"),
-    ("AmazonCloudWatch", "cloudwatch"),
-];
-
+/// Download AWS pricing data for `region` into `output_dir`.
+///
+/// The HTTP download logic lives in [`yevice_pricing::download`]; this
+/// function only handles directory/file I/O and progress output.
 pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create directory: {output_dir}"))?;
@@ -1182,14 +973,12 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
     let region_code = region;
     println!("Downloading pricing data for region: {region_code}");
 
-    for (service_code, filename) in PRICING_SERVICES {
+    for (service_code, filename) in pricing_download::PRICING_SERVICES {
         print!("  {service_code} ...");
 
-        let url = format!(
-            "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/{service_code}/current/{region_code}/index.json"
-        );
+        let url = pricing_download::pricing_url(service_code, region_code);
 
-        match download_pricing(&url) {
+        match pricing_download::download_pricing(&url) {
             Ok(data) => {
                 let path = format!("{output_dir}/{filename}.json");
                 std::fs::write(&path, &data).with_context(|| format!("failed to write {path}"))?;
@@ -1205,24 +994,6 @@ pub fn update_pricing(region: &str, output_dir: &str) -> Result<()> {
 
     println!("\nPricing data saved to: {output_dir}/");
     Ok(())
-}
-
-const MAX_PRICING_BODY_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
-
-fn download_pricing(url: &str) -> Result<Vec<u8>> {
-    let mut response = ureq::get(url)
-        .config()
-        .timeout_global(Some(Duration::from_secs(300)))
-        .build()
-        .call()
-        .context("HTTP request failed")?;
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(MAX_PRICING_BODY_BYTES)
-        .read_to_vec()
-        .context("failed to read response body")?;
-    Ok(body)
 }
 
 /// Render an architecture diagram from a generated cost-model JSON file.
@@ -1267,70 +1038,22 @@ fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
 
 /// Load usage parameters from a YAML file.
 ///
-/// Supports both flat and hierarchical formats:
-///
-/// Flat (legacy):
-/// ```yaml
-/// IngestFunction_requests: 5000000
-/// ```
-///
-/// Hierarchical:
-/// ```yaml
-/// IngestFunction:
-///   requests: 5000000
-/// ```
+/// File I/O happens here; parsing (flat and hierarchical formats) is
+/// delegated to [`yevice_core::io::parse_params`].
 fn load_params(path: &str) -> Result<Params> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-
-    let map: HashMap<String, serde_yaml_ng::Value> =
-        serde_yaml_ng::from_str(&content).context("failed to parse params file")?;
-
-    let mut params = Params::default();
-    for (k, v) in map {
-        match v {
-            // Hierarchical: key is logical ID, value is a mapping of short var names
-            serde_yaml_ng::Value::Mapping(sub_map) => {
-                for (sub_k, sub_v) in sub_map {
-                    let Some(sub_key) = sub_k.as_str() else {
-                        tracing::warn!(key = ?sub_k, "non-string key in params mapping; skipping");
-                        continue;
-                    };
-                    let val = extract_f64(&sub_v)
-                        .with_context(|| format!("param '{k}_{sub_key}': invalid value"))?;
-                    let full_name = format!("{k}_{sub_key}");
-                    params.insert(VariableName::new(full_name), val);
-                }
-            }
-            // Flat: key is the full variable name
-            _ => {
-                let val = extract_f64(&v).with_context(|| format!("param '{k}': invalid value"))?;
-                params.insert(VariableName::new(k), val);
-            }
-        }
-    }
-
-    Ok(params)
+    Ok(yevice_core::io::parse_params(&content)?)
 }
 
-fn extract_f64(v: &serde_yaml_ng::Value) -> anyhow::Result<f64> {
-    match v {
-        serde_yaml_ng::Value::Number(n) => n
-            .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("cannot interpret number {v:?} as f64")),
-        serde_yaml_ng::Value::String(s) => s
-            .parse::<f64>()
-            .with_context(|| format!("cannot interpret string {v:?} as f64")),
-        _ => anyhow::bail!("cannot interpret value {v:?} as a number"),
-    }
-}
-
+/// Load user-defined variable bindings from a YAML file.
+///
+/// File I/O happens here; parsing is delegated to
+/// [`yevice_core::io::parse_bindings`].
 fn load_bindings(path: &str) -> Result<Vec<yevice_core::cost::VariableBinding>> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-    let file: BindingsFile =
-        serde_yaml_ng::from_str(&content).context("failed to parse bindings file")?;
-    Ok(to_variable_bindings(&file.bindings))
+    Ok(yevice_core::io::parse_bindings(&content)?)
 }
 
 fn load_string_map(path: &str) -> Result<HashMap<String, String>> {

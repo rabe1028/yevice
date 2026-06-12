@@ -1656,9 +1656,7 @@ dependencies = [
  "comfy-table",
  "serde_json",
  "serde_yaml_ng",
- "tracing",
  "tracing-subscriber",
- "ureq",
  "yevice-cfn",
  "yevice-core",
  "yevice-output",
@@ -1678,6 +1676,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror",
  "tracing",
 ]
@@ -1699,6 +1698,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "ureq",
  "yevice-core",
 ]
 

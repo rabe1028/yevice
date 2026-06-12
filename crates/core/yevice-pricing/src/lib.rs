@@ -1,5 +1,6 @@
 pub mod bulk_api;
 pub mod catalog;
+pub mod download;
 pub mod error;
 pub mod file_registry;
 pub mod gcp_model;
