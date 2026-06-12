@@ -263,10 +263,9 @@ pub fn simulate_architecture(
         // Evaluate cost for this hour's load (as monthly equivalent at this rate)
         match evaluate_architecture(arch, &params) {
             Ok(result) => {
-                // Scale hourly slice: this hour's rate * hours_in_month_at_this_hour
-                let hours_at_rate = profile.days_per_month;
-                let hour_cost =
-                    result.total_monthly_cost * hours_at_rate / (24.0 * profile.days_per_month);
+                // Each of the 24 hourly slices contributes 1/24 of its
+                // monthly-rate cost, independent of days_per_month.
+                let hour_cost = result.total_monthly_cost / 24.0;
                 total_monthly += hour_cost;
                 hourly_costs.push((hour, result.total_monthly_cost));
             }
