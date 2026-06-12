@@ -41,6 +41,11 @@ pub(crate) fn parse(s: &str) -> Option<CfnRef> {
         .strip_prefix(REF_PREFIX)
         .and_then(|r| r.strip_suffix(SUFFIX))
     {
+        // Reject concatenated sentinels like "{{ref:A}}{{ref:B}}":
+        // strip_suffix finds the last "}}", leaving "A}}{{ref:B" in inner.
+        if inner.contains(SUFFIX) {
+            return None;
+        }
         return Some(CfnRef {
             logical_id: inner.to_string(),
             attr: None,
@@ -50,6 +55,9 @@ pub(crate) fn parse(s: &str) -> Option<CfnRef> {
         .strip_prefix(GETATT_PREFIX)
         .and_then(|r| r.strip_suffix(SUFFIX))
     {
+        if inner.contains(SUFFIX) {
+            return None;
+        }
         let (logical_id, attr) = inner.split_once('.')?;
         return Some(CfnRef {
             logical_id: logical_id.to_string(),
@@ -155,6 +163,14 @@ mod tests {
         assert!(parse("MyQueue}}").is_none());
         // getatt without dot — no logical_id/attr split possible
         assert!(parse("{{getatt:MyQueueNoAttr}}").is_none());
+    }
+
+    #[test]
+    fn parse_concatenated_sentinels_returns_none() {
+        // "{{ref:A}}{{ref:B}}" must NOT parse as ResourceRef("A}}{{ref:B").
+        assert!(parse("{{ref:Prefix}}{{ref:Suffix}}").is_none());
+        // Same for getatt.
+        assert!(parse("{{getatt:A.Attr}}{{ref:B}}").is_none());
     }
 
     // -------------------------------------------------------------------------
