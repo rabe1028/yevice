@@ -1682,6 +1682,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "yevice-engine"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "yevice-cfn",
+ "yevice-core",
+ "yevice-pricing",
+ "yevice-service-api",
+ "yevice-tf",
+ "yevice-wrangler",
+]
+
+[[package]]
 name = "yevice-output"
 version = "0.1.0"
 dependencies = [
