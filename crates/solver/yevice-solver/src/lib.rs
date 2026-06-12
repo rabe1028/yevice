@@ -116,163 +116,33 @@ impl Solver for EnumerationSolver {
             weights[k] = weights[k + 1].saturating_mul(vars[k + 1].domain.len() as u64);
         }
 
-        // -----------------------------------------------------------------------
-        // Pre-loop: partition bindings into those independent of decision
-        // variables and those that may depend on them.
-        // -----------------------------------------------------------------------
-
-        // Collect all decision variable names into a "dependent" set, then
-        // transitively expand it: a binding whose expression references any
-        // dependent variable makes its *target* dependent too.
-        let decision_names: std::collections::HashSet<&VariableName> =
-            vars.iter().map(|dv| &dv.name).collect();
-
-        let mut dependent: std::collections::HashSet<&VariableName> =
-            decision_names.iter().copied().collect();
-
-        // Fixed-point expansion of the dependent set over bindings.
-        loop {
-            let mut changed = false;
-            for binding in &problem.bindings {
-                if dependent.contains(&binding.target) {
-                    continue;
-                }
-                let expr_vars = binding.expr.variables();
-                if expr_vars.iter().any(|v| dependent.contains(v)) {
-                    dependent.insert(&binding.target);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // Partition bindings: fixed_bindings are those whose expr variables are
-        // entirely outside the dependent set (safe to resolve once).
-        // decision_bindings must be re-resolved each iteration (original order kept).
-        // Clone into owned Vecs so we can pass slices to resolve_bindings_into.
-        let (mut fixed_bindings, mut decision_bindings): (Vec<_>, Vec<_>) = problem
-            .bindings
-            .iter()
-            .cloned()
-            .partition(|b| b.expr.variables().iter().all(|v| !dependent.contains(v)));
-
-        // Hardening (Scenario B): a binding whose target IS a decision variable
-        // name must NOT be hoisted into fixed_bindings.  Pre-seeding base with a
-        // constant value for that target would shadow the decision variable write
-        // that happens in the inner loop (via get_mut), causing the binding result
-        // to persist in scratch rather than the chosen domain value.
+        // Build the base params map: fixed_params + decision var slot pre-seed.
         //
-        // Only decision variable names are reclassified here — NOT transitively
-        // dependent targets, which are handled correctly by contested_decision_first.
-        let (still_fixed, must_be_decision): (Vec<_>, Vec<_>) = fixed_bindings
-            .into_iter()
-            .partition(|b| !decision_names.contains(&b.target));
-        fixed_bindings = still_fixed;
-        decision_bindings.extend(must_be_decision);
-
-        // Build the contested_decision_first set: targets that appear in BOTH
-        // fixed_bindings AND decision_bindings, where the FIRST occurrence in
-        // problem.bindings is a decision-dependent binding.  Only for these targets
-        // does the hoist incorrectly let the fixed binding win; removing the
-        // pre-resolved value from scratch restores list-order priority.
-        //
-        // Targets that are fixed_param keys or decision variable names are excluded:
-        //   - fixed_param key: base already holds the param value and must keep it.
-        //   - decision variable name: the decision slot written above must win.
-        let decision_binding_targets: std::collections::HashSet<&VariableName> =
-            decision_bindings.iter().map(|b| &b.target).collect();
-
-        // Walk problem.bindings once to record, for each collision target, whether
-        // its FIRST occurrence is decision-dependent.
-        let mut first_is_decision: std::collections::HashMap<&VariableName, bool> =
-            std::collections::HashMap::new();
-        for binding in &problem.bindings {
-            if !first_is_decision.contains_key(&binding.target) {
-                let depends_on_decision = binding
-                    .expr
-                    .variables()
-                    .iter()
-                    .any(|v| dependent.contains(v));
-                first_is_decision.insert(&binding.target, depends_on_decision);
-            }
-        }
-
-        let contested_decision_first: std::collections::HashSet<&VariableName> =
-            decision_binding_targets
-                .iter()
-                .filter(|t| {
-                    // Must also have a fixed binding (truly contested)
-                    fixed_bindings.iter().any(|b| &b.target == **t)
-                    // Must NOT be a fixed_param (its value must win)
-                    && !problem.fixed_params.contains_key(*t)
-                    // Must NOT be a decision variable name (its slot value must win)
-                    && !decision_names.contains(*t)
-                    // FIRST entry in problem.bindings for this target is decision-dependent
-                    && first_is_decision.get(*t).copied().unwrap_or(false)
-                })
-                .copied()
-                .collect();
-
-        // Build the base params map once: fixed_params + fixed bindings resolved.
-        // Pre-insert slots for decision variables so that the inner loop can
-        // update values via get_mut without cloning keys.
-        //
-        // Priority contract (after hardening reclassification above):
-        //   - fixed_param with same name as a binding target → fixed value wins
-        //     (already in base; resolve_bindings_into skips keys already present).
-        //   - decision variable with same name as a binding target → decision
-        //     value wins (written by get_mut after clone_from; skipped by
-        //     resolve_bindings_into).  Hardening ensures the binding was moved to
-        //     decision_bindings, so it is never pre-seeded into base.
-        //   - pure binding target (neither fixed_param nor decision var) with its
-        //     FIRST occurrence as a fixed binding → fixed value wins (pre-seeded
-        //     into base; resolve_bindings_into skips it).
-        //   - contested target whose FIRST occurrence in problem.bindings is a
-        //     decision-dependent binding → removed from scratch each iteration
-        //     (contested_decision_first); decision binding re-evaluates and wins.
+        // Decision slots are pre-inserted so that the inner loop can update
+        // values via get_mut without a fresh allocation each iteration.
+        // Fixed params are pre-inserted so resolve_bindings_into's contains_key
+        // guard preserves fixed_param values against any colliding binding target.
         let mut base: Params = problem
             .fixed_params
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-
-        // Resolve fixed bindings into base (these are decision-independent).
-        // resolve_bindings_into does not fail — it absorbs errors internally
-        // (unresolvable bindings are warned and skipped).
-        resolve_bindings_into(&mut base, &fixed_bindings);
-
-        // Pre-allocate slots for decision variables (value filled each iteration).
-        // This pre-seed is required so that get_mut(&vars[k].name).expect(…)
-        // in the inner loop can update values without a fresh allocation.
-        for dv in vars {
-            base.entry(dv.name.clone()).or_insert(0.0);
+        for var in vars {
+            base.entry(var.name.clone()).or_insert(0.0);
         }
 
-        // Scratch buffer: reused every iteration via clone_from to avoid
-        // allocating a new HashMap each time.  clone_from replaces all contents
-        // of scratch with those of base (reusing the underlying allocation where
-        // possible; each String key is still cloned, but no heap realloc occurs
-        // as long as the load factor stays stable).
-        let mut scratch = base.clone();
+        // Scratch buffer: reused every iteration via clone_from.
+        let mut scratch: Params = Params::default();
 
         let mut best: Option<Solution> = None;
         let mut evaluation_failures: u64 = 0;
         let mut first_evaluation_error: Option<String> = None;
 
         for i in 0..combination_count {
-            // Restore scratch to the fixed base state (reuses existing allocation).
-            // After this, scratch contains exactly the keys in base:
-            //   - fixed_params values
-            //   - fixed binding targets (already resolved)
-            //   - decision variable slots (placeholder 0.0, overwritten below)
-            // Pure decision_binding targets are NOT in scratch here (not pre-seeded).
+            // Restore scratch to the base state (fixed_params + decision var slots).
             scratch.clone_from(&base);
 
-            // Decode flat index i and write decision variable values directly
-            // into scratch.  The slots were pre-seeded into base, so get_mut
-            // always succeeds — the unwrap is an invariant, not a runtime check.
+            // Write decision variable assignments into their pre-seeded slots.
             for k in 0..n {
                 let idx = ((i / weights[k]) as usize) % vars[k].domain.len();
                 *scratch.get_mut(&vars[k].name).expect(
@@ -280,61 +150,12 @@ impl Solver for EnumerationSolver {
                 ) = vars[k].domain[idx];
             }
 
-            // Restore list-order priority for contested_decision_first targets:
-            // these are targets that appear in both fixed_bindings and
-            // decision_bindings, whose FIRST occurrence in problem.bindings is a
-            // decision-dependent binding, and that are neither a fixed_param key
-            // nor a decision variable name.
-            //
-            // Contested-first decision-dep binding gets priority if resolvable;
-            // otherwise the fallback fixed binding wins. This preserves OLD
-            // list-order "first resolvable wins" semantics exactly.
-            //
-            // Targets excluded from this set (fixed_param keys and decision
-            // variable names) are left intact in scratch so their values win.
-
-            // Save fixed-binding values for contested-first targets so we can fall
-            // back to them if the decision-dependent binding fails to resolve.
-            // This restores OLD single-pass "first resolvable wins" semantics:
-            // if the list-first (decision-dep) binding is unresolvable for this
-            // assignment, the next resolvable binding (the fixed fallback) wins.
-            let contested_fallback: Vec<(VariableName, f64)> = contested_decision_first
-                .iter()
-                .filter_map(|t| scratch.get(*t).map(|v| ((*t).clone(), *v)))
-                .collect();
-
-            for t in &contested_decision_first {
-                scratch.remove(*t);
-            }
-
-            // Resolve decision-dependent bindings against the updated scratch.
-            //
-            // Priority contract enforced by resolve_bindings_into's
-            // `contains_key` skip:
-            //   - decision variable == binding target → scratch already holds the
-            //     decision value (written above); resolve_bindings_into skips it
-            //     → decision value wins.  Hardening (above) ensures such bindings
-            //     were moved to decision_bindings, so they are never in base.
-            //   - fixed_param == binding target → base (and thus scratch after
-            //     clone_from) already holds the fixed value; skipped → fixed
-            //     value wins.
-            //   - pure binding target → absent from scratch after clone_from
-            //     (not pre-seeded); resolve_bindings_into inserts the fresh
-            //     computed value → correct recomputation each iteration.
-            //   - contested_decision_first target → removed above; resolve_bindings_into
-            //     inserts the decision-dependent value → list-order priority
-            //     restored for targets whose first occurrence is decision-dependent.
-            //
-            // resolve_bindings_into does not return a value — errors are absorbed
-            // internally (division-by-zero or missing variables are warned and
-            // the target is left absent, causing infeasibility below).
-            resolve_bindings_into(&mut scratch, &decision_bindings);
-
-            // Restore fixed-binding value for any contested-first target whose
-            // decision-dependent binding failed to resolve.
-            for (t, v) in contested_fallback {
-                scratch.entry(t).or_insert(v);
-            }
+            // Resolve ALL bindings inside the loop. resolve_bindings_into is
+            // fixed-point and uses contains_key skip, which faithfully reproduces
+            // the documented semantics: fixed_param values and decision var slot
+            // values win; for remaining targets, the first resolvable binding
+            // (across passes) wins.
+            resolve_bindings_into(&mut scratch, &problem.bindings);
 
             // Evaluate and check all constraints; skip this combination on any
             // evaluation error (treat as infeasible).
@@ -1480,6 +1301,422 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Multi-data table-driven test: priority-collision space
+    // -----------------------------------------------------------------------
+
+    /// Table-driven test covering 8 binding-priority scenarios.
+    ///
+    /// For each case the output of [`EnumerationSolver`] is validated against a
+    /// naive brute-force oracle (`solve_naive`) that re-evaluates every
+    /// combination from scratch using the single-pass [`resolve_bindings`]
+    /// semantics, and also against a hard-coded expected objective value that
+    /// was computed by hand (reasoning documented inline).
+    #[test]
+    fn multi_data_priority_collision_table() {
+        use yevice_core::cost::VariableBinding;
+        use yevice_core::evaluate::resolve_bindings;
+
+        /// Brute-force oracle: enumerate every combination of decision-variable
+        /// values, build the full params map (`fixed_params` + chosen values),
+        /// call `resolve_bindings` (single-pass, source of truth), check
+        /// feasibility, evaluate objective, track best.
+        fn solve_naive(problem: &OptimizationProblem) -> Solution {
+            let vars = &problem.decision_variables;
+            if vars.iter().any(|dv| dv.domain.is_empty()) {
+                return Solution {
+                    assignments: HashMap::new(),
+                    objective_value: f64::NAN,
+                    feasible: false,
+                    evaluation_failures: 0,
+                    total_combinations: 0,
+                    first_evaluation_error: None,
+                };
+            }
+
+            // Build enumeration indices.
+            let n = vars.len();
+            let mut indices = vec![0usize; n];
+            let mut best: Option<Solution> = None;
+
+            'outer: loop {
+                // Build params: fixed_params + current decision-variable selection.
+                let mut params: evaluate::Params = problem
+                    .fixed_params
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                for k in 0..n {
+                    params.insert(vars[k].name.clone(), vars[k].domain[indices[k]]);
+                }
+
+                // Resolve all bindings in one pass using the oracle.
+                let resolved = resolve_bindings(&problem.bindings, &params).unwrap();
+
+                // Check feasibility.
+                if !is_feasible(problem, &resolved) {
+                    // Advance indices.
+                    let mut carry = 1;
+                    for k in (0..n).rev() {
+                        if carry == 0 {
+                            break;
+                        }
+                        indices[k] += carry;
+                        if indices[k] < vars[k].domain.len() {
+                            carry = 0;
+                        } else {
+                            indices[k] = 0;
+                            carry = 1;
+                        }
+                    }
+                    if carry == 1 {
+                        break 'outer;
+                    }
+                    continue;
+                }
+
+                // Evaluate objective.
+                if let Ok(obj) = evaluate::evaluate(&problem.objective, &resolved) {
+                    let better = match &best {
+                        None => true,
+                        Some(cur) => match problem.direction {
+                            ObjectiveDirection::Minimize => obj < cur.objective_value,
+                            ObjectiveDirection::Maximize => obj > cur.objective_value,
+                        },
+                    };
+                    if better {
+                        let assignments: HashMap<VariableName, f64> = vars
+                            .iter()
+                            .map(|dv| {
+                                (
+                                    dv.name.clone(),
+                                    vars[vars.iter().position(|v| v.name == dv.name).unwrap()]
+                                        .domain[indices
+                                        [vars.iter().position(|v| v.name == dv.name).unwrap()]],
+                                )
+                            })
+                            .collect();
+                        best = Some(Solution {
+                            assignments,
+                            objective_value: obj,
+                            feasible: true,
+                            evaluation_failures: 0,
+                            total_combinations: 0,
+                            first_evaluation_error: None,
+                        });
+                    }
+                }
+
+                // Advance indices.
+                let mut carry = 1;
+                for k in (0..n).rev() {
+                    if carry == 0 {
+                        break;
+                    }
+                    indices[k] += carry;
+                    if indices[k] < vars[k].domain.len() {
+                        carry = 0;
+                    } else {
+                        indices[k] = 0;
+                        carry = 1;
+                    }
+                }
+                if carry == 1 {
+                    break 'outer;
+                }
+            }
+
+            best.unwrap_or(Solution {
+                assignments: HashMap::new(),
+                objective_value: f64::NAN,
+                feasible: false,
+                evaluation_failures: 0,
+                total_combinations: 0,
+                first_evaluation_error: None,
+            })
+        }
+
+        // Helper to build a VariableBinding concisely.
+        let binding = |target: &str, expr: Expr| VariableBinding {
+            target: var(target),
+            expr,
+            description: String::new(),
+            source: "test".into(),
+        };
+
+        // -----------------------------------------------------------------------
+        // Case definitions: (name, problem, expected_objective)
+        // -----------------------------------------------------------------------
+
+        // Case 1: empty_bindings
+        // y ∈ {1,2,3}, no bindings, minimize y.
+        // No bindings — objective is directly y. min(y) = 1.
+        let case1 = (
+            "empty_bindings",
+            OptimizationProblem {
+                objective: Expr::variable("y"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![],
+            },
+            1.0_f64, // min(y domain) = 1
+        );
+
+        // Case 2: same_target_fixed_first_decision_second
+        // y ∈ {1,2,3}; bindings: [(T=100, fixed), (T=y+0, decision)]; minimize T.
+        // First binding for T is T=100 (fixed, no decision-var refs).
+        // T=100 is pre-seeded into base; decision binding skipped (T already in scratch).
+        // resolve_bindings oracle: T=100 wins (contains_key skip on second binding).
+        // Expected obj = 100.
+        let case2 = (
+            "same_target_fixed_first_decision_second",
+            OptimizationProblem {
+                objective: Expr::variable("T"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![
+                    binding("T", Expr::constant(100.0)),
+                    binding(
+                        "T",
+                        Expr::sum(vec![Expr::variable("y"), Expr::constant(0.0)]),
+                    ),
+                ],
+            },
+            100.0, // fixed T=100 wins (listed first)
+        );
+
+        // Case 3: same_target_decision_first_fixed_second
+        // y ∈ {1,2,3}; bindings: [(T=y+0, decision), (T=100, fixed)]; minimize T.
+        // T is in contested_decision_first (first binding is decision-dependent,
+        // T is neither a fixed_param nor a decision var). T is removed from scratch
+        // before decision_bindings run → T = y + 0 = y. min(y) = 1.
+        // resolve_bindings oracle: first resolvable wins → for each y value, T=y
+        // (decision binding is first; y is in params so it resolves immediately).
+        // Expected obj = 1.
+        let case3 = (
+            "same_target_decision_first_fixed_second",
+            OptimizationProblem {
+                objective: Expr::variable("T"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![
+                    binding(
+                        "T",
+                        Expr::sum(vec![Expr::variable("y"), Expr::constant(0.0)]),
+                    ),
+                    binding("T", Expr::constant(100.0)),
+                ],
+            },
+            1.0, // decision-dependent binding (T=y+0) listed first wins; min(y)=1
+        );
+
+        // Case 4: three_same_target_bindings_mixed
+        // y ∈ {1,2,3}; bindings: [(T=100,fixed), (T=y*10,decision), (T=50,fixed)]; minimize T.
+        // First binding for T is T=100 (fixed), so T=100 is pre-seeded into base.
+        // Subsequent bindings for T are skipped (contains_key). T=100 always.
+        // resolve_bindings oracle: T=100 wins (first resolvable; 100 is constant, resolves first).
+        // Expected obj = 100.
+        let case4 = (
+            "three_same_target_bindings_mixed",
+            OptimizationProblem {
+                objective: Expr::variable("T"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![
+                    binding("T", Expr::constant(100.0)),
+                    binding(
+                        "T",
+                        Expr::product(vec![Expr::variable("y"), Expr::constant(10.0)]),
+                    ),
+                    binding("T", Expr::constant(50.0)),
+                ],
+            },
+            100.0, // first binding (T=100) wins; all subsequent T-bindings skipped
+        );
+
+        // Case 5: contested_target_equals_fixed_param
+        // fixed_params={x:99.0}; y ∈ {1,2,3}; bindings: [(x=50,fixed),(x=y+100,decision)]; minimize x.
+        // x is a fixed_param key → excluded from contested_decision_first.
+        // base already holds x=99 from fixed_params. Both bindings skipped (x already present).
+        // resolve_bindings oracle: x=99 (in base_params; contains_key skips both bindings).
+        // Expected obj = 99.
+        let case5_fixed = {
+            let mut fp = HashMap::new();
+            fp.insert(var("x"), 99.0);
+            fp
+        };
+        let case5 = (
+            "contested_target_equals_fixed_param",
+            OptimizationProblem {
+                objective: Expr::variable("x"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+                constraints: vec![],
+                fixed_params: case5_fixed,
+                bindings: vec![
+                    binding("x", Expr::constant(50.0)),
+                    binding(
+                        "x",
+                        Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+                    ),
+                ],
+            },
+            99.0, // fixed_param x=99 wins; both bindings skipped
+        );
+
+        // Case 6: contested_target_equals_decision_variable
+        // decision_vars: x ∈ {1,2,3}, y ∈ {1,2,3}; bindings: [(x=50,fixed),(x=y+100,decision)]; minimize x.
+        // x is a decision variable → hardening moves x=50 binding to decision_bindings.
+        // x slot value (written by inner loop) is pre-seeded into scratch; resolve_bindings_into
+        // skips x (already present). Decision slot x wins.
+        // resolve_bindings oracle: x already in params (decision value); both bindings skipped.
+        // min(x domain) = 1. Expected obj = 1, assignments['x'] = 1.0.
+        let case6 = (
+            "contested_target_equals_decision_variable",
+            OptimizationProblem {
+                objective: Expr::variable("x"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![
+                    dv("x", vec![1.0, 2.0, 3.0]),
+                    dv("y", vec![1.0, 2.0, 3.0]),
+                ],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![
+                    binding("x", Expr::constant(50.0)),
+                    binding(
+                        "x",
+                        Expr::sum(vec![Expr::variable("y"), Expr::constant(100.0)]),
+                    ),
+                ],
+            },
+            1.0, // decision variable x slot wins; min(x domain)=1
+        );
+
+        // Case 7: chained_decision_bindings
+        // y ∈ {1,2,3}; bindings: [(T2=y,decision),(T1=T2+1,decision)]; minimize T1.
+        // T2=y (decision-dependent), T1=T2+1 (decision-dependent, chains through T2).
+        // At y=1: T2=1, T1=2; at y=2: T2=2, T1=3; at y=3: T2=3, T1=4.
+        // min T1 = 2 (at y=1).
+        // resolve_bindings oracle: T2=y, then T1=T2+1=y+1. min at y=1 → T1=2.
+        // Expected obj = 2.
+        let case7 = (
+            "chained_decision_bindings",
+            OptimizationProblem {
+                objective: Expr::variable("T1"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("y", vec![1.0, 2.0, 3.0])],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![
+                    binding("T2", Expr::variable("y")),
+                    binding(
+                        "T1",
+                        Expr::sum(vec![Expr::variable("T2"), Expr::constant(1.0)]),
+                    ),
+                ],
+            },
+            2.0, // T1 = y + 1; min at y=1 gives T1=2
+        );
+
+        // Case 8: empty_expr_vars_binding_targets_decision_var
+        // x ∈ {5,10,15}; bindings: [(x=50, fixed)]; minimize x.
+        // x is a decision variable → hardening moves x=50 binding to decision_bindings.
+        // x slot written by inner loop is in scratch; resolve_bindings_into skips x.
+        // Decision slot wins. min(x domain) = 5.
+        // resolve_bindings oracle: x already in params (decision value 5/10/15); binding skipped.
+        // Expected obj = 5, assignments['x'] = 5.0.
+        let case8 = (
+            "empty_expr_vars_binding_targets_decision_var",
+            OptimizationProblem {
+                objective: Expr::variable("x"),
+                direction: ObjectiveDirection::Minimize,
+                decision_variables: vec![dv("x", vec![5.0, 10.0, 15.0])],
+                constraints: vec![],
+                fixed_params: HashMap::new(),
+                bindings: vec![binding("x", Expr::constant(50.0))],
+            },
+            5.0, // decision variable x slot wins; min(x domain)=5
+        );
+
+        let cases: Vec<(&str, OptimizationProblem, f64)> =
+            vec![case1, case2, case3, case4, case5, case6, case7, case8];
+
+        let solver = EnumerationSolver;
+
+        for (name, problem, expected_obj) in &cases {
+            let solver_sol = solver
+                .solve(problem)
+                .unwrap_or_else(|e| panic!("case '{name}': solver returned error: {e:?}"));
+            let naive_sol = solve_naive(problem);
+
+            // Feasibility must agree.
+            assert!(
+                solver_sol.feasible == naive_sol.feasible,
+                "case '{name}': feasibility mismatch — solver={} naive={}",
+                solver_sol.feasible,
+                naive_sol.feasible
+            );
+
+            if solver_sol.feasible {
+                // Objective must match naive oracle within epsilon.
+                assert!(
+                    (solver_sol.objective_value - naive_sol.objective_value).abs() < 1e-9,
+                    "case '{name}': objective mismatch vs naive — solver={} naive={}",
+                    solver_sol.objective_value,
+                    naive_sol.objective_value
+                );
+
+                // Objective must match hand-computed expected value within epsilon.
+                assert!(
+                    (solver_sol.objective_value - expected_obj).abs() < 1e-9,
+                    "case '{name}': objective mismatch vs expected — solver={} expected={}",
+                    solver_sol.objective_value,
+                    expected_obj
+                );
+
+                // Assignment map must agree with naive on every decision variable.
+                for dv_var in &problem.decision_variables {
+                    let solver_val = solver_sol
+                        .assignments
+                        .get(&dv_var.name)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case '{name}': solver missing assignment for '{}'",
+                                dv_var.name
+                            )
+                        });
+                    let naive_val = naive_sol
+                        .assignments
+                        .get(&dv_var.name)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case '{name}': naive missing assignment for '{}'",
+                                dv_var.name
+                            )
+                        });
+                    assert!(
+                        (solver_val - naive_val).abs() < 1e-9,
+                        "case '{name}': assignment mismatch for '{}' — solver={} naive={}",
+                        dv_var.name,
+                        solver_val,
+                        naive_val
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // MAX_COMBINATIONS boundary tests
     // -----------------------------------------------------------------------
 
@@ -1638,6 +1875,64 @@ mod tests {
         assert!(
             sol.first_evaluation_error.is_some(),
             "expected first_evaluation_error to be Some(..) when all evaluations fail"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test for proptest counterexample: transitive dependency
+    // -----------------------------------------------------------------------
+
+    /// Regression: discovered by proptest — a fixed binding `b = 2` referenced
+    /// by an earlier decision-dependent binding `T1 = c * b` must NOT be hoisted
+    /// before the earlier binding has had a chance to be skipped for
+    /// undefined-variable.
+    ///
+    /// Per resolve_bindings's fixed-point + contains_key semantics:
+    ///   pass 1: T1=c*b skipped (b undefined), T1=1 inserts, b=2 inserts
+    ///   pass 2: all targets already set, no progress
+    ///   final T1 = 1.
+    ///
+    /// The old hoist optimization would pre-seed `b=2` into base before the
+    /// loop, causing T1=c*b to resolve in pass 1 and skip T1=1, yielding T1=2
+    /// (wrong).
+    #[test]
+    fn transitive_dependency_does_not_corrupt_binding_order() {
+        use yevice_core::cost::VariableBinding;
+
+        let problem = OptimizationProblem {
+            decision_variables: vec![dv("c", vec![1.0])],
+            fixed_params: HashMap::new(),
+            bindings: vec![
+                VariableBinding {
+                    target: var("T1"),
+                    expr: Expr::product(vec![Expr::variable("c"), Expr::variable("b")]),
+                    description: "T1 = c * b".into(),
+                    source: "test".into(),
+                },
+                VariableBinding {
+                    target: var("T1"),
+                    expr: Expr::constant(1.0),
+                    description: "T1 = 1".into(),
+                    source: "test".into(),
+                },
+                VariableBinding {
+                    target: var("b"),
+                    expr: Expr::constant(2.0),
+                    description: "b = 2".into(),
+                    source: "test".into(),
+                },
+            ],
+            constraints: vec![],
+            objective: Expr::variable("T1"),
+            direction: ObjectiveDirection::Minimize,
+        };
+
+        let result = EnumerationSolver.solve(&problem).expect("solve");
+        assert!(result.feasible);
+        assert!(
+            (result.objective_value - 1.0).abs() < 1e-9,
+            "T1 must be 1 (first-pass resolvable wins under fixed-point semantics), got {}",
+            result.objective_value
         );
     }
 }
