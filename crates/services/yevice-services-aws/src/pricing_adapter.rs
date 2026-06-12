@@ -505,9 +505,7 @@ impl PriceCatalog for AwsPricingCatalog {
             // Route through the file registry so that non-Tokyo regions emit a
             // fallback warning consistent with other RDS paths (via
             // FilePricingRegistry::warn_fallback_once).
-            "aws.rds.gp3_storage_gb_month" => {
-                Ok(PriceRecord::flat(self.rds_gp3_storage_price()))
-            }
+            "aws.rds.gp3_storage_gb_month" => Ok(PriceRecord::flat(self.rds_gp3_storage_price())),
             "aws.rds.gp3_iops_month" => Ok(PriceRecord::flat(self.rds_gp3_iops_price())),
             sku if sku.starts_with("aws.rds.") => {
                 // Format: aws.rds.<engine>.<instance_type>
