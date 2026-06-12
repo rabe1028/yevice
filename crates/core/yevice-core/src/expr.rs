@@ -20,6 +20,7 @@ pub struct Tier {
 /// A composable numeric expression evaluated with variable bindings.
 /// Used for cost calculations, capacity requirement derivations, and
 /// constraint definitions.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum Expr {
