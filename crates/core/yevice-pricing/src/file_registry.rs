@@ -211,7 +211,10 @@ impl FilePricingRegistry {
             let matches = find_entries_by_family(
                 entries,
                 "Database Storage",
-                &[("volumeType", "General Purpose-GP3")],
+                &[
+                    ("volumeType", "General Purpose-GP3"),
+                    ("deploymentOption", "Single-AZ"),
+                ],
             );
             if let Some(entry) = matches.first()
                 && let Some(price) = first_price(entry)
@@ -232,7 +235,10 @@ impl FilePricingRegistry {
     /// RDS instance-pricing fallback.
     pub fn rds_gp3_iops_price(&self) -> f64 {
         if let Some(entries) = self.entries("rds") {
-            let matches = find_entries(entries, &[("group", "RDS-GP3-IOPS")]);
+            let matches = find_entries(
+                entries,
+                &[("group", "RDS-GP3-IOPS"), ("deploymentOption", "Single-AZ")],
+            );
             if let Some(entry) = matches.first()
                 && let Some(price) = first_price(entry)
             {
