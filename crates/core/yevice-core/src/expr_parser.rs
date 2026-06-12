@@ -6,11 +6,16 @@
 //! - Arithmetic: `+`, `-`, `*`, `/`
 //! - Parentheses: `(a + b) * c`
 //! - `ceil(expr)`: ceiling function
+//! - `max(expr, floor)`: maximum of expr and a constant floor value
+//! - `min(expr, ceiling)`: minimum of expr and a constant ceiling value
 //!
 //! Grammar (recursive descent):
 //!   expr     = term (('+' | '-') term)*
 //!   term     = unary (('*' | '/') unary)*
-//!   unary    = 'ceil' '(' expr ')' | atom
+//!   unary    = 'ceil' '(' expr ')'
+//!            | 'max' '(' expr ',' NUMBER ')'
+//!            | 'min' '(' expr ',' NUMBER ')'
+//!            | atom
 //!   atom     = NUMBER | VARIABLE | '(' expr ')'
 
 use crate::expr::Expr;
@@ -21,6 +26,8 @@ pub enum ParseError {
     UnexpectedChar(char),
     UnexpectedEnd,
     ExpectedCloseParen,
+    ExpectedComma,
+    ExpectedNumber,
     InvalidNumber { literal: String, pos: usize },
 }
 
@@ -30,6 +37,8 @@ impl std::fmt::Display for ParseError {
             Self::UnexpectedChar(c) => write!(f, "unexpected character: '{c}'"),
             Self::UnexpectedEnd => write!(f, "unexpected end of expression"),
             Self::ExpectedCloseParen => write!(f, "expected ')'"),
+            Self::ExpectedComma => write!(f, "expected ','"),
+            Self::ExpectedNumber => write!(f, "expected a numeric literal"),
             Self::InvalidNumber { literal, pos } => {
                 write!(f, "invalid number literal '{literal}' at position {pos}")
             }
@@ -129,7 +138,72 @@ impl<'a> Parser<'a> {
             return Ok(Expr::ceil(inner));
         }
 
+        if self.starts_with_ident("max") {
+            self.pos += 3;
+            self.skip_whitespace();
+            if self.advance() != Some(b'(') {
+                return Err(ParseError::ExpectedCloseParen);
+            }
+            let inner = self.parse_expr()?;
+            self.skip_whitespace();
+            if self.advance() != Some(b',') {
+                return Err(ParseError::ExpectedComma);
+            }
+            self.skip_whitespace();
+            let floor = self.parse_number_literal()?;
+            self.skip_whitespace();
+            if self.advance() != Some(b')') {
+                return Err(ParseError::ExpectedCloseParen);
+            }
+            return Ok(Expr::Max {
+                expr: Box::new(inner),
+                floor,
+            });
+        }
+
+        if self.starts_with_ident("min") {
+            self.pos += 3;
+            self.skip_whitespace();
+            if self.advance() != Some(b'(') {
+                return Err(ParseError::ExpectedCloseParen);
+            }
+            let inner = self.parse_expr()?;
+            self.skip_whitespace();
+            if self.advance() != Some(b',') {
+                return Err(ParseError::ExpectedComma);
+            }
+            self.skip_whitespace();
+            let ceiling = self.parse_number_literal()?;
+            self.skip_whitespace();
+            if self.advance() != Some(b')') {
+                return Err(ParseError::ExpectedCloseParen);
+            }
+            return Ok(Expr::Min {
+                expr: Box::new(inner),
+                ceiling,
+            });
+        }
+
         self.parse_atom()
+    }
+
+    fn parse_number_literal(&mut self) -> Result<f64, ParseError> {
+        self.skip_whitespace();
+        match self.peek() {
+            Some(c) if c.is_ascii_digit() || c == b'.' => {}
+            _ => return Err(ParseError::ExpectedNumber),
+        }
+        let start = self.pos;
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'.')
+        {
+            self.pos += 1;
+        }
+        let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
+        s.parse::<f64>().map_err(|_| ParseError::InvalidNumber {
+            literal: s.to_string(),
+            pos: start,
+        })
     }
 
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
@@ -282,5 +356,74 @@ mod tests {
             msg.contains("1.2.3"),
             "error message must contain the offending literal; got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_max_below_floor() {
+        // x = 2, floor = 5  →  max(2, 5) = 5
+        let p = params_from(&[("x", 2.0)]);
+        assert_eq!(compute("max(x, 5)", &p), 5.0);
+    }
+
+    #[test]
+    fn test_max_above_floor() {
+        // x = 10, floor = 5  →  max(10, 5) = 10
+        let p = params_from(&[("x", 10.0)]);
+        assert_eq!(compute("max(x, 5)", &p), 10.0);
+    }
+
+    #[test]
+    fn test_min_below_ceiling() {
+        // x = 2, ceiling = 5  →  min(2, 5) = 2
+        let p = params_from(&[("x", 2.0)]);
+        assert_eq!(compute("min(x, 5)", &p), 2.0);
+    }
+
+    #[test]
+    fn test_min_above_ceiling() {
+        // x = 10, ceiling = 5  →  min(10, 5) = 5
+        let p = params_from(&[("x", 10.0)]);
+        assert_eq!(compute("min(x, 5)", &p), 5.0);
+    }
+
+    #[test]
+    fn test_max_nested_with_ceil_and_div() {
+        // ceil(max(x, 1) / 3) with x=7  →  ceil(7/3) = ceil(2.333..) = 3
+        let p = params_from(&[("x", 7.0)]);
+        assert_eq!(compute("ceil(max(x, 1) / 3)", &p), 3.0);
+        // x=0  →  ceil(max(0, 1) / 3) = ceil(1/3) = ceil(0.333..) = 1
+        let p0 = params_from(&[("x", 0.0)]);
+        assert_eq!(compute("ceil(max(x, 1) / 3)", &p0), 1.0);
+    }
+
+    #[test]
+    fn test_max_missing_comma_error() {
+        let err = parse_expr("max(x 5)").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(','),
+            "error message should mention comma; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_max_non_literal_second_arg_error() {
+        // The second argument of max/min must be a numeric literal.
+        let err = parse_expr("max(x, y)").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.is_empty(),
+            "expected an error for non-literal second arg; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_min_nested() {
+        // min(x * 2, 10) with x=3  →  min(6, 10) = 6
+        let p = params_from(&[("x", 3.0)]);
+        assert_eq!(compute("min(x * 2, 10)", &p), 6.0);
+        // x=8  →  min(16, 10) = 10
+        let p8 = params_from(&[("x", 8.0)]);
+        assert_eq!(compute("min(x * 2, 10)", &p8), 10.0);
     }
 }
