@@ -1,0 +1,32 @@
+[package]
+name = "yevice-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Orchestration engine for the yevice cost-model toolkit: input detection, IaC parsing, and cost-model generation"
+keywords = ["aws", "cost", "cloudformation", "terraform", "pricing"]
+categories = ["development-tools"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+yevice-core = { workspace = true }
+yevice-service-api = { workspace = true }
+yevice-pricing = { workspace = true }
+yevice-cfn = { workspace = true }
+yevice-tf = { workspace = true }
+yevice-wrangler = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

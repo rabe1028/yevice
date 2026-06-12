@@ -6,6 +6,7 @@ members = [
   "crates/iac/yevice-cfn",
   "crates/iac/yevice-tf",
   "crates/iac/yevice-wrangler",
+  "crates/engine/yevice-engine",
   "crates/services/yevice-services-aws",
   "crates/services/yevice-services-gcp",
   "crates/output/yevice-output",
@@ -69,6 +70,7 @@ yevice-pricing = { path = "crates/core/yevice-pricing", version = "0.1.0" }
 yevice-cfn = { path = "crates/iac/yevice-cfn", version = "0.1.0" }
 yevice-tf = { path = "crates/iac/yevice-tf", version = "0.1.0" }
 yevice-wrangler = { path = "crates/iac/yevice-wrangler", version = "0.1.0" }
+yevice-engine = { path = "crates/engine/yevice-engine", version = "0.1.0" }
 yevice-services-aws = { path = "crates/services/yevice-services-aws", version = "0.1.0" }
 yevice-services-gcp = { path = "crates/services/yevice-services-gcp", version = "0.1.0" }
 yevice-output = { path = "crates/output/yevice-output", version = "0.1.0" }
