@@ -406,19 +406,23 @@ fn resolve_select(
     );
 
     if is_unresolvable_list {
-        // We cannot select from an unresolvable list.  Preserve the original
-        // !Select expression so downstream consumers see the full expression
-        // (including the index), not just the list argument.
+        // We cannot select from an unresolvable list, but we must preserve any
+        // resource references that are already encoded in the resolved list
+        // value.  Returning the raw YAML wrapped in a Concrete(Tagged) would
+        // discard those typed references (they live inside list_resolved, not
+        // inside the original YAML node), causing downstream reference-
+        // extraction walks in convert.rs to miss them.
+        //
+        // Instead, return the already-resolved list value directly.  "Index
+        // selection is impossible at static-analysis time" but "the
+        // dependencies (references) must not be lost" — callers that consume
+        // the result as a sequence already handle non-sequence pass-throughs
+        // with their own guard (resolve_split does the same for its source).
         tracing::warn!(
             index = index,
-            "!Select list is unresolvable; passing through original !Select expression as-is"
+            "!Select list is unresolvable; passing through resolved list value to preserve references"
         );
-        return Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
-            serde_yaml_ng::value::TaggedValue {
-                tag: serde_yaml_ng::value::Tag::new("!Select"),
-                value: value.clone(),
-            },
-        ))));
+        return Ok(list_resolved);
     }
 
     let list = list_resolved
@@ -639,14 +643,34 @@ fn resolve_split(
             Ok(source)
         }
         ResolvedValue::Concrete(Value::Tagged(_)) => {
-            // Source resolved to an unknown pass-through intrinsic
-            // (e.g. !Base64 "a,b").  We cannot split statically.
+            // Source resolved to an unknown pass-through intrinsic in
+            // tag-form (e.g. `!Base64 "a,b"`).  We cannot split statically.
             // Preserve the original !Split tagged expression so the caller
             // sees it as an unresolved sequence-like value.
             tracing::warn!(
                 separator = %separator,
                 source = ?source,
                 "Fn::Split source is an unresolved intrinsic; passing through as-is"
+            );
+            Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
+                serde_yaml_ng::value::TaggedValue {
+                    tag: serde_yaml_ng::value::Tag::new("!Split"),
+                    value: value.clone(),
+                },
+            ))))
+        }
+        ResolvedValue::Map(map)
+            if map.len() == 1 && map.keys().next().is_some_and(|k| k.starts_with("Fn::")) =>
+        {
+            // Source resolved to a single-key map whose key has the `Fn::`
+            // prefix — this is the long-form equivalent of an unknown tagged
+            // intrinsic (e.g. `{"Fn::Base64": "a,b"}`).  Treat identically
+            // to the `Concrete(Value::Tagged(_))` case above so that tagged
+            // and long-form templates behave consistently.
+            tracing::warn!(
+                separator = %separator,
+                source = ?source,
+                "Fn::Split source is an unresolved long-form intrinsic; passing through as-is"
             );
             Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
                 serde_yaml_ng::value::TaggedValue {
@@ -1380,11 +1404,16 @@ mod tests {
         );
     }
 
-    /// `!Select [0, !Split [",", !Sub "${Queue},x"]]` — when the Split source
-    /// is Interpolated the whole expression must pass through without error
-    /// (both Split and the parent Select degrade gracefully).
+    /// `!Select [0, !Split [",", !Sub "${MyQueue},x"]]` — when the Split
+    /// source is Interpolated, the whole expression must pass through without
+    /// error AND the `MyQueue` reference that lives inside the Interpolated
+    /// value must be visible via `references()`.
+    ///
+    /// The previous behaviour wrapped the raw YAML in
+    /// `Concrete(Tagged(!Select ...))`, which discarded the already-resolved
+    /// typed references.  The fix returns the resolved list value directly.
     #[test]
-    fn test_select_with_unresolvable_split_passes_through() {
+    fn test_select_with_unresolvable_split_passes_through_preserving_references() {
         let ctx = make_ctx();
         // !Sub "${MyQueue},x" → Interpolated (MyQueue is not a parameter)
         let sub_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
@@ -1407,19 +1436,20 @@ mod tests {
             result.is_ok(),
             "!Select over unresolvable !Split must not error, got: {result:?}"
         );
-        // The pass-through must be the outer !Select expression, not the inner
-        // !Split — callers must see the full expression including the index.
-        match result.unwrap() {
-            ResolvedValue::Concrete(Value::Tagged(t)) => {
-                assert_eq!(
-                    t.tag.to_string(),
-                    "!Select",
-                    "pass-through must preserve the outer !Select tag, got {:?}",
-                    t.tag
-                );
-            }
-            other => panic!("expected Concrete(Tagged(!Select ...)), got {other:?}"),
-        }
+        let resolved = result.unwrap();
+        // The result must NOT be Concrete(Tagged(!Select ...)) — that form
+        // discards the typed references stored in the resolved list value.
+        // Instead the resolved list value (Interpolated) is returned directly,
+        // so references() surfaces MyQueue to the downstream graph builder.
+        let refs = resolved.references();
+        assert!(
+            !refs.is_empty(),
+            "!Select pass-through must preserve references from the list; got none for {resolved:?}"
+        );
+        assert_eq!(
+            refs[0].logical_id, "MyQueue",
+            "expected MyQueue reference, got {refs:?}"
+        );
     }
 
     /// `!Split [",", !Base64 "a,b"]` — when the source is an unknown
@@ -1448,6 +1478,61 @@ mod tests {
                 );
             }
             other => panic!("expected Concrete(Tagged(!Split ...)), got {other:?}"),
+        }
+    }
+
+    /// `Fn::Split [",", {"Fn::Base64": "a,b"}]` — long-form unknown intrinsic
+    /// as the Split source must behave identically to the tag-form
+    /// `!Split [",", !Base64 "a,b"]`: both must pass through without error and
+    /// produce a `Concrete(Tagged(!Split ...))` result.
+    ///
+    /// This tests parity between tagged and long-form representations of the
+    /// same template construct (Issue #19 comment 3404981486).
+    #[test]
+    fn test_split_long_form_unknown_intrinsic_source_same_as_tag_form() {
+        let ctx = make_ctx();
+
+        // --- tag-form: !Split [",", !Base64 "a,b"] ---
+        let base64_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Base64"),
+            value: Value::String("a,b".into()),
+        }));
+        let tag_val = Value::Sequence(vec![Value::String(",".into()), base64_tagged]);
+        let tag_result = resolve_split(&tag_val, &ctx, 0);
+        assert!(
+            tag_result.is_ok(),
+            "tag-form: Fn::Split with !Base64 source must not error, got: {tag_result:?}"
+        );
+
+        // --- long-form: {"Fn::Split": [",", {"Fn::Base64": "a,b"}]} ---
+        let mut base64_map = serde_yaml_ng::Mapping::new();
+        base64_map.insert(
+            Value::String("Fn::Base64".into()),
+            Value::String("a,b".into()),
+        );
+        let long_val = Value::Sequence(vec![Value::String(",".into()), Value::Mapping(base64_map)]);
+        let long_result = resolve_split(&long_val, &ctx, 0);
+        assert!(
+            long_result.is_ok(),
+            "long-form: Fn::Split with {{\"Fn::Base64\": ...}} source must not error, got: {long_result:?}"
+        );
+
+        // Both must produce a Concrete(Tagged(!Split ...)) pass-through.
+        for (label, result) in [
+            ("tag-form", tag_result.unwrap()),
+            ("long-form", long_result.unwrap()),
+        ] {
+            match result {
+                ResolvedValue::Concrete(Value::Tagged(ref t)) => {
+                    assert_eq!(
+                        t.tag.to_string(),
+                        "!Split",
+                        "{label}: pass-through must be tagged !Split, got {:?}",
+                        t.tag
+                    );
+                }
+                other => panic!("{label}: expected Concrete(Tagged(!Split ...)), got {other:?}"),
+            }
         }
     }
 
