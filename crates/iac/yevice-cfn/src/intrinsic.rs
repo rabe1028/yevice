@@ -396,14 +396,16 @@ fn resolve_select(
 
     // Helper: detect whether the resolved list is something we cannot iterate
     // statically (tagged pass-through, resource reference, or interpolated
-    // string that happens to be the list argument).
+    // string that happens to be the list argument, or a long-form unknown
+    // intrinsic represented as a single-key Fn::* Map).
     let is_unresolvable_list = matches!(
         &list_resolved,
         ResolvedValue::Concrete(Value::Tagged(_))
             | ResolvedValue::Ref(_)
             | ResolvedValue::GetAtt { .. }
             | ResolvedValue::Interpolated(_)
-    );
+    ) || matches!(&list_resolved, ResolvedValue::Map(map)
+        if map.len() == 1 && map.keys().next().is_some_and(|k| k.starts_with("Fn::")));
 
     if is_unresolvable_list {
         // We cannot select from an unresolvable list, but we must preserve any
@@ -1449,6 +1451,31 @@ mod tests {
         assert_eq!(
             refs[0].logical_id, "MyQueue",
             "expected MyQueue reference, got {refs:?}"
+        );
+    }
+
+    /// `Fn::Select [0, {Fn::GetAZs: ""}]` — long-form unknown intrinsic as
+    /// the Select list must degrade gracefully (pass-through, no error), just
+    /// like the tag-form `!Select [0, !GetAZs ""]` (parity fix identified by
+    /// codex review, Refs #19).
+    #[test]
+    fn test_select_long_form_unknown_intrinsic_list_passes_through() {
+        let ctx = make_ctx();
+
+        // Build: {"Fn::Select": [0, {"Fn::GetAZs": ""}]}
+        let mut getazs_map = serde_yaml_ng::Mapping::new();
+        getazs_map.insert(
+            Value::String("Fn::GetAZs".into()),
+            Value::String(String::new()),
+        );
+        let val = Value::Sequence(vec![
+            Value::Number(serde_yaml_ng::value::Number::from(0_u64)),
+            Value::Mapping(getazs_map),
+        ]);
+        let result = resolve_select(&val, &ctx, 0);
+        assert!(
+            result.is_ok(),
+            "Fn::Select with long-form unknown intrinsic list must not error, got: {result:?}"
         );
     }
 
