@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::bulk_api::{
-    PricingEntry, find_entries, find_entries_by_family, first_price, parse_bulk_pricing,
+    PricingEntry, find_entries, find_entries_by_family, first_price, parse_bulk_pricing_full,
 };
 use crate::error::PricingError;
 use crate::model::*;
@@ -14,6 +14,22 @@ use crate::model::*;
 /// The region used by the hardcoded fallback values.  When the requested
 /// region matches this constant, no warning is emitted.
 const HARDCODED_REGION: &str = "ap-northeast-1";
+
+/// Metadata describing the source and freshness of a loaded pricing file.
+#[derive(Debug, Clone)]
+pub struct PricingMetadata {
+    /// The service key used to identify this file (e.g. `"lambda"`, `"ec2"`).
+    pub service_key: String,
+    /// ISO 8601 publication date from the Bulk API JSON, if present.
+    pub publication_date: Option<String>,
+    /// Version string from the Bulk API JSON, if present.
+    pub version: Option<String>,
+    /// The region this pricing data was loaded for.
+    pub region: String,
+    /// Currency key detected from `pricePerUnit` (e.g. `"USD"`).
+    /// Defaults to `"USD"` when no price dimension is found.
+    pub currency: String,
+}
 
 /// Pricing registry that loads from downloaded JSON files.
 pub struct FilePricingRegistry {
@@ -23,6 +39,8 @@ pub struct FilePricingRegistry {
     pub fallback: crate::registry::PricingRegistry,
     /// Map from service key (e.g. `"lambda"`, `"ec2"`) to parsed pricing entries.
     services: HashMap<String, Vec<PricingEntry>>,
+    /// Map from service key to file-level metadata extracted at load time.
+    metadata: HashMap<String, PricingMetadata>,
     /// Tracks which services have already emitted a fallback warning so each
     /// service only warns once per registry instance.
     warned_services: Mutex<HashSet<String>>,
@@ -48,9 +66,11 @@ impl FilePricingRegistry {
         ];
 
         let mut services: HashMap<String, Vec<PricingEntry>> = HashMap::new();
+        let mut metadata: HashMap<String, PricingMetadata> = HashMap::new();
         for name in &service_names {
-            if let Some(entries) = load_service(&data_dir, name) {
+            if let Some((entries, meta)) = load_service(&data_dir, name, &region) {
                 services.insert(name.to_string(), entries);
+                metadata.insert(name.to_string(), meta);
             }
         }
 
@@ -66,6 +86,7 @@ impl FilePricingRegistry {
             data_dir,
             fallback,
             services,
+            metadata,
             warned_services: Mutex::new(HashSet::new()),
         }
     }
@@ -91,6 +112,16 @@ impl FilePricingRegistry {
                 HARDCODED_REGION,
             );
         }
+    }
+
+    /// Returns metadata for `service_key`, or `None` if that file was not loaded.
+    pub fn metadata(&self, service_key: &str) -> Option<&PricingMetadata> {
+        self.metadata.get(service_key)
+    }
+
+    /// Returns metadata for all successfully loaded services.
+    pub fn all_metadata(&self) -> Vec<&PricingMetadata> {
+        self.metadata.values().collect()
     }
 
     /// Returns loaded entries for `service_key`, or `None` if that file was
@@ -410,13 +441,30 @@ impl FilePricingRegistry {
     }
 }
 
-fn load_service(data_dir: &Path, name: &str) -> Option<Vec<PricingEntry>> {
+fn load_service(
+    data_dir: &Path,
+    name: &str,
+    region: &str,
+) -> Option<(Vec<PricingEntry>, PricingMetadata)> {
     let path = data_dir.join(format!("{name}.json"));
     match std::fs::read(&path) {
-        Ok(data) => match parse_bulk_pricing(&data) {
-            Ok(entries) => {
+        Ok(data) => match parse_bulk_pricing_full(&data) {
+            Ok((entries, bulk_meta)) => {
                 tracing::debug!(service = name, entries = entries.len(), "loaded pricing");
-                Some(entries)
+                tracing::info!(
+                    service = name,
+                    publication_date = bulk_meta.publication_date.as_deref().unwrap_or("unknown"),
+                    version = bulk_meta.version.as_deref().unwrap_or("unknown"),
+                    "loaded pricing file metadata"
+                );
+                let meta = PricingMetadata {
+                    service_key: name.to_string(),
+                    publication_date: bulk_meta.publication_date,
+                    version: bulk_meta.version,
+                    region: region.to_string(),
+                    currency: bulk_meta.currency,
+                };
+                Some((entries, meta))
             }
             Err(e) => {
                 tracing::warn!(service = name, error = %e, "failed to parse pricing file");

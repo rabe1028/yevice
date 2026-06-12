@@ -3,6 +3,9 @@
 //! The JSON structure:
 //! ```json
 //! {
+//!   "offerCode": "...",
+//!   "version": "...",
+//!   "publicationDate": "...",
 //!   "products": { "<sku>": { "sku": "...", "productFamily": "...", "attributes": { ... } } },
 //!   "terms": { "OnDemand": { "<sku>": { "<sku>.<offerTermCode>": { "priceDimensions": { ... } } } } }
 //! }
@@ -19,6 +22,10 @@ use crate::error::PricingError;
 pub struct BulkPricingFile {
     #[serde(rename = "offerCode")]
     pub offer_code: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(rename = "publicationDate", default)]
+    pub publication_date: Option<String>,
     pub products: HashMap<String, BulkProduct>,
     pub terms: BulkTerms,
 }
@@ -103,12 +110,33 @@ pub struct PricingDimension {
     pub end_range: Option<f64>,
 }
 
+/// Top-level metadata extracted from a Bulk Pricing JSON file.
+#[derive(Debug, Clone)]
+pub struct BulkFileMeta {
+    pub offer_code: String,
+    pub publication_date: Option<String>,
+    pub version: Option<String>,
+    /// The currency key detected from `pricePerUnit` (e.g. `"USD"`).
+    /// Defaults to `"USD"` when no currency key is found.
+    pub currency: String,
+}
+
 /// Parse a Bulk Pricing JSON file and extract simplified pricing entries.
 pub fn parse_bulk_pricing(json_data: &[u8]) -> Result<Vec<PricingEntry>, PricingError> {
+    let (entries, _meta) = parse_bulk_pricing_full(json_data)?;
+    Ok(entries)
+}
+
+/// Parse a Bulk Pricing JSON file and return both pricing entries and
+/// top-level file metadata.
+pub fn parse_bulk_pricing_full(
+    json_data: &[u8],
+) -> Result<(Vec<PricingEntry>, BulkFileMeta), PricingError> {
     let file: BulkPricingFile =
         serde_json::from_slice(json_data).map_err(|e| PricingError::ParseError(e.to_string()))?;
 
     let mut entries = Vec::new();
+    let mut detected_currency: Option<String> = None;
 
     for (sku, product) in &file.products {
         let term_map = file.terms.on_demand.get(sku);
@@ -117,6 +145,11 @@ pub fn parse_bulk_pricing(json_data: &[u8]) -> Result<Vec<PricingEntry>, Pricing
         if let Some(offers) = term_map {
             for offer in offers.values() {
                 for dim in offer.price_dimensions.values() {
+                    // Capture the first currency key we see across all dimensions.
+                    if detected_currency.is_none() {
+                        detected_currency = dim.price_per_unit.keys().next().cloned();
+                    }
+
                     let begin: f64 = dim.begin_range.parse().unwrap_or_else(|e| {
                         tracing::warn!(
                             description = %dim.description,
@@ -151,7 +184,14 @@ pub fn parse_bulk_pricing(json_data: &[u8]) -> Result<Vec<PricingEntry>, Pricing
         });
     }
 
-    Ok(entries)
+    let meta = BulkFileMeta {
+        offer_code: file.offer_code,
+        publication_date: file.publication_date,
+        version: file.version,
+        currency: detected_currency.unwrap_or_else(|| "USD".to_string()),
+    };
+
+    Ok((entries, meta))
 }
 
 /// Lookup helper: find pricing entries matching attribute filters.

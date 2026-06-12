@@ -85,3 +85,110 @@ fn file_registry_maps_rds_engine_aliases_to_bulk_api_database_engine_names() {
     assert_close(aurora_postgresql.hourly_price, 0.444);
     assert_close(aurora_postgresql.storage_price_per_gb, 0.138);
 }
+
+/// Metadata is populated from top-level fields in the Bulk API JSON.
+/// The fixture lambda.json now carries `publicationDate` and `version`.
+#[test]
+fn metadata_returns_publication_date_and_version_from_fixture() {
+    let registry = FilePricingRegistry::load("ap-northeast-1", fixture_dir());
+
+    let meta = registry
+        .metadata("lambda")
+        .expect("lambda metadata should be present");
+    assert_eq!(meta.service_key, "lambda");
+    assert_eq!(
+        meta.publication_date.as_deref(),
+        Some("2023-10-15T00:00:00Z"),
+        "publication_date must match the fixture value"
+    );
+    assert_eq!(
+        meta.version.as_deref(),
+        Some("20231015"),
+        "version must match the fixture value"
+    );
+    assert_eq!(meta.region, "ap-northeast-1");
+    assert_eq!(meta.currency, "USD");
+}
+
+/// all_metadata returns one entry per successfully loaded service file.
+#[test]
+fn all_metadata_returns_one_entry_per_loaded_service() {
+    let registry = FilePricingRegistry::load("ap-northeast-1", fixture_dir());
+    // Fixture dir only has lambda.json and rds.json.
+    let all = registry.all_metadata();
+    assert_eq!(all.len(), 2, "expected exactly two loaded services");
+
+    let keys: Vec<&str> = {
+        let mut v: Vec<&str> = all.iter().map(|m| m.service_key.as_str()).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(keys, ["lambda", "rds"]);
+}
+
+/// metadata returns None for a service whose file was not loaded.
+#[test]
+fn metadata_returns_none_for_missing_service() {
+    let registry = FilePricingRegistry::load("ap-northeast-1", fixture_dir());
+    assert!(
+        registry.metadata("ec2").is_none(),
+        "ec2 has no fixture file; metadata must be None"
+    );
+}
+
+/// A Bulk API JSON without publicationDate/version must still parse successfully,
+/// with those fields returning None in the metadata.
+#[test]
+fn metadata_fields_are_none_for_json_without_top_level_fields() {
+    let dir = {
+        let d = std::env::temp_dir().join(format!("yevice_meta_test_{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("create temp dir");
+        d
+    };
+    // Minimal JSON: no publicationDate, no version.
+    let minimal = r#"{
+        "offerCode": "AWSLambda",
+        "products": {
+            "SKU1": {
+                "sku": "SKU1",
+                "productFamily": "Serverless",
+                "attributes": {"group": "AWS-Lambda-Requests"}
+            }
+        },
+        "terms": {
+            "OnDemand": {
+                "SKU1": {
+                    "SKU1.TERM": {
+                        "sku": "SKU1",
+                        "priceDimensions": {
+                            "SKU1.DIM": {
+                                "description": "per req",
+                                "beginRange": "0",
+                                "endRange": "Inf",
+                                "unit": "Requests",
+                                "pricePerUnit": {"USD": "0.0000002"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }"#;
+    std::fs::write(dir.join("lambda.json"), minimal).unwrap();
+
+    let registry = FilePricingRegistry::load("us-east-1", &dir);
+    let meta = registry
+        .metadata("lambda")
+        .expect("lambda metadata should be present even without top-level fields");
+    assert!(
+        meta.publication_date.is_none(),
+        "publication_date must be None when absent from JSON"
+    );
+    assert!(
+        meta.version.is_none(),
+        "version must be None when absent from JSON"
+    );
+    assert_eq!(meta.currency, "USD");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

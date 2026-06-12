@@ -1,5 +1,7 @@
 {
   "offerCode": "AWSLambda",
+  "version": "20231015",
+  "publicationDate": "2023-10-15T00:00:00Z",
   "products": {
     "LAMBDA-REQUESTS": {
       "sku": "LAMBDA-REQUESTS",
