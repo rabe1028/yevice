@@ -15,6 +15,7 @@ use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
 use yevice_core::resource::{Architecture, Provider};
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
+use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
 use yevice_core::types::VariableName;
 use yevice_service_api::{
     CfnAdapterRegistry, MultiProviderCatalog, ProviderPlugin, Registration, ServiceCatalog,
@@ -915,90 +916,17 @@ fn load_quotas(path: &str) -> Result<Quotas> {
 
 /// Simulate cost over time with varying load patterns.
 ///
-/// Load profile format:
-/// ```yaml
-/// base_params:
-///   IngestFunction_avg_duration_ms: 200
-///   ...
-/// hourly_pattern:
-///   - hour: 0
-///     multiplier: 0.1
-///   - hour: 9
-///     multiplier: 1.0
-///   - hour: 12
-///     multiplier: 0.8
-///   - hour: 18
-///     multiplier: 1.5  # peak
-///   - hour: 22
-///     multiplier: 0.3
-/// scaled_variables:
-///   - DataStream_put_records
-///   - IngestFunction_requests
-/// days_per_month: 30
-/// ```
+/// Reads the load profile and cost models from disk, delegates the actual
+/// simulation to [`yevice_core::simulate`], and renders the result tables.
 pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool) -> Result<()> {
-    let profile = load_simulation_profile(profile_path)?;
+    let content = std::fs::read_to_string(profile_path)
+        .with_context(|| format!("failed to read: {profile_path}"))?;
+    let profile = SimulationProfile::from_yaml_str(&content)?;
 
-    // (arch_name, total_monthly, hourly_costs, base_resource_costs)
-    // base_resource_costs: Vec<(label, monthly_cost)> evaluated at base_params (for breakdown)
-    let mut arch_results: Vec<crate::render::SimulationArchResult> = Vec::new();
-
+    let mut arch_results: Vec<ArchSimulation> = Vec::new();
     for path in cost_model_paths {
         let arch = load_cost_model(path)?;
-        let arch_name = arch.name.to_string();
-        let mut total_monthly = 0.0;
-        let mut hourly_costs = Vec::new();
-
-        // Evaluate at base_params once for the resource breakdown display.
-        let base_resource_costs = if breakdown {
-            let result = evaluate_architecture(&arch, &profile.base_params).with_context(|| {
-                format!("failed to evaluate base cost for architecture '{arch_name}'")
-            })?;
-            result
-                .resources
-                .into_iter()
-                .map(|r| (r.label, r.monthly_cost))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        for hour in 0..24 {
-            let multiplier = profile.multiplier_at(hour);
-            let mut params = profile.base_params.clone();
-
-            // Scale designated variables by the hourly multiplier
-            for var_name in &profile.scaled_variables {
-                if let Some(base_val) = params.get(var_name).copied() {
-                    // Convert monthly value to hourly, apply multiplier
-                    let hourly_val = base_val / (24.0 * profile.days_per_month) * multiplier;
-                    params.insert(var_name.clone(), hourly_val);
-                }
-            }
-
-            // Evaluate cost for this hour's load (as monthly equivalent at this rate)
-            match evaluate_architecture(&arch, &params) {
-                Ok(result) => {
-                    // Scale hourly slice: this hour's rate * hours_in_month_at_this_hour
-                    let hours_at_rate = profile.days_per_month;
-                    let hour_cost =
-                        result.total_monthly_cost * hours_at_rate / (24.0 * profile.days_per_month);
-                    total_monthly += hour_cost;
-                    hourly_costs.push((hour, result.total_monthly_cost));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "failed to evaluate '{arch_name}' at hour {hour} in simulation \
-                             (check that the load profile's base_params provides every variable \
-                             the cost model references)"
-                        )
-                    });
-                }
-            }
-        }
-
-        arch_results.push((arch_name, total_monthly, hourly_costs, base_resource_costs));
+        arch_results.push(simulate_architecture(&arch, &profile, breakdown)?);
     }
 
     // Print hourly breakdown table
@@ -1010,20 +938,20 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
     // Winner
     if arch_results.len() == 2 {
-        let diff = arch_results[1].1 - arch_results[0].1;
+        let diff = arch_results[1].total_monthly_cost - arch_results[0].total_monthly_cost;
         if diff > 0.0 {
             println!(
                 "\n{} is ${:.2}/month cheaper than {}",
-                arch_results[0].0,
+                arch_results[0].name,
                 diff.abs(),
-                arch_results[1].0
+                arch_results[1].name
             );
         } else {
             println!(
                 "\n{} is ${:.2}/month cheaper than {}",
-                arch_results[1].0,
+                arch_results[1].name,
                 diff.abs(),
-                arch_results[0].0
+                arch_results[0].name
             );
         }
     }
@@ -1032,8 +960,8 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
     if breakdown {
         // Collect all unique resource labels across all architectures.
         let mut all_labels: Vec<String> = Vec::new();
-        for (_, _, _, res_costs) in &arch_results {
-            for (label, _) in res_costs {
+        for sim in &arch_results {
+            for (label, _) in &sim.base_resource_costs {
                 if !all_labels.contains(label) {
                     all_labels.push(label.clone());
                 }
@@ -1050,116 +978,6 @@ pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool
 
     Ok(())
 }
-
-#[derive(Debug)]
-struct SimulationProfile {
-    base_params: Params,
-    hourly_pattern: Vec<(u32, f64)>,
-    scaled_variables: Vec<VariableName>,
-    days_per_month: f64,
-}
-
-impl SimulationProfile {
-    fn multiplier_at(&self, hour: u32) -> f64 {
-        // Find the last defined multiplier at or before this hour
-        let mut result = self.hourly_pattern.first().map_or(1.0, |(_, m)| *m);
-        for (h, m) in &self.hourly_pattern {
-            if *h <= hour {
-                result = *m;
-            }
-        }
-        result
-    }
-}
-
-fn load_simulation_profile(path: &str) -> Result<SimulationProfile> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-
-    let raw: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&content).context("failed to parse profile")?;
-    let map = raw.as_mapping().context("profile must be a mapping")?;
-
-    // Load base_params
-    let base_params_val = map
-        .get(Value::String("base_params".into()))
-        .context("profile must have base_params")?;
-    let base_map: HashMap<String, serde_yaml_ng::Value> =
-        serde_yaml_ng::from_value(base_params_val.clone())
-            .context("failed to parse base_params")?;
-
-    let mut base_params = Params::default();
-    for (k, v) in base_map {
-        match v {
-            serde_yaml_ng::Value::Mapping(sub_map) => {
-                for (sub_k, sub_v) in sub_map {
-                    let Some(sub_key) = sub_k.as_str() else {
-                        tracing::warn!(key = ?sub_k, "non-string key in profile base_params mapping; skipping");
-                        continue;
-                    };
-                    let val = extract_f64(&sub_v).with_context(|| {
-                        format!("profile base_param '{k}_{sub_key}': invalid value")
-                    })?;
-                    base_params.insert(VariableName::new(format!("{k}_{sub_key}")), val);
-                }
-            }
-            _ => {
-                let val = extract_f64(&v)
-                    .with_context(|| format!("profile base_param '{k}': invalid value"))?;
-                base_params.insert(VariableName::new(k), val);
-            }
-        }
-    }
-
-    // Load hourly_pattern
-    let pattern_val = map
-        .get(Value::String("hourly_pattern".into()))
-        .and_then(|v| v.as_sequence())
-        .context("profile must have hourly_pattern array")?;
-
-    let mut hourly_pattern: Vec<(u32, f64)> = Vec::new();
-    for entry in pattern_val {
-        let entry_map = entry
-            .as_mapping()
-            .context("hourly entry must be a mapping")?;
-        let hour = entry_map
-            .get(Value::String("hour".into()))
-            .and_then(serde_yaml_ng::Value::as_u64)
-            .context("hourly entry must have hour")? as u32;
-        let multiplier = entry_map
-            .get(Value::String("multiplier".into()))
-            .and_then(serde_yaml_ng::Value::as_f64)
-            .context("hourly entry must have multiplier")?;
-        hourly_pattern.push((hour, multiplier));
-    }
-    hourly_pattern.sort_by_key(|(h, _)| *h);
-
-    // Load scaled_variables
-    let scaled = map
-        .get(Value::String("scaled_variables".into()))
-        .and_then(|v| v.as_sequence())
-        .map(|seq| {
-            seq.iter()
-                .filter_map(|v| v.as_str().map(VariableName::new))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Days per month
-    let days = map
-        .get(Value::String("days_per_month".into()))
-        .and_then(serde_yaml_ng::Value::as_f64)
-        .unwrap_or(30.0);
-
-    Ok(SimulationProfile {
-        base_params,
-        hourly_pattern,
-        scaled_variables: scaled,
-        days_per_month: days,
-    })
-}
-
-use serde_yaml_ng::Value;
 
 /// AWS services to download pricing for.
 const PRICING_SERVICES: &[(&str, &str)] = &[

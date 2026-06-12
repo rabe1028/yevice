@@ -1,6 +1,11 @@
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
+use thiserror::Error;
+
+use crate::evaluate::Params;
+use crate::types::VariableName;
+
 /// IaC input file maximum size in bytes (OOM prevention limit).
 pub const MAX_IAC_FILE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 
@@ -28,6 +33,81 @@ pub fn read_to_string_capped(path: &Path) -> io::Result<String> {
         ));
     }
     std::fs::read_to_string(path)
+}
+
+/// A YAML scalar that could not be interpreted as an `f64`.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct YamlNumberError(String);
+
+/// A parameter-style YAML entry whose value is not a valid number.
+#[derive(Debug, Error)]
+#[error("{context} '{name}': invalid value")]
+pub struct ParamValueError {
+    /// What kind of entry failed (e.g. `param`, `profile base_param`).
+    context: &'static str,
+    /// Full (flattened) variable name of the offending entry.
+    name: String,
+    #[source]
+    source: YamlNumberError,
+}
+
+/// Interpret a YAML scalar as an `f64`. Accepts numbers and numeric strings.
+pub(crate) fn extract_f64(v: &serde_yaml_ng::Value) -> Result<f64, YamlNumberError> {
+    match v {
+        serde_yaml_ng::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| YamlNumberError(format!("cannot interpret number {v:?} as f64"))),
+        serde_yaml_ng::Value::String(s) => s
+            .parse::<f64>()
+            .map_err(|_| YamlNumberError(format!("cannot interpret string {v:?} as f64"))),
+        _ => Err(YamlNumberError(format!(
+            "cannot interpret value {v:?} as a number"
+        ))),
+    }
+}
+
+/// Flatten a parsed YAML map of usage parameters into [`Params`].
+///
+/// Supports both flat (`Foo_requests: 100`) and hierarchical
+/// (`Foo: { requests: 100 }`) entries; hierarchical entries are flattened to
+/// `{logical_id}_{short_name}`. `context` labels error messages (e.g. `param`
+/// or `profile base_param`).
+pub(crate) fn params_from_yaml_map(
+    map: std::collections::HashMap<String, serde_yaml_ng::Value>,
+    context: &'static str,
+) -> Result<Params, ParamValueError> {
+    let mut params = Params::default();
+    for (k, v) in map {
+        match v {
+            // Hierarchical: key is logical ID, value is a mapping of short var names
+            serde_yaml_ng::Value::Mapping(sub_map) => {
+                for (sub_k, sub_v) in sub_map {
+                    let Some(sub_key) = sub_k.as_str() else {
+                        tracing::warn!(key = ?sub_k, "non-string key in {context} mapping; skipping");
+                        continue;
+                    };
+                    let full_name = format!("{k}_{sub_key}");
+                    let val = extract_f64(&sub_v).map_err(|source| ParamValueError {
+                        context,
+                        name: full_name.clone(),
+                        source,
+                    })?;
+                    params.insert(VariableName::new(full_name), val);
+                }
+            }
+            // Flat: key is the full variable name
+            _ => {
+                let val = extract_f64(&v).map_err(|source| ParamValueError {
+                    context,
+                    name: k.clone(),
+                    source,
+                })?;
+                params.insert(VariableName::new(k), val);
+            }
+        }
+    }
+    Ok(params)
 }
 
 #[cfg(test)]

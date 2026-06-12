@@ -1678,6 +1678,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "thiserror",
  "tracing",
 ]
