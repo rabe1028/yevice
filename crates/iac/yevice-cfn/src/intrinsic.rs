@@ -394,16 +394,24 @@ fn resolve_select(
 
     let list_resolved = resolve_inner(&seq[1], ctx, depth + 1)?;
 
-    // If the list resolved to a tagged pass-through (e.g. an unresolvable
-    // Fn::Split whose source contains references), we cannot select from it
-    // statically.  Warn and preserve the *original* !Select expression so
-    // downstream consumers see the full unresolved expression (including the
-    // index), not just the inner list argument.
-    if let ResolvedValue::Concrete(Value::Tagged(ref tagged)) = list_resolved {
+    // Helper: detect whether the resolved list is something we cannot iterate
+    // statically (tagged pass-through, resource reference, or interpolated
+    // string that happens to be the list argument).
+    let is_unresolvable_list = matches!(
+        &list_resolved,
+        ResolvedValue::Concrete(Value::Tagged(_))
+            | ResolvedValue::Ref(_)
+            | ResolvedValue::GetAtt { .. }
+            | ResolvedValue::Interpolated(_)
+    );
+
+    if is_unresolvable_list {
+        // We cannot select from an unresolvable list.  Preserve the original
+        // !Select expression so downstream consumers see the full expression
+        // (including the index), not just the list argument.
         tracing::warn!(
             index = index,
-            tag = %tagged.tag,
-            "!Select list resolved to an unresolvable tagged value; passing through as-is"
+            "!Select list is unresolvable; passing through original !Select expression as-is"
         );
         return Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
             serde_yaml_ng::value::TaggedValue {
@@ -614,20 +622,31 @@ fn resolve_split(
                 .collect();
             Ok(ResolvedValue::Seq(parts))
         }
-        ResolvedValue::Interpolated(_)
-        | ResolvedValue::Ref(_)
-        | ResolvedValue::GetAtt { .. }
-        | ResolvedValue::Concrete(Value::Tagged(_)) => {
-            // Source contains unresolved resource references or an unknown
-            // pass-through intrinsic (e.g. !Base64 "a,b").  The exact split
-            // positions cannot be determined statically.  Warn and pass through
-            // the original !Split expression so downstream logic sees the full
-            // unresolved value rather than silently producing incorrect results.
+        ResolvedValue::Interpolated(_) | ResolvedValue::Ref(_) | ResolvedValue::GetAtt { .. } => {
+            // Source contains unresolved resource references; the exact split
+            // positions cannot be determined statically.  Warn and return the
+            // *resolved source value directly* so that its typed references
+            // (Ref / GetAtt / Interpolated parts) remain accessible to the
+            // downstream reference-extraction walks in convert.rs.  Callers
+            // that need a sequence (e.g. resolve_select) already handle
+            // non-sequence pass-throughs with their own guard.
             tracing::warn!(
                 separator = %separator,
                 source = ?source,
-                "Fn::Split source cannot be resolved statically; \
-                 passing through as-is"
+                "Fn::Split source contains unresolved references; \
+                 split positions are indeterminate — passing through source as-is"
+            );
+            Ok(source)
+        }
+        ResolvedValue::Concrete(Value::Tagged(_)) => {
+            // Source resolved to an unknown pass-through intrinsic
+            // (e.g. !Base64 "a,b").  We cannot split statically.
+            // Preserve the original !Split tagged expression so the caller
+            // sees it as an unresolved sequence-like value.
+            tracing::warn!(
+                separator = %separator,
+                source = ?source,
+                "Fn::Split source is an unresolved intrinsic; passing through as-is"
             );
             Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
                 serde_yaml_ng::value::TaggedValue {
@@ -1433,7 +1452,8 @@ mod tests {
     }
 
     /// `Fn::Split` where source is an `Interpolated` value (unresolved ref)
-    /// must pass through as Concrete (not error) and emit a warning.
+    /// must pass through as the source value (not error, not a Seq), and
+    /// the resource references in the source must be preserved.
     #[test]
     fn test_split_interpolated_source_passes_through() {
         let ctx = make_ctx();
@@ -1450,10 +1470,23 @@ mod tests {
             result.is_ok(),
             "Fn::Split on an Interpolated source must not error, got: {result:?}"
         );
-        // Must be a pass-through (Concrete), not a Seq.
+        let resolved = result.unwrap();
+        // Must be a pass-through, not a Seq.
         assert!(
-            !matches!(result.unwrap(), ResolvedValue::Seq(_)),
+            !matches!(resolved, ResolvedValue::Seq(_)),
             "Fn::Split on Interpolated source must not produce a Seq"
+        );
+        // The resource reference inside the Interpolated source must be
+        // preserved so downstream reference-extraction walks still find it.
+        let refs = resolved.references();
+        assert!(
+            !refs.is_empty(),
+            "Fn::Split pass-through must preserve source references; got none"
+        );
+        assert_eq!(
+            refs[0].logical_id, "MyQueue",
+            "expected MyQueue reference, got {:?}",
+            refs
         );
     }
 
