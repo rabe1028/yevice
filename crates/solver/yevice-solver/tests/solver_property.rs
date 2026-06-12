@@ -156,13 +156,11 @@ fn solve_naive(problem: &OptimizationProblem) -> Solution {
 // Generators
 // ---------------------------------------------------------------------------
 
-/// Small pool of variable names — kept intentionally short so that the
-/// generator frequently produces *collisions* (same name used as both a
-/// decision variable and a binding target, or the same target in multiple
-/// bindings).  Collisions are the exact class of bug the property test is
-/// designed to catch.
-const VAR_POOL: &[&str] = &["a", "b", "c", "T1", "T2", "T3"];
-
+/// Generates a variable name from a small pool so collisions arise often.
+///
+/// The pool is small intentionally: frequent collisions (same name as decision
+/// variable and binding target, or same target in multiple bindings) are the
+/// exact class of bug this property suite is designed to catch.
 fn arb_variable_name() -> impl Strategy<Value = VariableName> {
     prop_oneof![
         Just("a"),
