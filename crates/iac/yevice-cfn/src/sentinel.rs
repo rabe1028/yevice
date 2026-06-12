@@ -67,19 +67,37 @@ pub(crate) fn parse(s: &str) -> Option<CfnRef> {
     None
 }
 
-/// Try to parse `s` as a whole-string sentinel; if that fails, search for an
-/// embedded sentinel — but only when `s` does not start with a sentinel prefix.
+/// Returns `true` if `s` is a *concatenation* of two or more sentinels:
+/// starts with a sentinel prefix, and after the first closing `}}` the
+/// remaining text immediately opens another sentinel.
 ///
-/// The prefix guard prevents extracting a partial match from a *concatenation*
-/// of sentinels such as `{{ref:A}}{{ref:B}}`.  For such strings `parse` now
-/// correctly returns `None` (concatenation is not a single reference), but
-/// `find_embedded` would otherwise pick up `A`, producing a spurious edge.
-/// By refusing to call `find_embedded` when the string opens with `{{ref:` or
-/// `{{getatt:`, we preserve the pre-fix semantics (no edge for multi-reference
-/// joins).
+/// ```text
+/// "{{ref:A}}{{ref:B}}"         → true  (concatenation — no single target)
+/// "{{getatt:Fn.Arn}}:live"     → false (sentinel + literal suffix — single target)
+/// "arn:...{{ref:X}}"           → false (literal prefix — single embedded target)
+/// ```
+fn is_sentinel_concatenation(s: &str) -> bool {
+    if !s.starts_with(REF_PREFIX) && !s.starts_with(GETATT_PREFIX) {
+        return false;
+    }
+    // Find the first closing "}}" and inspect what follows.
+    s.find(SUFFIX).is_some_and(|end| {
+        let after = &s[end + SUFFIX.len()..];
+        after.starts_with(REF_PREFIX) || after.starts_with(GETATT_PREFIX)
+    })
+}
+
+/// Try to parse `s` as a whole-string sentinel; if that fails, search for an
+/// embedded sentinel — except when `s` is a *concatenation* of sentinels.
+///
+/// The concatenation guard prevents extracting a partial match from strings
+/// like `{{ref:A}}{{ref:B}}` where neither sub-sentinel is the definitive
+/// target.  A single sentinel with a trailing literal (e.g.
+/// `{{getatt:Fn.Arn}}:live` from `Fn::Sub`) is **not** a concatenation, so
+/// `find_embedded` still runs and recovers the reference correctly.
 pub(crate) fn parse_or_find_embedded(s: &str) -> Option<CfnRef> {
     parse(s).or_else(|| {
-        if s.starts_with(REF_PREFIX) || s.starts_with(GETATT_PREFIX) {
+        if is_sentinel_concatenation(s) {
             None
         } else {
             find_embedded(s)
@@ -279,5 +297,26 @@ mod tests {
         // A concatenation must NOT produce a spurious edge to the first resource.
         assert!(parse_or_find_embedded("{{ref:A}}{{ref:B}}").is_none());
         assert!(parse_or_find_embedded("{{getatt:A.Attr}}{{ref:B}}").is_none());
+    }
+
+    #[test]
+    fn parse_or_find_embedded_sentinel_with_literal_suffix() {
+        // Fn::Sub can produce "{{getatt:Fn.Arn}}:live" — a single sentinel
+        // followed by literal text.  This is NOT a concatenation; the sentinel
+        // reference should still be extracted.
+        let result =
+            parse_or_find_embedded("{{getatt:MyFunction.Arn}}:live").expect("should find ref");
+        assert_eq!(result.logical_id, "MyFunction");
+        assert_eq!(result.attr, Some("Arn".to_string()));
+    }
+
+    #[test]
+    fn is_sentinel_concatenation_distinguishes_correctly() {
+        assert!(is_sentinel_concatenation("{{ref:A}}{{ref:B}}"));
+        assert!(is_sentinel_concatenation("{{getatt:A.Attr}}{{ref:B}}"));
+        assert!(!is_sentinel_concatenation("{{ref:A}}:live"));
+        assert!(!is_sentinel_concatenation("{{getatt:Fn.Arn}}:live"));
+        assert!(!is_sentinel_concatenation("arn:aws:...{{ref:X}}"));
+        assert!(!is_sentinel_concatenation("{{ref:Only}}"));
     }
 }
