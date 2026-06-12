@@ -174,7 +174,10 @@ const EXPECTED_SERVICE_TO_TF: &[(&str, &[&str])] = &[
     ("aws.ecs_fargate", &["aws_ecs_service"]),
     (
         "aws.elasticache",
-        &["aws_elasticache_cluster", "aws_elasticache_replication_group"],
+        &[
+            "aws_elasticache_cluster",
+            "aws_elasticache_replication_group",
+        ],
     ),
     ("aws.eventbridge_scheduler", &["aws_scheduler_schedule"]),
     ("aws.kinesis", &["aws_kinesis_stream"]),
