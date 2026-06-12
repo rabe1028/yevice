@@ -77,7 +77,7 @@ fn extract_f64(v: &serde_yaml_ng::Value) -> Option<f64> {
 
 fn build_architecture_cost(
     name: &str,
-    resources: &BTreeMap<String, yevice_cfn::parser::CfnResource>,
+    resources: &BTreeMap<String, yevice_cfn::parser::ResolvedResource>,
     _pricing: (),
     strict: bool,
 ) -> yevice_core::cost::ArchitectureCost {
