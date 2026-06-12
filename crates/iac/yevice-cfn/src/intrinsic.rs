@@ -1485,8 +1485,7 @@ mod tests {
         );
         assert_eq!(
             refs[0].logical_id, "MyQueue",
-            "expected MyQueue reference, got {:?}",
-            refs
+            "expected MyQueue reference, got {refs:?}"
         );
     }
 
