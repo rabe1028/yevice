@@ -7,7 +7,7 @@ use yevice_core::{
     resource::{Architecture, Connection, ConnectionType, Resource, ResourceShell},
     types::{LogicalId, Region, ResourceType},
 };
-use yevice_service_api::{CfnAdapterRegistry, RawCfnResource};
+use yevice_service_api::{CfnAdapterRegistry, CfnPropertyValue, RawCfnResource};
 
 use crate::parser::{CfnResource, CfnTemplate};
 use crate::sentinel;
@@ -23,9 +23,12 @@ pub fn build_architecture(
         .resources
         .iter()
         .map(|(logical_id, cfn)| {
-            let properties = yaml_to_json(&cfn.properties);
-            let raw =
-                RawCfnResource::new(logical_id.as_str(), cfn.resource_type.as_str(), properties);
+            let properties = yaml_to_cfn_properties(&cfn.properties);
+            let raw = RawCfnResource {
+                logical_id: LogicalId::new(logical_id.as_str()),
+                resource_type: ResourceType::new(cfn.resource_type.as_str()),
+                properties,
+            };
             let shell = match adapters.lookup(&cfn.resource_type) {
                 None => ResourceShell::other(&cfn.resource_type),
                 Some(adapter) => match adapter.convert(&raw) {
@@ -162,7 +165,7 @@ fn extract_function_logical_id(props: &serde_yaml_ng::Mapping) -> Option<String>
     let s = fn_name.as_str()?;
     // Whole-string sentinel first, then embedded (e.g. Fn::Sub ARN like
     // "arn:...:function:{{ref:MyFn}}").
-    if let Some(cfn_ref) = sentinel::parse(s).or_else(|| sentinel::find_embedded(s)) {
+    if let Some(cfn_ref) = sentinel::parse_or_find_embedded(s) {
         return Some(cfn_ref.logical_id);
     }
     Some(s.to_string())
@@ -177,7 +180,7 @@ fn extract_source_logical_id(
     if let Some(s) = source_arn.as_str() {
         // Resolved sentinel: "{{ref:X}}" or "{{getatt:X.Attr}}"
         // Also handles embedded sentinels from Fn::Sub ARNs.
-        if let Some(cfn_ref) = sentinel::parse(s).or_else(|| sentinel::find_embedded(s)) {
+        if let Some(cfn_ref) = sentinel::parse_or_find_embedded(s) {
             let source_type = detect_source_type(&cfn_ref.logical_id, resources)?;
             return Some((cfn_ref.logical_id, source_type));
         }
@@ -225,9 +228,7 @@ fn arn_last_segment(arn: &str) -> String {
 /// - Embedded sentinels (e.g. `Fn::Sub` ARNs after resolution):
 ///   `"arn:...:function:{{ref:X}}"` → `Some("X")` (first embedded sentinel wins)
 fn extract_logical_id_from_sentinel(s: &str) -> Option<String> {
-    sentinel::parse(s)
-        .or_else(|| sentinel::find_embedded(s))
-        .map(|r| r.logical_id)
+    sentinel::parse_or_find_embedded(s).map(|r| r.logical_id)
 }
 
 /// Determine the containment parent for a CFn resource.
@@ -683,9 +684,48 @@ fn get_yaml_number(value: &YamlValue, key: &str) -> Option<f64> {
         })
 }
 
+/// Convert a `serde_yaml_ng::Value` properties block to a
+/// `BTreeMap<String, CfnPropertyValue>`.
+///
+/// Each top-level entry is converted: if the JSON representation is a
+/// whole-string sentinel (`"{{ref:X}}"` or `"{{getatt:X.Y}}"`), it becomes a
+/// typed `ResourceRef` or `ResourceGetAtt` variant.  All other values become
+/// `Concrete`.
+fn yaml_to_cfn_properties(value: &YamlValue) -> BTreeMap<String, CfnPropertyValue> {
+    let json = yaml_to_json(value);
+    if let serde_json::Value::Object(map) = json {
+        map.into_iter()
+            .map(|(k, v)| (k, json_value_to_cfn_property(v)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// Convert a top-level property `serde_json::Value` to a `CfnPropertyValue`.
+///
+/// If the value is a whole-string sentinel produced by the intrinsic resolver,
+/// it becomes `ResourceRef` or `ResourceGetAtt`.  Everything else is `Concrete`.
+fn json_value_to_cfn_property(value: serde_json::Value) -> CfnPropertyValue {
+    if let serde_json::Value::String(ref s) = value
+        && let Some(cfn_ref) = sentinel::parse(s)
+    {
+        return if let Some(attr) = cfn_ref.attr {
+            CfnPropertyValue::ResourceGetAtt {
+                logical_id: cfn_ref.logical_id,
+                attr,
+            }
+        } else {
+            CfnPropertyValue::ResourceRef(cfn_ref.logical_id)
+        };
+    }
+    CfnPropertyValue::Concrete(value)
+}
+
 /// Convert a `serde_yaml_ng::Value` to a `serde_json::Value`.
 ///
-/// This is needed because `RawCfnResource.properties` expects `serde_json::Value`.
+/// Used internally by [`yaml_to_cfn_properties`] and by connection extraction
+/// helpers that operate on nested YAML structures.
 fn yaml_to_json(value: &YamlValue) -> serde_json::Value {
     match value {
         YamlValue::Null => serde_json::Value::Null,
@@ -1575,6 +1615,74 @@ mod determinism_tests {
             names1,
             vec!["AlphaFn", "MidTable", "ZooLogs"],
             "resource order must be sorted by logical_id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CfnPropertyValue conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ref_sentinel_becomes_resource_ref() {
+        let val = serde_json::Value::String("{{ref:MyBucket}}".to_string());
+        let result = json_value_to_cfn_property(val);
+        assert!(
+            matches!(result, CfnPropertyValue::ResourceRef(ref id) if id == "MyBucket"),
+            "expected ResourceRef(MyBucket), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn getatt_sentinel_becomes_resource_get_att() {
+        let val = serde_json::Value::String("{{getatt:MyFunction.Arn}}".to_string());
+        let result = json_value_to_cfn_property(val);
+        assert!(
+            matches!(
+                result,
+                CfnPropertyValue::ResourceGetAtt { ref logical_id, ref attr }
+                    if logical_id == "MyFunction" && attr == "Arn"
+            ),
+            "expected ResourceGetAtt{{ MyFunction, Arn }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn concrete_string_stays_concrete() {
+        let val = serde_json::Value::String("us-east-1".to_string());
+        let result = json_value_to_cfn_property(val.clone());
+        assert!(
+            matches!(result, CfnPropertyValue::Concrete(ref v) if v == &val),
+            "expected Concrete(string), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_to_cfn_properties_mixed() {
+        let mut map = serde_yaml_ng::Mapping::new();
+        for (k, v) in [
+            ("Region", "us-east-1"),
+            ("FunctionArn", "{{getatt:MyFunction.Arn}}"),
+            ("TableName", "{{ref:MyTable}}"),
+        ] {
+            map.insert(
+                YamlValue::String(k.to_string()),
+                YamlValue::String(v.to_string()),
+            );
+        }
+        let yaml = YamlValue::Mapping(map);
+        let props = yaml_to_cfn_properties(&yaml);
+
+        assert!(
+            matches!(props["Region"], CfnPropertyValue::Concrete(_)),
+            "Region should be Concrete"
+        );
+        assert!(
+            matches!(props["FunctionArn"], CfnPropertyValue::ResourceGetAtt { ref logical_id, ref attr } if logical_id == "MyFunction" && attr == "Arn"),
+            "FunctionArn should be ResourceGetAtt"
+        );
+        assert!(
+            matches!(props["TableName"], CfnPropertyValue::ResourceRef(ref id) if id == "MyTable"),
+            "TableName should be ResourceRef"
         );
     }
 }
