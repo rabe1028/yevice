@@ -1,82 +1,30 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
 use yevice_solver::{EnumerationSolver, Solver, SolverError};
 
-use yevice_cfn::convert as cfn_convert;
-use yevice_cfn::parser;
 use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
-use yevice_core::resource::{Architecture, Provider};
+use yevice_core::resource::Provider;
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
 use yevice_core::types::VariableName;
+use yevice_engine::{CfnInputs, EngineError, GenerateRequest};
 use yevice_pricing::download as pricing_download;
-use yevice_service_api::{
-    CfnAdapterRegistry, MultiProviderCatalog, ProviderPlugin, Registration, ServiceCatalog,
-    TfAdapterRegistry,
-};
+use yevice_service_api::ProviderPlugin;
 use yevice_services_aws::AwsPlugin;
 use yevice_services_gcp::GcpPlugin;
 use yevice_wrangler::CloudflarePlugin;
 
-const DEFAULT_ARCHITECTURE_NAME: &str = "default";
+pub use yevice_engine::InputFormat;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputFormat {
-    Cfn,
-    Tf,
-    Wrangler,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TfProvider {
-    Aws,
-    Gcp,
-    Mixed,
-    Unknown,
-}
-
-struct ParsedInput {
-    architecture: Architecture,
-}
-
-fn resolve_cfn_template(
-    template_path: &str,
-    parameters_path: Option<&str>,
-    imports_path: Option<&str>,
-) -> Result<yevice_cfn::parser::ResolvedTemplate> {
-    let template = parser::parse_template(Path::new(template_path))
-        .context("failed to parse CloudFormation template")?;
-
-    let param_values = match parameters_path {
-        Some(p) => load_string_map(p).context("failed to load parameters file")?,
-        None => HashMap::new(),
-    };
-
-    let import_values = match imports_path {
-        Some(p) => load_string_map(p).context("failed to load imports file")?,
-        None => HashMap::new(),
-    };
-
-    let resolved = parser::resolve_template(&template, &param_values, &import_values)
-        .context("failed to resolve template")?;
-
-    Ok(yevice_cfn::parser::CfnTemplate {
-        parameters: template.parameters,
-        mappings: template.mappings,
-        conditions: template.conditions,
-        resources: resolved,
-    })
-}
-
-/// Returns the list of all provider plugins. Both `build_registries` and
-/// `build_pricing_resolver` iterate over this single source of truth.
+/// Returns the list of all provider plugins injected into the engine.
+/// This is the single place where the CLI decides which providers exist.
 fn provider_plugins() -> Vec<Box<dyn ProviderPlugin>> {
     vec![
         Box::new(AwsPlugin),
@@ -85,19 +33,17 @@ fn provider_plugins() -> Vec<Box<dyn ProviderPlugin>> {
     ]
 }
 
-fn build_registries() -> (ServiceCatalog, CfnAdapterRegistry, TfAdapterRegistry) {
-    let mut catalog = ServiceCatalog::new();
-    let mut cfn_adapters = CfnAdapterRegistry::new();
-    let mut tf_adapters = TfAdapterRegistry::new();
-    for plugin in provider_plugins() {
-        let mut reg = Registration {
-            catalog: &mut catalog,
-            cfn_adapters: &mut cfn_adapters,
-            tf_adapters: &mut tf_adapters,
-        };
-        plugin.register(&mut reg);
-    }
-    (catalog, cfn_adapters, tf_adapters)
+/// Resolve the input format, adding the CLI flag hint to detection failures.
+fn resolve_input_format(
+    template_path: &str,
+    requested: Option<InputFormat>,
+) -> Result<InputFormat> {
+    yevice_engine::resolve_input_format(Path::new(template_path), requested).map_err(|e| match e {
+        EngineError::UnknownInputFormat { .. } => {
+            anyhow::anyhow!("{e}. Pass --input-format <cfn|tf|wrangler>.")
+        }
+        other => other.into(),
+    })
 }
 
 pub fn generate(
@@ -116,26 +62,18 @@ pub fn generate(
     let format = resolve_input_format(template_path, input_format)?;
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
-    let (catalog, cfn_adapters, tf_adapters) = build_registries();
-    let parsed_input = build_architecture_from_input(
+    let cfn_inputs = load_cfn_inputs(parameters_path, imports_path)?;
+    let request = GenerateRequest {
         format,
-        template_path,
-        parameters_path,
-        imports_path,
-        Some(name),
-        region,
-        &cfn_adapters,
-        &tf_adapters,
-    )?;
-    let pricing = build_pricing_resolver(
-        &parsed_input.architecture,
+        template_path: Path::new(template_path),
+        cfn_inputs,
+        name,
         region,
         provider_regions,
+        strict,
         list_price,
-    );
-    let mut cost_model = catalog
-        .build_cost_model(&parsed_input.architecture, &pricing, strict)
-        .context("failed to build cost model")?;
+    };
+    let mut cost_model = yevice_engine::generate_cost_model(&provider_plugins(), &request)?;
 
     if format == InputFormat::Cfn
         && let Some(path) = bindings_path
@@ -346,18 +284,17 @@ pub fn validate(
     let format = resolve_input_format(template_path, input_format)?;
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
-    let (catalog, cfn_adapters, tf_adapters) = build_registries();
-    let parsed_input = build_architecture_from_input(
+    let registries = yevice_engine::build_registries(&provider_plugins());
+    let cfn_inputs = load_cfn_inputs(parameters_path, imports_path)?;
+    let architecture = yevice_engine::build_architecture_from_input(
         format,
-        template_path,
-        parameters_path,
-        imports_path,
+        Path::new(template_path),
+        &cfn_inputs,
         (format != InputFormat::Wrangler).then_some("validate"),
         region,
-        &cfn_adapters,
-        &tf_adapters,
+        &registries,
     )?;
-    let architecture = parsed_input.architecture;
+    let catalog = registries.catalog;
 
     let quotas = match quotas_path {
         Some(p) => load_quotas(p).context("failed to load quotas file")?,
@@ -567,72 +504,6 @@ pub fn optimize(
     Ok(())
 }
 
-fn resolve_input_format(
-    template_path: &str,
-    requested: Option<InputFormat>,
-) -> Result<InputFormat> {
-    match requested {
-        Some(format) => Ok(format),
-        None => detect_input_format(Path::new(template_path)),
-    }
-}
-
-fn detect_input_format(path: &Path) -> Result<InputFormat> {
-    if path.is_dir() {
-        if directory_contains_tf_files(path)? {
-            return Ok(InputFormat::Tf);
-        }
-        if find_wrangler_config(path).is_some() {
-            return Ok(InputFormat::Wrangler);
-        }
-    }
-
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_ascii_lowercase);
-
-    match (extension.as_deref(), file_name.as_deref()) {
-        (Some("yaml" | "yml" | "json"), _) => Ok(InputFormat::Cfn),
-        (Some("tf" | "tfvars"), _) => Ok(InputFormat::Tf),
-        (Some("toml"), _) | (_, Some("wrangler.toml" | "wrangler.jsonc")) => {
-            Ok(InputFormat::Wrangler)
-        }
-        _ => bail!(
-            "could not detect input format for {}. Pass --input-format <cfn|tf|wrangler>.",
-            path.display()
-        ),
-    }
-}
-
-fn directory_contains_tf_files(path: &Path) -> Result<bool> {
-    if !path.is_dir() {
-        return Ok(false);
-    }
-
-    for entry in std::fs::read_dir(path)
-        .with_context(|| format!("failed to read directory: {}", path.display()))?
-    {
-        let entry = entry?;
-        if entry.path().extension().is_some_and(|ext| ext == "tf") {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn find_wrangler_config(path: &Path) -> Option<PathBuf> {
-    ["wrangler.toml", "wrangler.jsonc"]
-        .into_iter()
-        .map(|name| path.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
 fn reject_cfn_only_options(
     format: InputFormat,
     parameters_path: Option<&str>,
@@ -664,159 +535,6 @@ fn reject_cfn_only_options(
     )
 }
 
-fn build_architecture_from_input(
-    format: InputFormat,
-    template_path: &str,
-    parameters_path: Option<&str>,
-    imports_path: Option<&str>,
-    architecture_name: Option<&str>,
-    region: &str,
-    cfn_adapters: &CfnAdapterRegistry,
-    tf_adapters: &TfAdapterRegistry,
-) -> Result<ParsedInput> {
-    match format {
-        InputFormat::Cfn => {
-            let resolved_template =
-                resolve_cfn_template(template_path, parameters_path, imports_path)?;
-            let architecture = cfn_convert::build_architecture(
-                architecture_name.unwrap_or(DEFAULT_ARCHITECTURE_NAME),
-                region,
-                &resolved_template,
-                cfn_adapters,
-            );
-            Ok(ParsedInput { architecture })
-        }
-        InputFormat::Tf => {
-            let resolved = resolve_tf_input(Path::new(template_path))?;
-            let tf_provider = detect_tf_provider(&resolved);
-            if tf_provider == TfProvider::Unknown {
-                bail!(
-                    "unable to detect a supported Terraform provider from {template_path}. Expected resources with aws_ or google_ prefixes."
-                );
-            }
-
-            let architecture = yevice_tf::build_architecture(
-                architecture_name.unwrap_or(DEFAULT_ARCHITECTURE_NAME),
-                region,
-                &resolved,
-                tf_adapters,
-            );
-            Ok(ParsedInput { architecture })
-        }
-        InputFormat::Wrangler => {
-            let wrangler_path = resolve_wrangler_input_path(Path::new(template_path))?;
-            let mut architecture =
-                yevice_wrangler::parse_wrangler(&wrangler_path).with_context(|| {
-                    format!(
-                        "failed to parse Wrangler config: {}",
-                        wrangler_path.display()
-                    )
-                })?;
-
-            if let Some(name_override) =
-                architecture_name.filter(|name| *name != DEFAULT_ARCHITECTURE_NAME)
-            {
-                architecture.name = name_override.to_string();
-            }
-
-            Ok(ParsedInput { architecture })
-        }
-    }
-}
-
-fn resolve_tf_input(path: &Path) -> Result<yevice_tf::ResolvedConfig> {
-    let config_dir = terraform_config_dir(path)?;
-    let config = yevice_tf::parse_tf_dir(config_dir)
-        .with_context(|| format!("failed to parse Terraform config: {}", config_dir.display()))?;
-
-    // Variable files in Terraform precedence (lowest first; later wins):
-    //   1. `terraform.tfvars`
-    //   2. `*.auto.tfvars` (alphabetical)
-    //   3. an explicit `*.tfvars` passed as the input path
-    // (HCL `.tfvars` only; the JSON variants are not parsed here.)
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    let default_tfvars = config_dir.join("terraform.tfvars");
-    if default_tfvars.is_file() {
-        candidates.push(default_tfvars);
-    }
-    if let Ok(entries) = std::fs::read_dir(config_dir) {
-        let mut autos: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".auto.tfvars"))
-            })
-            .collect();
-        autos.sort();
-        candidates.extend(autos);
-    }
-    let path_is_tfvars = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("tfvars"));
-    if path_is_tfvars && path.is_file() && !candidates.iter().any(|c| c == path) {
-        candidates.push(path.to_path_buf());
-    }
-
-    let mut merged = HashMap::new();
-    for file in &candidates {
-        let vars = yevice_tf::parse_tfvars(file)
-            .with_context(|| format!("failed to parse Terraform variables: {}", file.display()))?;
-        merged.extend(vars);
-    }
-    let tfvars = if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    };
-
-    yevice_tf::resolve_config(config, tfvars).context("failed to resolve Terraform configuration")
-}
-
-fn terraform_config_dir(path: &Path) -> Result<&Path> {
-    if path.is_dir() {
-        return Ok(path);
-    }
-
-    path.parent()
-        .context("failed to determine Terraform configuration directory")
-}
-
-fn resolve_wrangler_input_path(path: &Path) -> Result<PathBuf> {
-    if path.is_dir() {
-        return find_wrangler_config(path).with_context(|| {
-            format!(
-                "failed to locate wrangler.toml or wrangler.jsonc in {}",
-                path.display()
-            )
-        });
-    }
-
-    Ok(path.to_path_buf())
-}
-
-fn detect_tf_provider(resolved: &yevice_tf::ResolvedConfig) -> TfProvider {
-    let mut has_aws = false;
-    let mut has_gcp = false;
-
-    for resource in &resolved.resources {
-        if resource.resource_type.starts_with("aws_") {
-            has_aws = true;
-        } else if resource.resource_type.starts_with("google_") {
-            has_gcp = true;
-        }
-    }
-
-    match (has_aws, has_gcp) {
-        (true, true) => TfProvider::Mixed,
-        (true, false) => TfProvider::Aws,
-        (false, true) => TfProvider::Gcp,
-        (false, false) => TfProvider::Unknown,
-    }
-}
-
 /// Parse a `PROVIDER=REGION` string into a `(Provider, String)` pair.
 ///
 /// The provider name must be one of `aws`, `gcp`, or `cloudflare`.
@@ -842,59 +560,14 @@ fn provider_from_str(s: &str) -> Result<Provider> {
     }
 }
 
-/// Build a per-provider pricing resolver from the providers present in `arch`.
+/// Load custom quotas from a YAML file.
 ///
-/// Iterates over all registered provider plugins and, for each provider that
-/// appears in the architecture, inserts the plugin's pricing catalog into the
-/// resolver. The `Provider::Other` variant has no corresponding plugin and is
-/// handled separately with a [`yevice_pricing::NoopCatalog`].
-///
-/// `provider_regions` allows overriding the region used for a specific
-/// provider's pricing catalog. Providers not present in the map fall back to
-/// `default_region`, preserving full backward compatibility.
-fn build_pricing_resolver(
-    arch: &Architecture,
-    default_region: &str,
-    provider_regions: &HashMap<Provider, String>,
-    list_price: bool,
-) -> MultiProviderCatalog {
-    let mut resolver = MultiProviderCatalog::new();
-
-    for plugin in provider_plugins() {
-        if arch.has_provider(plugin.provider()) {
-            let region = provider_regions
-                .get(&plugin.provider())
-                .map_or(default_region, String::as_str);
-            resolver.insert(
-                plugin.provider(),
-                plugin.pricing_catalog(region, list_price),
-            );
-        }
-    }
-
-    // Provider::Other has no dedicated plugin; use a no-op catalog.
-    if arch.has_provider(Provider::Other) {
-        resolver.insert(Provider::Other, Box::new(yevice_pricing::NoopCatalog));
-    }
-
-    resolver
-}
-
+/// File I/O happens here; parsing and key validation are delegated to
+/// [`yevice_core::io::parse_quotas`].
 fn load_quotas(path: &str) -> Result<Quotas> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-    let quotas: Quotas =
-        serde_yaml_ng::from_str(&content).context("failed to parse quotas file")?;
-    let legacy: Vec<&str> = quotas.keys().filter(|k| !k.contains('.')).collect();
-    if !legacy.is_empty() {
-        bail!(
-            "quota file '{path}' uses non-namespaced keys ({}); quota files now use \
-             provider-namespaced keys such as 'aws.lambda.concurrent_executions'. \
-             Please migrate these keys.",
-            legacy.join(", ")
-        );
-    }
-    Ok(quotas)
+    yevice_core::io::parse_quotas(&content).with_context(|| format!("invalid quota file: {path}"))
 }
 
 /// Simulate cost over time with varying load patterns.
@@ -1031,9 +704,7 @@ pub fn diagram(cost_model_path: &str, format: &str, output: Option<&str>) -> Res
 fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read cost model: {path}"))?;
-    let arch: ArchitectureCost =
-        serde_json::from_str(&content).context("failed to parse cost model JSON")?;
-    Ok(arch)
+    Ok(yevice_core::io::parse_cost_model(&content)?)
 }
 
 /// Load usage parameters from a YAML file.
@@ -1056,34 +727,41 @@ fn load_bindings(path: &str) -> Result<Vec<yevice_core::cost::VariableBinding>> 
     Ok(yevice_core::io::parse_bindings(&content)?)
 }
 
+/// Load CloudFormation parameter and import value files into [`CfnInputs`].
+///
+/// Both paths are optional; missing files yield empty maps (Terraform and
+/// Wrangler inputs never supply them).
+fn load_cfn_inputs(parameters_path: Option<&str>, imports_path: Option<&str>) -> Result<CfnInputs> {
+    let parameters = match parameters_path {
+        Some(p) => load_string_map(p).context("failed to load parameters file")?,
+        None => HashMap::new(),
+    };
+    let imports = match imports_path {
+        Some(p) => load_string_map(p).context("failed to load imports file")?,
+        None => HashMap::new(),
+    };
+    Ok(CfnInputs {
+        parameters,
+        imports,
+    })
+}
+
+/// Load a flat `name: scalar` YAML map (CFN parameters/imports) from a file.
+///
+/// File I/O happens here; parsing is delegated to
+/// [`yevice_core::io::parse_string_map`].
 fn load_string_map(path: &str) -> Result<HashMap<String, String>> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-
-    let map: HashMap<String, serde_yaml_ng::Value> =
-        serde_yaml_ng::from_str(&content).context("failed to parse file")?;
-
-    let mut result = HashMap::new();
-    for (k, v) in map {
-        let val = match v {
-            serde_yaml_ng::Value::String(s) => s,
-            serde_yaml_ng::Value::Number(n) => n.to_string(),
-            serde_yaml_ng::Value::Bool(b) => b.to_string(),
-            _ => continue,
-        };
-        result.insert(k, val);
-    }
-
-    Ok(result)
+    Ok(yevice_core::io::parse_string_map(&content)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    use yevice_tf::parser::TfResource;
 
     fn temp_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1093,97 +771,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yevice-cli-{label}-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn tf_resource(resource_type: &str) -> TfResource {
-        TfResource {
-            resource_type: resource_type.to_string(),
-            name: "sample".to_string(),
-            attrs: HashMap::new(),
-            blocks: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn detects_input_formats_from_paths() {
-        assert_eq!(
-            detect_input_format(Path::new("template.yaml")).unwrap(),
-            InputFormat::Cfn
-        );
-        assert_eq!(
-            detect_input_format(Path::new("main.tf")).unwrap(),
-            InputFormat::Tf
-        );
-        assert_eq!(
-            detect_input_format(Path::new("terraform.tfvars")).unwrap(),
-            InputFormat::Tf
-        );
-        assert_eq!(
-            detect_input_format(Path::new("wrangler.toml")).unwrap(),
-            InputFormat::Wrangler
-        );
-        assert_eq!(
-            detect_input_format(Path::new("wrangler.jsonc")).unwrap(),
-            InputFormat::Wrangler
-        );
-    }
-
-    #[test]
-    fn detects_directory_inputs() {
-        let tf_dir = temp_dir("detect-tf-dir");
-        fs::write(
-            tf_dir.join("main.tf"),
-            "resource \"google_pubsub_topic\" \"events\" {}\n",
-        )
-        .unwrap();
-        assert_eq!(detect_input_format(&tf_dir).unwrap(), InputFormat::Tf);
-        fs::remove_dir_all(&tf_dir).unwrap();
-
-        let wrangler_dir = temp_dir("detect-wrangler-dir");
-        fs::write(
-            wrangler_dir.join("wrangler.toml"),
-            "name = \"edge-worker\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            detect_input_format(&wrangler_dir).unwrap(),
-            InputFormat::Wrangler
-        );
-        fs::remove_dir_all(&wrangler_dir).unwrap();
-    }
-
-    #[test]
-    fn detects_terraform_provider_from_resolved_config() {
-        let aws = yevice_tf::ResolvedConfig {
-            resources: vec![tf_resource("aws_s3_bucket")],
-            vars: HashMap::new(),
-            locals: HashMap::new(),
-        };
-        assert_eq!(detect_tf_provider(&aws), TfProvider::Aws);
-
-        let gcp = yevice_tf::ResolvedConfig {
-            resources: vec![tf_resource("google_storage_bucket")],
-            vars: HashMap::new(),
-            locals: HashMap::new(),
-        };
-        assert_eq!(detect_tf_provider(&gcp), TfProvider::Gcp);
-
-        let mixed = yevice_tf::ResolvedConfig {
-            resources: vec![
-                tf_resource("aws_s3_bucket"),
-                tf_resource("google_storage_bucket"),
-            ],
-            vars: HashMap::new(),
-            locals: HashMap::new(),
-        };
-        assert_eq!(detect_tf_provider(&mixed), TfProvider::Mixed);
-
-        let unknown = yevice_tf::ResolvedConfig {
-            resources: vec![tf_resource("azurerm_storage_account")],
-            vars: HashMap::new(),
-            locals: HashMap::new(),
-        };
-        assert_eq!(detect_tf_provider(&unknown), TfProvider::Unknown);
     }
 
     // --- parse_provider_region tests ---
@@ -1368,45 +955,6 @@ mod tests {
         );
     }
 
-    // --- load_quotas validation tests ---
-
-    /// Non-namespaced key (no `.`) must cause `load_quotas` to bail with a
-    /// message that names the offending key.
-    #[test]
-    fn load_quotas_rejects_non_namespaced_keys() {
-        use std::fs;
-        let dir = temp_dir("quotas-legacy");
-        let quota_file = dir.join("quotas.yaml");
-        fs::write(&quota_file, "lambda_concurrent_executions: 50\n").unwrap();
-
-        let err = load_quotas(quota_file.to_str().unwrap()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("lambda_concurrent_executions"),
-            "error must name the non-namespaced key; got: {msg}"
-        );
-        assert!(
-            msg.contains("non-namespaced"),
-            "error must mention 'non-namespaced'; got: {msg}"
-        );
-    }
-
-    /// Namespaced keys (containing `.`) must be accepted without error.
-    #[test]
-    fn load_quotas_accepts_namespaced_keys() {
-        use std::fs;
-        let dir = temp_dir("quotas-namespaced");
-        let quota_file = dir.join("quotas.yaml");
-        fs::write(&quota_file, "aws.lambda.concurrent_executions: 50\n").unwrap();
-
-        let quotas = load_quotas(quota_file.to_str().unwrap()).unwrap();
-        assert_eq!(
-            quotas.get("aws.lambda.concurrent_executions"),
-            Some(50.0),
-            "namespaced quota value must be loaded correctly"
-        );
-    }
-
     // --- #3 optimize unbound-check closure tests ---
 
     /// When a binding's source variable is not provided, the binding target
@@ -1526,39 +1074,6 @@ mod tests {
             result.is_ok(),
             "optimize must succeed when source variable is provided: {result:?}"
         );
-    }
-
-    #[test]
-    fn build_pricing_resolver_uses_per_provider_region() {
-        use yevice_core::resource::{Architecture, Resource, ResourceShell};
-        use yevice_core::types::{LogicalId, Region, ResourceType};
-
-        // Build a minimal architecture that contains only a GCP resource so we
-        // can verify that build_pricing_resolver accepts an overridden region
-        // per provider without panicking.
-        let shell = ResourceShell::new("gcp.cloud_run", Provider::Gcp, &serde_json::json!({}));
-        let resource = Resource {
-            logical_id: LogicalId::new("MyService"),
-            resource_type: ResourceType::new("google_cloud_run_v2_service"),
-            shell,
-            group: None,
-        };
-        let arch = Architecture {
-            name: "test-arch".to_string(),
-            region: Region::new("ap-northeast-1"),
-            resources: vec![resource],
-            connections: Vec::new(),
-        };
-
-        let default_region = "ap-northeast-1";
-        let mut provider_regions: HashMap<Provider, String> = HashMap::new();
-        provider_regions.insert(Provider::Gcp, "asia-northeast1".to_string());
-
-        // build_pricing_resolver should complete without panicking.
-        // The overridden GCP region is used internally; we confirm the arch
-        // is recognised as having GCP present.
-        let _resolver = build_pricing_resolver(&arch, default_region, &provider_regions, false);
-        assert!(arch.has_provider(Provider::Gcp));
     }
 
     // --- #8 sensitivity steps=0 guard ---

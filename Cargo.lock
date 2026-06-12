@@ -1659,13 +1659,13 @@ dependencies = [
  "tracing-subscriber",
  "yevice-cfn",
  "yevice-core",
+ "yevice-engine",
  "yevice-output",
  "yevice-pricing",
  "yevice-service-api",
  "yevice-services-aws",
  "yevice-services-gcp",
  "yevice-solver",
- "yevice-tf",
  "yevice-wrangler",
 ]
 
