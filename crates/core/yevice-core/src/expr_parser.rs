@@ -124,7 +124,7 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         self.skip_whitespace();
 
-        if self.starts_with_ident("ceil") {
+        if self.starts_with_call("ceil") {
             self.pos += 4;
             self.skip_whitespace();
             if self.advance() != Some(b'(') {
@@ -138,7 +138,7 @@ impl<'a> Parser<'a> {
             return Ok(Expr::ceil(inner));
         }
 
-        if self.starts_with_ident("max") {
+        if self.starts_with_call("max") {
             self.pos += 3;
             self.skip_whitespace();
             if self.advance() != Some(b'(') {
@@ -161,7 +161,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        if self.starts_with_ident("min") {
+        if self.starts_with_call("min") {
             self.pos += 3;
             self.skip_whitespace();
             if self.advance() != Some(b'(') {
@@ -266,6 +266,20 @@ impl<'a> Parser<'a> {
             return false;
         }
         true
+    }
+
+    /// True iff the input at `pos` matches the identifier `s` AND a `(`
+    /// follows (after optional whitespace). This distinguishes `max(...)` from
+    /// a plain variable named `max`.
+    fn starts_with_call(&self, s: &str) -> bool {
+        if !self.starts_with_ident(s) {
+            return false;
+        }
+        let mut lookahead = self.pos + s.len();
+        while lookahead < self.input.len() && self.input[lookahead].is_ascii_whitespace() {
+            lookahead += 1;
+        }
+        lookahead < self.input.len() && self.input[lookahead] == b'('
     }
 }
 
@@ -394,6 +408,15 @@ mod tests {
         // x=0  →  ceil(max(0, 1) / 3) = ceil(1/3) = ceil(0.333..) = 1
         let p0 = params_from(&[("x", 0.0)]);
         assert_eq!(compute("ceil(max(x, 1) / 3)", &p0), 1.0);
+    }
+
+    #[test]
+    fn test_max_min_as_variable_names() {
+        // Variables literally named "max" or "min" must still parse as variables
+        // when not followed by "(" — regression guard for the starts_with_call fix.
+        let p = params_from(&[("max", 3.0), ("min", 7.0)]);
+        assert_eq!(compute("max * 2", &p), 6.0);
+        assert_eq!(compute("min + 1", &p), 8.0);
     }
 
     #[test]
