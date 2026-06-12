@@ -396,15 +396,21 @@ fn resolve_select(
 
     // If the list resolved to a tagged pass-through (e.g. an unresolvable
     // Fn::Split whose source contains references), we cannot select from it
-    // statically.  Warn and return the tagged value as-is so the caller sees
-    // an unresolved value rather than a hard error.
+    // statically.  Warn and preserve the *original* !Select expression so
+    // downstream consumers see the full unresolved expression (including the
+    // index), not just the inner list argument.
     if let ResolvedValue::Concrete(Value::Tagged(ref tagged)) = list_resolved {
         tracing::warn!(
             index = index,
             tag = %tagged.tag,
             "!Select list resolved to an unresolvable tagged value; passing through as-is"
         );
-        return Ok(list_resolved);
+        return Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
+            serde_yaml_ng::value::TaggedValue {
+                tag: serde_yaml_ng::value::Tag::new("!Select"),
+                value: value.clone(),
+            },
+        ))));
     }
 
     let list = list_resolved
@@ -608,16 +614,20 @@ fn resolve_split(
                 .collect();
             Ok(ResolvedValue::Seq(parts))
         }
-        ResolvedValue::Interpolated(_) | ResolvedValue::Ref(_) | ResolvedValue::GetAtt { .. } => {
-            // Source contains unresolved resource references; the exact split
+        ResolvedValue::Interpolated(_)
+        | ResolvedValue::Ref(_)
+        | ResolvedValue::GetAtt { .. }
+        | ResolvedValue::Concrete(Value::Tagged(_)) => {
+            // Source contains unresolved resource references or an unknown
+            // pass-through intrinsic (e.g. !Base64 "a,b").  The exact split
             // positions cannot be determined statically.  Warn and pass through
-            // so downstream logic sees the raw value rather than silently
-            // producing incorrect results.
+            // the original !Split expression so downstream logic sees the full
+            // unresolved value rather than silently producing incorrect results.
             tracing::warn!(
                 separator = %separator,
                 source = ?source,
-                "Fn::Split source contains unresolved references; \
-                 split positions are indeterminate — passing through as-is"
+                "Fn::Split source cannot be resolved statically; \
+                 passing through as-is"
             );
             Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
                 serde_yaml_ng::value::TaggedValue {
@@ -1378,11 +1388,48 @@ mod tests {
             result.is_ok(),
             "!Select over unresolvable !Split must not error, got: {result:?}"
         );
-        // Must not produce a Seq — it should pass through as a non-concrete value.
+        // The pass-through must be the outer !Select expression, not the inner
+        // !Split — callers must see the full expression including the index.
+        match result.unwrap() {
+            ResolvedValue::Concrete(Value::Tagged(t)) => {
+                assert_eq!(
+                    t.tag.to_string(),
+                    "!Select",
+                    "pass-through must preserve the outer !Select tag, got {:?}",
+                    t.tag
+                );
+            }
+            other => panic!("expected Concrete(Tagged(!Select ...)), got {other:?}"),
+        }
+    }
+
+    /// `!Split [",", !Base64 "a,b"]` — when the source is an unknown
+    /// pass-through intrinsic (Concrete(Tagged)), Split must not error.
+    #[test]
+    fn test_split_unknown_intrinsic_source_passes_through() {
+        let ctx = make_ctx();
+        let base64_tagged = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Base64"),
+            value: Value::String("a,b".into()),
+        }));
+        let val = Value::Sequence(vec![Value::String(",".into()), base64_tagged]);
+        let result = resolve_split(&val, &ctx, 0);
         assert!(
-            !matches!(result.unwrap(), ResolvedValue::Seq(_)),
-            "!Select over unresolvable !Split must not produce a Seq"
+            result.is_ok(),
+            "Fn::Split with unknown intrinsic source must not error, got: {result:?}"
         );
+        // Must be a Concrete(Tagged(!Split ...)) pass-through, not a Seq.
+        match result.unwrap() {
+            ResolvedValue::Concrete(Value::Tagged(t)) => {
+                assert_eq!(
+                    t.tag.to_string(),
+                    "!Split",
+                    "pass-through must be tagged !Split, got {:?}",
+                    t.tag
+                );
+            }
+            other => panic!("expected Concrete(Tagged(!Split ...)), got {other:?}"),
+        }
     }
 
     /// `Fn::Split` where source is an `Interpolated` value (unresolved ref)
