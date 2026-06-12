@@ -1619,4 +1619,72 @@ mod determinism_tests {
             "resource order must be sorted by logical_id"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // CfnPropertyValue conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ref_sentinel_becomes_resource_ref() {
+        let val = serde_json::Value::String("{{ref:MyBucket}}".to_string());
+        let result = json_value_to_cfn_property(val);
+        assert!(
+            matches!(result, CfnPropertyValue::ResourceRef(ref id) if id == "MyBucket"),
+            "expected ResourceRef(MyBucket), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn getatt_sentinel_becomes_resource_get_att() {
+        let val = serde_json::Value::String("{{getatt:MyFunction.Arn}}".to_string());
+        let result = json_value_to_cfn_property(val);
+        assert!(
+            matches!(
+                result,
+                CfnPropertyValue::ResourceGetAtt { ref logical_id, ref attr }
+                    if logical_id == "MyFunction" && attr == "Arn"
+            ),
+            "expected ResourceGetAtt{{ MyFunction, Arn }}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn concrete_string_stays_concrete() {
+        let val = serde_json::Value::String("us-east-1".to_string());
+        let result = json_value_to_cfn_property(val.clone());
+        assert!(
+            matches!(result, CfnPropertyValue::Concrete(ref v) if v == &val),
+            "expected Concrete(string), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_to_cfn_properties_mixed() {
+        let mut map = serde_yaml_ng::Mapping::new();
+        for (k, v) in [
+            ("Region", "us-east-1"),
+            ("FunctionArn", "{{getatt:MyFunction.Arn}}"),
+            ("TableName", "{{ref:MyTable}}"),
+        ] {
+            map.insert(
+                YamlValue::String(k.to_string()),
+                YamlValue::String(v.to_string()),
+            );
+        }
+        let yaml = YamlValue::Mapping(map);
+        let props = yaml_to_cfn_properties(&yaml);
+
+        assert!(
+            matches!(props["Region"], CfnPropertyValue::Concrete(_)),
+            "Region should be Concrete"
+        );
+        assert!(
+            matches!(props["FunctionArn"], CfnPropertyValue::ResourceGetAtt { ref logical_id, ref attr } if logical_id == "MyFunction" && attr == "Arn"),
+            "FunctionArn should be ResourceGetAtt"
+        );
+        assert!(
+            matches!(props["TableName"], CfnPropertyValue::ResourceRef(ref id) if id == "MyTable"),
+            "TableName should be ResourceRef"
+        );
+    }
 }
