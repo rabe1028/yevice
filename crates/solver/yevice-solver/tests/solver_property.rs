@@ -224,23 +224,69 @@ fn arb_binding() -> impl Strategy<Value = VariableBinding> {
     })
 }
 
+fn arb_direction() -> impl Strategy<Value = ObjectiveDirection> {
+    prop_oneof![
+        Just(ObjectiveDirection::Minimize),
+        Just(ObjectiveDirection::Maximize),
+    ]
+}
+
 fn arb_problem() -> impl Strategy<Value = OptimizationProblem> {
     (
         arb_decision_vars(),
         arb_fixed_params(),
         prop::collection::vec(arb_binding(), 0..=5),
         arb_simple_expr(),
+        arb_direction(),
     )
-        .prop_map(|(decision_variables, fixed_params, bindings, objective)| {
-            OptimizationProblem {
-                decision_variables,
-                fixed_params,
-                bindings,
+        .prop_map(
+            |(decision_variables, fixed_params, bindings, objective, direction)| {
+                OptimizationProblem {
+                    decision_variables,
+                    fixed_params,
+                    bindings,
+                    constraints: vec![],
+                    objective,
+                    direction,
+                }
+            },
+        )
+}
+
+fn arb_transitive_chain_problem() -> impl Strategy<Value = OptimizationProblem> {
+    (
+        arb_variable_name(), // chain_a (= chain_b)
+        arb_variable_name(), // chain_b (= const_val)
+        arb_variable_name(), // decision var name
+        1i32..=5i32,         // const_val for chain_b
+        arb_domain(),        // decision var domain
+    )
+        .prop_map(
+            |(chain_a, chain_b, dv_name, const_val, domain)| OptimizationProblem {
+                decision_variables: vec![DecisionVariable {
+                    name: dv_name.clone(),
+                    domain,
+                }],
+                fixed_params: HashMap::new(),
+                bindings: vec![
+                    VariableBinding {
+                        target: chain_a.clone(),
+                        expr: Expr::variable(chain_b.clone()),
+                        description: String::new(),
+                        source: "proptest-chain".into(),
+                    },
+                    VariableBinding {
+                        target: chain_b.clone(),
+                        expr: Expr::constant(f64::from(const_val)),
+                        description: String::new(),
+                        source: "proptest-chain".into(),
+                    },
+                ],
                 constraints: vec![],
-                objective,
+                objective: Expr::sum(vec![Expr::variable(chain_a), Expr::variable(dv_name)]),
                 direction: ObjectiveDirection::Minimize,
-            }
-        })
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +349,70 @@ proptest! {
             actual.objective_value,
             expected.objective_value,
             problem
+        );
+    }
+
+    /// 同一の問題を2回 solve した結果が一致することを確認。
+    /// HashMap の非決定的な反復順序やその他の内部状態の漏れを検出する。
+    #[test]
+    fn solver_is_deterministic(problem in arb_problem()) {
+        // 組合せ数が多すぎる場合はスキップ（速度維持）
+        let combination_count: u64 = problem.decision_variables.iter()
+            .map(|d| d.domain.len() as u64)
+            .product();
+        prop_assume!(combination_count > 0 && combination_count <= 256);
+
+        let solver = EnumerationSolver;
+        let r1 = solver.solve(&problem);
+        let r2 = solver.solve(&problem);
+
+        match (&r1, &r2) {
+            (Ok(s1), Ok(s2)) => {
+                prop_assert_eq!(s1.feasible, s2.feasible, "feasibility differs between runs");
+                if s1.feasible {
+                    prop_assert!(
+                        (s1.objective_value - s2.objective_value).abs() < 1e-9,
+                        "objective differs: {} vs {}", s1.objective_value, s2.objective_value
+                    );
+                    prop_assert_eq!(&s1.assignments, &s2.assignments,
+                        "assignments differ between runs on problem: {:?}", problem);
+                }
+            }
+            (Err(_), Err(_)) => {}
+            _ => return Err(proptest::test_runner::TestCaseError::fail(
+                "solver returned Ok first run and Err second run (or vice-versa)",
+            )),
+        }
+    }
+
+    /// `A = B`, `B = const` という2段bindingチェーンを持つ問題で
+    /// solverがoracleと一致することを確認する。
+    /// このクラスの問題は loop-invariant hoist バグで壊れていた。
+    #[test]
+    fn solver_matches_oracle_on_transitive_chain(problem in arb_transitive_chain_problem()) {
+        let combination_count: u64 = problem.decision_variables.iter()
+            .map(|d| d.domain.len() as u64)
+            .product();
+        prop_assume!(combination_count > 0 && combination_count <= 64);
+
+        let solver = EnumerationSolver;
+        let actual = match solver.solve(&problem) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        };
+
+        let expected = solve_naive(&problem);
+        prop_assume!(expected.feasible);
+
+        prop_assert!(
+            actual.feasible,
+            "solver reported infeasible on transitive-chain problem where oracle found feasible (obj={}): {:?}",
+            expected.objective_value, problem
+        );
+        prop_assert!(
+            (actual.objective_value - expected.objective_value).abs() < 1e-9,
+            "transitive-chain objective mismatch: solver={}, naive={}, problem={:?}",
+            actual.objective_value, expected.objective_value, problem
         );
     }
 }
