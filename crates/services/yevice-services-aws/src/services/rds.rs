@@ -129,10 +129,13 @@ impl Service for RdsService {
         } else {
             let storage_per_az = match spec.storage_type.as_str() {
                 "gp3" => {
-                    let base = 0.1216 * spec.allocated_storage_gb;
+                    let gp3_storage_price =
+                        pricing.lookup_f64(&Sku::new("aws.rds.gp3_storage_gb_month"))?;
+                    let gp3_iops_price = pricing.lookup_f64(&Sku::new("aws.rds.gp3_iops_month"))?;
+                    let base = gp3_storage_price * spec.allocated_storage_gb;
                     let iops_cost = spec.iops.map_or(0.0, |i| {
                         if i > 3000.0 {
-                            (i - 3000.0) * 0.008
+                            (i - 3000.0) * gp3_iops_price
                         } else {
                             0.0
                         }

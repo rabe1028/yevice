@@ -169,6 +169,10 @@ impl PriceCatalog for TestCatalog {
             sku if sku.starts_with("aws.opensearch_service_storage.") => PriceRecord::flat(2.0),
             sku if sku.starts_with("aws.opensearch_service.") => PriceRecord::flat(1.0),
             sku if sku.starts_with("aws.rds_storage.") => PriceRecord::flat(2.0),
+            // gp3 storage / iops unit prices must be listed before the
+            // generic aws.rds.* prefix-catch-all below.
+            "aws.rds.gp3_storage_gb_month" => PriceRecord::flat(0.1216),
+            "aws.rds.gp3_iops_month" => PriceRecord::flat(0.008),
             sku if sku.starts_with("aws.rds.") => PriceRecord::flat(1.0),
             sku if sku.starts_with("aws.redshift.") => PriceRecord::flat(1.0),
             other => {

@@ -140,6 +140,22 @@ impl PricingRegistry {
         })
     }
 
+    /// RDS gp3 storage price per GB-month (ap-northeast-1).
+    pub fn rds_gp3_storage_price(&self) -> f64 {
+        Self::RDS_GP3_STORAGE_PRICE
+    }
+
+    /// RDS gp3 storage price per GB-month fallback constant (ap-northeast-1).
+    pub(crate) const RDS_GP3_STORAGE_PRICE: f64 = 0.1216;
+
+    /// RDS gp3 excess IOPS price per IOPS-month (ap-northeast-1).
+    pub fn rds_gp3_iops_price(&self) -> f64 {
+        Self::RDS_GP3_IOPS_PRICE
+    }
+
+    /// RDS gp3 excess IOPS price fallback constant (ap-northeast-1).
+    pub(crate) const RDS_GP3_IOPS_PRICE: f64 = 0.008;
+
     /// S3 Standard pricing for ap-northeast-1.
     pub fn s3_price(&self) -> S3Price {
         S3Price {

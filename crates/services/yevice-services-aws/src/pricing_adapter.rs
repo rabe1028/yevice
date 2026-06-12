@@ -479,6 +479,14 @@ impl PriceCatalog for AwsPricingCatalog {
                     self.provider().ec2_price(itype)?.hourly_price,
                 ))
             }
+            // RDS gp3 storage and excess-IOPS unit prices must be matched
+            // before the generic `aws.rds.*` prefix guard below, as Rust
+            // evaluates match arms in order and the prefix guard would shadow
+            // these exact-string arms.
+            "aws.rds.gp3_storage_gb_month" => {
+                Ok(PriceRecord::flat(self.memory.rds_gp3_storage_price()))
+            }
+            "aws.rds.gp3_iops_month" => Ok(PriceRecord::flat(self.memory.rds_gp3_iops_price())),
             sku if sku.starts_with("aws.rds.") => {
                 // Format: aws.rds.<engine>.<instance_type>
                 let rest = sku.strip_prefix("aws.rds.").unwrap_or("");

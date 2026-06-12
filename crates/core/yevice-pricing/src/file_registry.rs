@@ -1,11 +1,17 @@
 //! Pricing registry backed by downloaded Bulk API JSON files.
 //! Falls back to hardcoded values if files are not available.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::bulk_api::{PricingEntry, find_entries, first_price, parse_bulk_pricing};
 use crate::error::PricingError;
 use crate::model::*;
+
+/// The region used by the hardcoded fallback values.  When the requested
+/// region matches this constant, no warning is emitted.
+const HARDCODED_REGION: &str = "ap-northeast-1";
 
 /// Pricing registry that loads from downloaded JSON files.
 pub struct FilePricingRegistry {
@@ -13,15 +19,11 @@ pub struct FilePricingRegistry {
     #[allow(dead_code)]
     data_dir: PathBuf,
     pub fallback: crate::registry::PricingRegistry,
-    lambda: Option<Vec<PricingEntry>>,
-    ec2: Option<Vec<PricingEntry>>,
-    rds: Option<Vec<PricingEntry>>,
-    s3: Option<Vec<PricingEntry>>,
-    dynamodb: Option<Vec<PricingEntry>>,
-    ecs: Option<Vec<PricingEntry>>,
-    kinesis: Option<Vec<PricingEntry>>,
-    sqs: Option<Vec<PricingEntry>>,
-    cloudwatch: Option<Vec<PricingEntry>>,
+    /// Map from service key (e.g. `"lambda"`, `"ec2"`) to parsed pricing entries.
+    services: HashMap<String, Vec<PricingEntry>>,
+    /// Tracks which services have already emitted a fallback warning so each
+    /// service only warns once per registry instance.
+    warned_services: Mutex<HashSet<String>>,
 }
 
 impl FilePricingRegistry {
@@ -30,57 +32,73 @@ impl FilePricingRegistry {
         let region = region.into();
 
         let fallback = crate::registry::PricingRegistry::new(&region);
-        let mut reg = Self {
-            region,
-            data_dir: data_dir.clone(),
-            fallback,
-            lambda: None,
-            ec2: None,
-            rds: None,
-            s3: None,
-            dynamodb: None,
-            ecs: None,
-            kinesis: None,
-            sqs: None,
-            cloudwatch: None,
-        };
 
-        reg.lambda = load_service(&data_dir, "lambda");
-        reg.ec2 = load_service(&data_dir, "ec2");
-        reg.rds = load_service(&data_dir, "rds");
-        reg.s3 = load_service(&data_dir, "s3");
-        reg.dynamodb = load_service(&data_dir, "dynamodb");
-        reg.ecs = load_service(&data_dir, "ecs");
-        reg.kinesis = load_service(&data_dir, "kinesis");
-        reg.sqs = load_service(&data_dir, "sqs");
-        reg.cloudwatch = load_service(&data_dir, "cloudwatch");
+        let service_names = [
+            "lambda",
+            "ec2",
+            "rds",
+            "s3",
+            "dynamodb",
+            "ecs",
+            "kinesis",
+            "sqs",
+            "cloudwatch",
+        ];
 
-        let loaded_count = [
-            &reg.lambda,
-            &reg.ec2,
-            &reg.rds,
-            &reg.s3,
-            &reg.dynamodb,
-            &reg.ecs,
-            &reg.kinesis,
-            &reg.sqs,
-            &reg.cloudwatch,
-        ]
-        .iter()
-        .filter(|e| e.is_some())
-        .count();
+        let mut services: HashMap<String, Vec<PricingEntry>> = HashMap::new();
+        for name in &service_names {
+            if let Some(entries) = load_service(&data_dir, name) {
+                services.insert(name.to_string(), entries);
+            }
+        }
 
+        let loaded_count = services.len();
         tracing::info!(
             data_dir = %data_dir.display(),
             loaded_count,
             "loaded pricing data from files"
         );
 
-        reg
+        Self {
+            region,
+            data_dir,
+            fallback,
+            services,
+            warned_services: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Emit a `tracing::warn!` the first time `service_key` falls back to
+    /// hardcoded pricing for a non-ap-northeast-1 region.
+    fn warn_fallback_once(&self, service_key: &str) {
+        if self.region == HARDCODED_REGION {
+            return;
+        }
+        // Only warn once per service per registry instance.
+        let mut warned = self
+            .warned_services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warned.insert(service_key.to_string()) {
+            tracing::warn!(
+                service = service_key,
+                requested_region = %self.region,
+                fallback_region = HARDCODED_REGION,
+                "no Bulk API pricing data for this service/region; \
+                 using hardcoded {} prices",
+                HARDCODED_REGION,
+            );
+        }
+    }
+
+    /// Returns loaded entries for `service_key`, or `None` if that file was
+    /// not loaded.
+    fn entries(&self, service_key: &str) -> Option<&Vec<PricingEntry>> {
+        self.services.get(service_key)
     }
 
     pub fn lambda_price(&self) -> LambdaPrice {
-        if let Some(entries) = &self.lambda {
+        if let Some(entries) = self.entries("lambda") {
             let request_price = find_entries(entries, &[("group", "AWS-Lambda-Requests")])
                 .first()
                 .and_then(|e| first_price(e))
@@ -114,11 +132,12 @@ impl FilePricingRegistry {
         }
 
         // Fallback to hardcoded
+        self.warn_fallback_once("lambda");
         self.fallback.lambda_price()
     }
 
     pub fn ec2_price(&self, instance_type: &str) -> Result<Ec2Price, PricingError> {
-        if let Some(entries) = &self.ec2 {
+        if let Some(entries) = self.entries("ec2") {
             let matches = find_entries(
                 entries,
                 &[
@@ -141,11 +160,12 @@ impl FilePricingRegistry {
         }
 
         // Fallback
+        self.warn_fallback_once("ec2");
         self.fallback.ec2_price(instance_type)
     }
 
     pub fn rds_price(&self, instance_type: &str, engine: &str) -> Result<RdsPrice, PricingError> {
-        if let Some(entries) = &self.rds {
+        if let Some(entries) = self.entries("rds") {
             let db_engine = match engine {
                 "mysql" | "mariadb" => "MySQL",
                 "postgres" => "PostgreSQL",
@@ -173,16 +193,18 @@ impl FilePricingRegistry {
             }
         }
 
+        self.warn_fallback_once("rds");
         self.fallback.rds_price(instance_type, engine)
     }
 
     pub fn s3_price(&self) -> S3Price {
         // S3 pricing has complex tiered structure, use hardcoded for now
+        self.warn_fallback_once("s3");
         self.fallback.s3_price()
     }
 
     pub fn dynamodb_price(&self) -> DynamoDbPrice {
-        if let Some(entries) = &self.dynamodb {
+        if let Some(entries) = self.entries("dynamodb") {
             let write_price = find_entries(entries, &[("group", "DDB-WriteUnits")])
                 .first()
                 .and_then(|e| first_price(e))
@@ -232,10 +254,12 @@ impl FilePricingRegistry {
             };
         }
 
+        self.warn_fallback_once("dynamodb");
         self.fallback.dynamodb_price()
     }
 
     pub fn fargate_price(&self) -> FargatePrice {
+        self.warn_fallback_once("fargate");
         self.fallback.fargate_price()
     }
 
@@ -244,7 +268,7 @@ impl FilePricingRegistry {
     }
 
     pub fn kinesis_price(&self) -> KinesisPrice {
-        if let Some(entries) = &self.kinesis {
+        if let Some(entries) = self.entries("kinesis") {
             let shard_price = find_entries(entries, &[("group", "Kinesis Streams")])
                 .iter()
                 .find_map(|e| first_price(e))
@@ -280,14 +304,17 @@ impl FilePricingRegistry {
             };
         }
 
+        self.warn_fallback_once("kinesis");
         self.fallback.kinesis_price()
     }
 
     pub fn sqs_price(&self) -> SqsPrice {
+        self.warn_fallback_once("sqs");
         self.fallback.sqs_price()
     }
 
     pub fn cloudwatch_logs_price(&self) -> CloudWatchLogsPrice {
+        self.warn_fallback_once("cloudwatch_logs");
         self.fallback.cloudwatch_logs_price()
     }
 
@@ -321,6 +348,13 @@ impl FilePricingRegistry {
 
     pub fn data_transfer_price(&self) -> DataTransferPrice {
         self.fallback.data_transfer_price()
+    }
+
+    /// Returns `true` when no Bulk API file was loaded for `service_key`.
+    /// Useful for tests that need to verify fallback behavior.
+    #[cfg(test)]
+    pub fn is_fallback_for(&self, service_key: &str) -> bool {
+        !self.services.contains_key(service_key)
     }
 }
 
@@ -462,6 +496,48 @@ mod tests {
             price.put_payload_unit_price,
             crate::registry::PricingRegistry::KINESIS_PUT_PAYLOAD_UNIT_PRICE,
             "kinesis put_payload_unit_price must fall back to canonical constant"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When a non-ap-northeast-1 region is requested and no Bulk API file is
+    /// available for a service, the registry should use hardcoded prices and
+    /// record that warning dedup has fired for that service.
+    #[test]
+    fn fallback_warning_dedup_fires_once_for_non_tokyo_region() {
+        let dir = make_temp_dir("warn_dedup");
+        // No lambda.json in dir -> full fallback path
+        let reg = FilePricingRegistry::load("us-east-1", &dir);
+
+        // Call lambda_price twice; the second call must not add a second entry.
+        let _ = reg.lambda_price();
+        let _ = reg.lambda_price();
+
+        let warned = reg.warned_services.lock().unwrap();
+        assert!(
+            warned.contains("lambda"),
+            "lambda should be in the warned set"
+        );
+        assert_eq!(warned.len(), 1, "only one service should have been warned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the requested region equals ap-northeast-1, no warning is emitted
+    /// even if no Bulk API file is present.
+    #[test]
+    fn fallback_warning_suppressed_for_hardcoded_region() {
+        let dir = make_temp_dir("no_warn_tokyo");
+        // No lambda.json in dir -> full fallback path, but region matches
+        let reg = FilePricingRegistry::load("ap-northeast-1", &dir);
+
+        let _ = reg.lambda_price();
+
+        let warned = reg.warned_services.lock().unwrap();
+        assert!(
+            warned.is_empty(),
+            "no warnings should be emitted for ap-northeast-1"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
