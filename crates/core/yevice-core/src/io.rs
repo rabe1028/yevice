@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
 use thiserror::Error;
 
 use crate::bindings::{BindingsFile, to_variable_bindings};
-use crate::cost::VariableBinding;
+use crate::capacity::Quotas;
+use crate::cost::{ArchitectureCost, VariableBinding};
 use crate::evaluate::Params;
 use crate::types::VariableName;
 
@@ -159,6 +161,79 @@ pub fn parse_bindings(content: &str) -> Result<Vec<VariableBinding>, BindingsPar
     Ok(to_variable_bindings(&file.bindings))
 }
 
+/// Error raised while parsing a string-map YAML document
+/// (e.g. CloudFormation parameter or import values).
+#[derive(Debug, Error)]
+#[error("failed to parse string map")]
+pub struct StringMapParseError(#[source] serde_yaml_ng::Error);
+
+/// Parse a flat YAML mapping of `name: scalar` entries into string values.
+///
+/// Numbers and booleans are stringified; entries with non-scalar values
+/// (sequences, mappings, null) are silently skipped. Used for CloudFormation
+/// parameter and cross-stack import value files.
+pub fn parse_string_map(content: &str) -> Result<HashMap<String, String>, StringMapParseError> {
+    let map: HashMap<String, serde_yaml_ng::Value> =
+        serde_yaml_ng::from_str(content).map_err(StringMapParseError)?;
+
+    let mut result = HashMap::new();
+    for (k, v) in map {
+        let val = match v {
+            serde_yaml_ng::Value::String(s) => s,
+            serde_yaml_ng::Value::Number(n) => n.to_string(),
+            serde_yaml_ng::Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        result.insert(k, val);
+    }
+
+    Ok(result)
+}
+
+/// Errors raised while parsing a quotas YAML document.
+#[derive(Debug, Error)]
+pub enum QuotasParseError {
+    /// The document is not a valid YAML mapping of quota keys to numbers.
+    #[error("failed to parse quotas file")]
+    Yaml(#[source] serde_yaml_ng::Error),
+
+    /// One or more keys are not provider-namespaced (contain no `.`).
+    #[error(
+        "quotas use non-namespaced keys ({keys}); quota files now use \
+         provider-namespaced keys such as 'aws.lambda.concurrent_executions'. \
+         Please migrate these keys."
+    )]
+    LegacyKeys {
+        /// Comma-separated list of the offending keys.
+        keys: String,
+    },
+}
+
+/// Parse service quotas from YAML text.
+///
+/// Keys must be provider-namespaced (e.g. `aws.lambda.concurrent_executions`);
+/// legacy non-namespaced keys are rejected with [`QuotasParseError::LegacyKeys`].
+pub fn parse_quotas(content: &str) -> Result<Quotas, QuotasParseError> {
+    let quotas: Quotas = serde_yaml_ng::from_str(content).map_err(QuotasParseError::Yaml)?;
+    let legacy: Vec<&str> = quotas.keys().filter(|k| !k.contains('.')).collect();
+    if !legacy.is_empty() {
+        return Err(QuotasParseError::LegacyKeys {
+            keys: legacy.join(", "),
+        });
+    }
+    Ok(quotas)
+}
+
+/// Error raised while parsing a cost-model JSON document.
+#[derive(Debug, Error)]
+#[error("failed to parse cost model JSON")]
+pub struct CostModelParseError(#[source] serde_json::Error);
+
+/// Parse a cost model (as produced by `generate`) from JSON text.
+pub fn parse_cost_model(content: &str) -> Result<ArchitectureCost, CostModelParseError> {
+    serde_json::from_str(content).map_err(CostModelParseError)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -288,6 +363,82 @@ bindings:
         let err = parse_bindings("bindings: 42\n").unwrap_err();
         assert!(
             err.to_string().contains("failed to parse bindings file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_string_map_stringifies_scalars_and_skips_non_scalars() {
+        let yaml = "\
+Name: api
+Count: 3
+Enabled: true
+Tags: [a, b]
+Nested:
+  key: value
+";
+        let map = parse_string_map(yaml).unwrap();
+        assert_eq!(map.get("Name"), Some(&"api".to_string()));
+        assert_eq!(map.get("Count"), Some(&"3".to_string()));
+        assert_eq!(map.get("Enabled"), Some(&"true".to_string()));
+        assert!(!map.contains_key("Tags"), "sequences must be skipped");
+        assert!(!map.contains_key("Nested"), "mappings must be skipped");
+    }
+
+    #[test]
+    fn parse_string_map_rejects_invalid_yaml() {
+        let err = parse_string_map(": not yaml :\n").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse string map"),
+            "got: {err}"
+        );
+    }
+
+    /// Non-namespaced key (no `.`) must cause `parse_quotas` to fail with a
+    /// message that names the offending key.
+    #[test]
+    fn parse_quotas_rejects_non_namespaced_keys() {
+        let err = parse_quotas("lambda_concurrent_executions: 50\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lambda_concurrent_executions"),
+            "error must name the non-namespaced key; got: {msg}"
+        );
+        assert!(
+            msg.contains("non-namespaced"),
+            "error must mention 'non-namespaced'; got: {msg}"
+        );
+    }
+
+    /// Namespaced keys (containing `.`) must be accepted without error.
+    #[test]
+    fn parse_quotas_accepts_namespaced_keys() {
+        let quotas = parse_quotas("aws.lambda.concurrent_executions: 50\n").unwrap();
+        assert_eq!(
+            quotas.get("aws.lambda.concurrent_executions"),
+            Some(50.0),
+            "namespaced quota value must be loaded correctly"
+        );
+    }
+
+    #[test]
+    fn parse_cost_model_reads_minimal_model() {
+        let json = r#"{
+            "name": "test",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        }"#;
+        let model = parse_cost_model(json).unwrap();
+        assert_eq!(model.name.as_str(), "test");
+        assert!(model.resources.is_empty());
+    }
+
+    #[test]
+    fn parse_cost_model_rejects_invalid_json() {
+        let err = parse_cost_model("{ not json").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse cost model JSON"),
             "got: {err}"
         );
     }
