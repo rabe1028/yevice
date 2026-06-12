@@ -180,7 +180,7 @@ fn extract_source_logical_id(
     if let Some(s) = source_arn.as_str() {
         // Resolved sentinel: "{{ref:X}}" or "{{getatt:X.Attr}}"
         // Also handles embedded sentinels from Fn::Sub ARNs.
-        if let Some(cfn_ref) = sentinel::parse(s).or_else(|| sentinel::find_embedded(s)) {
+        if let Some(cfn_ref) = sentinel::parse_or_find_embedded(s) {
             let source_type = detect_source_type(&cfn_ref.logical_id, resources)?;
             return Some((cfn_ref.logical_id, source_type));
         }
