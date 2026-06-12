@@ -164,8 +164,15 @@ fn solve_naive(problem: &OptimizationProblem) -> Solution {
 const VAR_POOL: &[&str] = &["a", "b", "c", "T1", "T2", "T3"];
 
 fn arb_variable_name() -> impl Strategy<Value = VariableName> {
-    // Use .to_vec() to get Vec<&str> so select yields &str values (not &&str).
-    prop::sample::select(VAR_POOL.to_vec()).prop_map(VariableName::new)
+    prop_oneof![
+        Just("a"),
+        Just("b"),
+        Just("c"),
+        Just("T1"),
+        Just("T2"),
+        Just("T3"),
+    ]
+    .prop_map(VariableName::new)
 }
 
 fn arb_domain() -> impl Strategy<Value = Vec<f64>> {
