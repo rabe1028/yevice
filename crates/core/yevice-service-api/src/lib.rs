@@ -8,8 +8,8 @@ pub mod service;
 pub use catalog::ServiceCatalog;
 pub use error::CostError;
 pub use iac::{
-    CfnAdapter, CfnAdapterRegistry, IacError, RawCfnResource, RawTfResource, TfAdapter,
-    TfAdapterRegistry,
+    CfnAdapter, CfnAdapterRegistry, CfnPropertyValue, IacError, RawCfnResource, RawTfResource,
+    TfAdapter, TfAdapterRegistry,
 };
 pub use plugin::{ProviderPlugin, Registration};
 pub use pricing_resolver::{MultiProviderCatalog, PriceCatalogResolver};

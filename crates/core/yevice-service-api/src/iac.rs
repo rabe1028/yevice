@@ -4,7 +4,8 @@
 //! data into a `ResourceShell`. Adapters are collected in `*AdapterRegistry`
 //! and looked up at parse time by resource type string.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde_json::Value;
 use yevice_core::{
@@ -30,6 +31,20 @@ pub enum IacError {
 // CloudFormation
 // ---------------------------------------------------------------------------
 
+/// A property value for a CloudFormation resource.
+/// Whole-string unresolved intrinsics (`!Ref`, `!GetAtt`) become typed variants.
+/// Embedded sentinels inside string values (from `Fn::Sub`, `Fn::Join`, etc.)
+/// and nested object properties remain as `Concrete`.
+#[derive(Debug, Clone)]
+pub enum CfnPropertyValue {
+    /// A statically-resolved concrete value.
+    Concrete(serde_json::Value),
+    /// An unresolved `!Ref LogicalId` referencing a resource in the same template.
+    ResourceRef(String),
+    /// An unresolved `!GetAtt LogicalId.Attr`.
+    ResourceGetAtt { logical_id: String, attr: String },
+}
+
 /// A raw CloudFormation resource as parsed from YAML.
 ///
 /// The `properties` field holds the deserialized `Properties` block.
@@ -37,75 +52,103 @@ pub enum IacError {
 pub struct RawCfnResource {
     pub logical_id: LogicalId,
     pub resource_type: ResourceType,
-    /// The `Properties` block of the CFn resource (may be `Value::Null`).
-    pub properties: Value,
+    /// The `Properties` block of the CFn resource, keyed by property name.
+    pub properties: BTreeMap<String, CfnPropertyValue>,
 }
 
 impl RawCfnResource {
+    /// Construct a `RawCfnResource` from a concrete `serde_json::Value` properties block.
+    ///
+    /// All top-level property values are wrapped as `CfnPropertyValue::Concrete`.
+    /// This constructor is intended for use in tests and adapters that work with
+    /// already-resolved concrete JSON values (no sentinel parsing is performed).
     pub fn new(
         logical_id: impl Into<String>,
         resource_type: impl Into<String>,
         properties: Value,
     ) -> Self {
+        let props = if let Value::Object(map) = properties {
+            map.into_iter()
+                .map(|(k, v)| (k, CfnPropertyValue::Concrete(v)))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         Self {
             logical_id: LogicalId::new(logical_id),
             resource_type: ResourceType::new(resource_type),
-            properties,
+            properties: props,
         }
     }
 
     /// Get a string property value.
     pub fn get_str(&self, key: &str) -> Option<&str> {
-        self.properties.get(key)?.as_str()
+        match self.properties.get(key)? {
+            CfnPropertyValue::Concrete(Value::String(s)) => Some(s.as_str()),
+            CfnPropertyValue::Concrete(_) => None,
+            CfnPropertyValue::ResourceRef(id) => {
+                tracing::warn!(key, ref_id = %id, "unresolved !Ref where str expected; skipping");
+                None
+            }
+            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+                tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where str expected; skipping");
+                None
+            }
+        }
     }
 
     /// Get a numeric property value as f64.
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         match self.properties.get(key)? {
-            Value::Number(n) => n.as_f64(),
-            Value::String(s) => {
-                if s.starts_with("{{ref:") || s.starts_with("{{getatt:") {
-                    tracing::warn!(
-                        value = %s,
-                        key = %key,
-                        "unresolved CloudFormation reference {} where a number was expected; treating as absent",
-                        s
-                    );
-                    return None;
-                }
-                s.parse::<f64>().ok()
+            CfnPropertyValue::Concrete(Value::Number(n)) => n.as_f64(),
+            CfnPropertyValue::Concrete(Value::String(s)) => s.parse().ok(),
+            CfnPropertyValue::Concrete(_) => None,
+            CfnPropertyValue::ResourceRef(id) => {
+                tracing::warn!(key, ref_id = %id, "unresolved !Ref where f64 expected; skipping");
+                None
             }
-            _ => None,
+            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+                tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where f64 expected; skipping");
+                None
+            }
         }
     }
 
     /// Get a boolean property value.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         match self.properties.get(key)? {
-            Value::Bool(b) => Some(*b),
-            Value::String(s) => {
-                if s.starts_with("{{ref:") || s.starts_with("{{getatt:") {
-                    tracing::warn!(
-                        value = %s,
-                        key = %key,
-                        "unresolved CloudFormation reference {} where a boolean was expected; treating as absent",
-                        s
-                    );
-                    return None;
-                }
-                match s.to_lowercase().as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                }
+            CfnPropertyValue::Concrete(Value::Bool(b)) => Some(*b),
+            CfnPropertyValue::Concrete(Value::String(s)) => match s.to_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            CfnPropertyValue::Concrete(_) => None,
+            CfnPropertyValue::ResourceRef(id) => {
+                tracing::warn!(key, ref_id = %id, "unresolved !Ref where bool expected; skipping");
+                None
             }
-            _ => None,
+            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+                tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where bool expected; skipping");
+                None
+            }
         }
     }
 
-    /// Access a nested object property.
-    pub fn get_object(&self, key: &str) -> Option<&Value> {
-        self.properties.get(key)
+    /// Returns the underlying JSON value for any `Concrete` variant.
+    /// Returns `None` for unresolved intrinsic references.
+    pub fn get_object(&self, key: &str) -> Option<&serde_json::Value> {
+        match self.properties.get(key)? {
+            CfnPropertyValue::Concrete(v) => Some(v),
+            CfnPropertyValue::ResourceRef(id) => {
+                tracing::warn!(key, ref_id = %id, "unresolved !Ref where object expected; skipping");
+                None
+            }
+            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+                tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where object expected; skipping");
+                None
+            }
+        }
     }
 }
 

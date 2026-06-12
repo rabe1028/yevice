@@ -7,7 +7,7 @@ use yevice_core::{
     resource::{Architecture, Connection, ConnectionType, Resource, ResourceShell},
     types::{LogicalId, Region, ResourceType},
 };
-use yevice_service_api::{CfnAdapterRegistry, RawCfnResource};
+use yevice_service_api::{CfnAdapterRegistry, CfnPropertyValue, RawCfnResource};
 
 use crate::parser::{CfnResource, CfnTemplate};
 use crate::sentinel;
@@ -23,9 +23,12 @@ pub fn build_architecture(
         .resources
         .iter()
         .map(|(logical_id, cfn)| {
-            let properties = yaml_to_json(&cfn.properties);
-            let raw =
-                RawCfnResource::new(logical_id.as_str(), cfn.resource_type.as_str(), properties);
+            let properties = yaml_to_cfn_properties(&cfn.properties);
+            let raw = RawCfnResource {
+                logical_id: LogicalId::new(logical_id.as_str()),
+                resource_type: ResourceType::new(cfn.resource_type.as_str()),
+                properties,
+            };
             let shell = match adapters.lookup(&cfn.resource_type) {
                 None => ResourceShell::other(&cfn.resource_type),
                 Some(adapter) => match adapter.convert(&raw) {
@@ -683,9 +686,48 @@ fn get_yaml_number(value: &YamlValue, key: &str) -> Option<f64> {
         })
 }
 
+/// Convert a `serde_yaml_ng::Value` properties block to a
+/// `BTreeMap<String, CfnPropertyValue>`.
+///
+/// Each top-level entry is converted: if the JSON representation is a
+/// whole-string sentinel (`"{{ref:X}}"` or `"{{getatt:X.Y}}"`), it becomes a
+/// typed `ResourceRef` or `ResourceGetAtt` variant.  All other values become
+/// `Concrete`.
+fn yaml_to_cfn_properties(value: &YamlValue) -> BTreeMap<String, CfnPropertyValue> {
+    let json = yaml_to_json(value);
+    if let serde_json::Value::Object(map) = json {
+        map.into_iter()
+            .map(|(k, v)| (k, json_value_to_cfn_property(v)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// Convert a top-level property `serde_json::Value` to a `CfnPropertyValue`.
+///
+/// If the value is a whole-string sentinel produced by the intrinsic resolver,
+/// it becomes `ResourceRef` or `ResourceGetAtt`.  Everything else is `Concrete`.
+fn json_value_to_cfn_property(value: serde_json::Value) -> CfnPropertyValue {
+    if let serde_json::Value::String(ref s) = value
+        && let Some(cfn_ref) = sentinel::parse(s)
+    {
+        return if let Some(attr) = cfn_ref.attr {
+            CfnPropertyValue::ResourceGetAtt {
+                logical_id: cfn_ref.logical_id,
+                attr,
+            }
+        } else {
+            CfnPropertyValue::ResourceRef(cfn_ref.logical_id)
+        };
+    }
+    CfnPropertyValue::Concrete(value)
+}
+
 /// Convert a `serde_yaml_ng::Value` to a `serde_json::Value`.
 ///
-/// This is needed because `RawCfnResource.properties` expects `serde_json::Value`.
+/// Used internally by [`yaml_to_cfn_properties`] and by connection extraction
+/// helpers that operate on nested YAML structures.
 fn yaml_to_json(value: &YamlValue) -> serde_json::Value {
     match value {
         YamlValue::Null => serde_json::Value::Null,
