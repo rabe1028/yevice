@@ -54,6 +54,13 @@ impl ServiceCatalog {
         self.connection_rules.extend(rules);
     }
 
+    /// Returns a sorted list of all registered service IDs.
+    pub fn registered_service_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.services.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Return a slice of all registered connection rules.
     pub fn connection_rules(&self) -> &[Box<dyn ConnectionRule>] {
         &self.connection_rules
@@ -96,9 +103,11 @@ impl ServiceCatalog {
                 continue;
             }
             let Some(service) = self.services.get(service_id.as_str()) else {
-                tracing::debug!(
+                tracing::warn!(
                     service_id = service_id.as_str(),
-                    "no cost model registered, skipping"
+                    resource_type = resource.resource_type.as_str(),
+                    logical_id = %resource.logical_id,
+                    "no service registered for service_id; resource silently skipped"
                 );
                 continue;
             };

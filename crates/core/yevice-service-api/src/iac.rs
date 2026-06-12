@@ -196,6 +196,13 @@ impl CfnAdapterRegistry {
         self.adapters.get(resource_type).map(AsRef::as_ref)
     }
 
+    /// Returns a sorted list of all registered CloudFormation resource type strings.
+    pub fn registered_types(&self) -> Vec<&str> {
+        let mut types: Vec<&str> = self.adapters.keys().map(String::as_str).collect();
+        types.sort_unstable();
+        types
+    }
+
     /// Convert a raw CFn resource to a `ResourceShell`.
     ///
     /// Returns `None` if no adapter is registered for the resource type.
@@ -314,6 +321,13 @@ impl TfAdapterRegistry {
     /// Look up the adapter for a given resource type string.
     pub fn lookup(&self, resource_type: &str) -> Option<&dyn TfAdapter> {
         self.adapters.get(resource_type).map(AsRef::as_ref)
+    }
+
+    /// Returns a sorted list of all registered Terraform resource type strings.
+    pub fn registered_types(&self) -> Vec<&str> {
+        let mut types: Vec<&str> = self.adapters.keys().map(String::as_str).collect();
+        types.sort_unstable();
+        types
     }
 
     /// Convert a raw TF resource to a `ResourceShell`.
