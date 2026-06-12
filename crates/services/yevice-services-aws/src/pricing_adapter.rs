@@ -80,6 +80,25 @@ impl AwsPricingCatalog {
             None => &self.memory,
         }
     }
+
+    /// RDS gp3 storage price per GB-month, routed through the file registry so
+    /// non-Tokyo regions emit a fallback warning consistent with other RDS paths.
+    fn rds_gp3_storage_price(&self) -> f64 {
+        match &self.file {
+            Some(f) => f.rds_gp3_storage_price(),
+            None => self.memory.rds_gp3_storage_price(),
+        }
+    }
+
+    /// RDS gp3 excess IOPS price per IOPS-month, routed through the file
+    /// registry so non-Tokyo regions emit a fallback warning consistent with
+    /// other RDS paths.
+    fn rds_gp3_iops_price(&self) -> f64 {
+        match &self.file {
+            Some(f) => f.rds_gp3_iops_price(),
+            None => self.memory.rds_gp3_iops_price(),
+        }
+    }
 }
 
 impl PriceCatalog for AwsPricingCatalog {
@@ -483,10 +502,13 @@ impl PriceCatalog for AwsPricingCatalog {
             // before the generic `aws.rds.*` prefix guard below, as Rust
             // evaluates match arms in order and the prefix guard would shadow
             // these exact-string arms.
+            // Route through the file registry so that non-Tokyo regions emit a
+            // fallback warning consistent with other RDS paths (via
+            // FilePricingRegistry::warn_fallback_once).
             "aws.rds.gp3_storage_gb_month" => {
-                Ok(PriceRecord::flat(self.memory.rds_gp3_storage_price()))
+                Ok(PriceRecord::flat(self.rds_gp3_storage_price()))
             }
-            "aws.rds.gp3_iops_month" => Ok(PriceRecord::flat(self.memory.rds_gp3_iops_price())),
+            "aws.rds.gp3_iops_month" => Ok(PriceRecord::flat(self.rds_gp3_iops_price())),
             sku if sku.starts_with("aws.rds.") => {
                 // Format: aws.rds.<engine>.<instance_type>
                 let rest = sku.strip_prefix("aws.rds.").unwrap_or("");

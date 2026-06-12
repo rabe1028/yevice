@@ -197,6 +197,52 @@ impl FilePricingRegistry {
         self.fallback.rds_price(instance_type, engine)
     }
 
+    /// RDS gp3 storage price per GB-month.
+    ///
+    /// Looks for a `Database Storage` entry with `volumeType = "General Purpose-GP3"` in
+    /// the downloaded `rds.json` file.  Falls back to the hardcoded ap-northeast-1 constant
+    /// when the file is absent or the SKU is not found, and emits a region-fallback warning
+    /// (suppressed for ap-northeast-1) using a dedicated dedup key so that it fires
+    /// independently of the RDS instance-pricing fallback.
+    pub fn rds_gp3_storage_price(&self) -> f64 {
+        if let Some(entries) = self.entries("rds") {
+            let matches = find_entries(
+                entries,
+                &[
+                    ("productFamily", "Database Storage"),
+                    ("volumeType", "General Purpose-GP3"),
+                ],
+            );
+            if let Some(entry) = matches.first()
+                && let Some(price) = first_price(entry)
+            {
+                return price;
+            }
+        }
+        self.warn_fallback_once("rds_gp3_storage");
+        self.fallback.rds_gp3_storage_price()
+    }
+
+    /// RDS gp3 excess IOPS price per IOPS-month.
+    ///
+    /// Looks for a `System Operation` entry with `group = "RDS-GP3-IOPS"` in the downloaded
+    /// `rds.json` file.  Falls back to the hardcoded ap-northeast-1 constant when the file
+    /// is absent or the SKU is not found, and emits a region-fallback warning (suppressed for
+    /// ap-northeast-1) using a dedicated dedup key so that it fires independently of the
+    /// RDS instance-pricing fallback.
+    pub fn rds_gp3_iops_price(&self) -> f64 {
+        if let Some(entries) = self.entries("rds") {
+            let matches = find_entries(entries, &[("group", "RDS-GP3-IOPS")]);
+            if let Some(entry) = matches.first()
+                && let Some(price) = first_price(entry)
+            {
+                return price;
+            }
+        }
+        self.warn_fallback_once("rds_gp3_iops");
+        self.fallback.rds_gp3_iops_price()
+    }
+
     pub fn s3_price(&self) -> S3Price {
         // S3 pricing has complex tiered structure, use hardcoded for now
         self.warn_fallback_once("s3");
@@ -496,6 +542,76 @@ mod tests {
             price.put_payload_unit_price,
             crate::registry::PricingRegistry::KINESIS_PUT_PAYLOAD_UNIT_PRICE,
             "kinesis put_payload_unit_price must fall back to canonical constant"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When a non-ap-northeast-1 region is requested with a file-backed
+    /// registry that has no gp3 SKU in its rds.json, both gp3 price helpers
+    /// must fall back to the hardcoded constant and record independent warning
+    /// dedup entries (distinct from the "rds" instance-pricing key).
+    #[test]
+    fn rds_gp3_fallback_warning_fires_for_non_tokyo_region() {
+        let dir = make_temp_dir("rds_gp3_fallback");
+        // Write an rds.json with no gp3 entries so the lookup path returns None.
+        std::fs::write(
+            dir.join("rds.json"),
+            minimal_bulk_json_with_wrong_group("AmazonRDS"),
+        )
+        .unwrap();
+
+        let reg = FilePricingRegistry::load("us-east-1", &dir);
+
+        // Both helpers must return the canonical hardcoded constants.
+        assert_eq!(
+            reg.rds_gp3_storage_price(),
+            crate::registry::PricingRegistry::RDS_GP3_STORAGE_PRICE,
+            "rds_gp3_storage_price must fall back to canonical constant"
+        );
+        assert_eq!(
+            reg.rds_gp3_iops_price(),
+            crate::registry::PricingRegistry::RDS_GP3_IOPS_PRICE,
+            "rds_gp3_iops_price must fall back to canonical constant"
+        );
+
+        // Both fallback paths must have fired their dedup warnings.
+        let warned = reg.warned_services.lock().unwrap();
+        assert!(
+            warned.contains("rds_gp3_storage"),
+            "rds_gp3_storage should be in the warned set"
+        );
+        assert!(
+            warned.contains("rds_gp3_iops"),
+            "rds_gp3_iops should be in the warned set"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gp3 fallback warning must be suppressed when the region is ap-northeast-1.
+    #[test]
+    fn rds_gp3_fallback_warning_suppressed_for_hardcoded_region() {
+        let dir = make_temp_dir("rds_gp3_no_warn_tokyo");
+        std::fs::write(
+            dir.join("rds.json"),
+            minimal_bulk_json_with_wrong_group("AmazonRDS"),
+        )
+        .unwrap();
+
+        let reg = FilePricingRegistry::load("ap-northeast-1", &dir);
+
+        let _ = reg.rds_gp3_storage_price();
+        let _ = reg.rds_gp3_iops_price();
+
+        let warned = reg.warned_services.lock().unwrap();
+        assert!(
+            !warned.contains("rds_gp3_storage"),
+            "no gp3 storage warning should be emitted for ap-northeast-1"
+        );
+        assert!(
+            !warned.contains("rds_gp3_iops"),
+            "no gp3 iops warning should be emitted for ap-northeast-1"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
