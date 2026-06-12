@@ -9,7 +9,7 @@ use yevice_solver::{EnumerationSolver, Solver, SolverError};
 
 use yevice_cfn::convert as cfn_convert;
 use yevice_cfn::parser;
-use yevice_core::bindings::{BindingsFile, derive_bindings, to_variable_bindings};
+use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
@@ -1056,70 +1056,22 @@ fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
 
 /// Load usage parameters from a YAML file.
 ///
-/// Supports both flat and hierarchical formats:
-///
-/// Flat (legacy):
-/// ```yaml
-/// IngestFunction_requests: 5000000
-/// ```
-///
-/// Hierarchical:
-/// ```yaml
-/// IngestFunction:
-///   requests: 5000000
-/// ```
+/// File I/O happens here; parsing (flat and hierarchical formats) is
+/// delegated to [`yevice_core::io::parse_params`].
 fn load_params(path: &str) -> Result<Params> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-
-    let map: HashMap<String, serde_yaml_ng::Value> =
-        serde_yaml_ng::from_str(&content).context("failed to parse params file")?;
-
-    let mut params = Params::default();
-    for (k, v) in map {
-        match v {
-            // Hierarchical: key is logical ID, value is a mapping of short var names
-            serde_yaml_ng::Value::Mapping(sub_map) => {
-                for (sub_k, sub_v) in sub_map {
-                    let Some(sub_key) = sub_k.as_str() else {
-                        tracing::warn!(key = ?sub_k, "non-string key in params mapping; skipping");
-                        continue;
-                    };
-                    let val = extract_f64(&sub_v)
-                        .with_context(|| format!("param '{k}_{sub_key}': invalid value"))?;
-                    let full_name = format!("{k}_{sub_key}");
-                    params.insert(VariableName::new(full_name), val);
-                }
-            }
-            // Flat: key is the full variable name
-            _ => {
-                let val = extract_f64(&v).with_context(|| format!("param '{k}': invalid value"))?;
-                params.insert(VariableName::new(k), val);
-            }
-        }
-    }
-
-    Ok(params)
+    Ok(yevice_core::io::parse_params(&content)?)
 }
 
-fn extract_f64(v: &serde_yaml_ng::Value) -> anyhow::Result<f64> {
-    match v {
-        serde_yaml_ng::Value::Number(n) => n
-            .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("cannot interpret number {v:?} as f64")),
-        serde_yaml_ng::Value::String(s) => s
-            .parse::<f64>()
-            .with_context(|| format!("cannot interpret string {v:?} as f64")),
-        _ => anyhow::bail!("cannot interpret value {v:?} as a number"),
-    }
-}
-
+/// Load user-defined variable bindings from a YAML file.
+///
+/// File I/O happens here; parsing is delegated to
+/// [`yevice_core::io::parse_bindings`].
 fn load_bindings(path: &str) -> Result<Vec<yevice_core::cost::VariableBinding>> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("failed to read: {path}"))?;
-    let file: BindingsFile =
-        serde_yaml_ng::from_str(&content).context("failed to parse bindings file")?;
-    Ok(to_variable_bindings(&file.bindings))
+    Ok(yevice_core::io::parse_bindings(&content)?)
 }
 
 fn load_string_map(path: &str) -> Result<HashMap<String, String>> {

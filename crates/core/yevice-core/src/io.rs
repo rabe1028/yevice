@@ -3,6 +3,8 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use crate::bindings::{BindingsFile, to_variable_bindings};
+use crate::cost::VariableBinding;
 use crate::evaluate::Params;
 use crate::types::VariableName;
 
@@ -110,6 +112,53 @@ pub(crate) fn params_from_yaml_map(
     Ok(params)
 }
 
+/// Errors raised while parsing a usage-params YAML document.
+#[derive(Debug, Error)]
+pub enum ParamsParseError {
+    /// The document is not a valid YAML mapping of variable names to values.
+    #[error("failed to parse params file")]
+    Yaml(#[source] serde_yaml_ng::Error),
+
+    /// An entry holds a value that cannot be read as a number.
+    #[error(transparent)]
+    Value(#[from] ParamValueError),
+}
+
+/// Parse usage parameters from YAML text.
+///
+/// Supports both flat and hierarchical formats:
+///
+/// Flat (legacy):
+/// ```yaml
+/// IngestFunction_requests: 5000000
+/// ```
+///
+/// Hierarchical:
+/// ```yaml
+/// IngestFunction:
+///   requests: 5000000
+/// ```
+pub fn parse_params(content: &str) -> Result<Params, ParamsParseError> {
+    let map: std::collections::HashMap<String, serde_yaml_ng::Value> =
+        serde_yaml_ng::from_str(content).map_err(ParamsParseError::Yaml)?;
+    Ok(params_from_yaml_map(map, "param")?)
+}
+
+/// Error raised while parsing a user-defined bindings YAML document.
+#[derive(Debug, Error)]
+#[error("failed to parse bindings file")]
+pub struct BindingsParseError(#[source] serde_yaml_ng::Error);
+
+/// Parse user-defined variable bindings from YAML text.
+///
+/// The document must follow the [`BindingsFile`] structure; entries with
+/// invalid expressions are skipped with a warning (see
+/// [`to_variable_bindings`]).
+pub fn parse_bindings(content: &str) -> Result<Vec<VariableBinding>, BindingsParseError> {
+    let file: BindingsFile = serde_yaml_ng::from_str(content).map_err(BindingsParseError)?;
+    Ok(to_variable_bindings(&file.bindings))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -173,5 +222,73 @@ mod tests {
         assert!(result.is_ok(), "exact limit should succeed");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_params_supports_flat_and_hierarchical_keys() {
+        let yaml = "\
+IngestFunction_requests: 5000000
+Table:
+  read_units: 25
+  write_units: '12.5'
+";
+        let params = parse_params(yaml).unwrap();
+        assert_eq!(
+            params.get(&VariableName::new("IngestFunction_requests")),
+            Some(&5_000_000.0)
+        );
+        assert_eq!(
+            params.get(&VariableName::new("Table_read_units")),
+            Some(&25.0)
+        );
+        assert_eq!(
+            params.get(&VariableName::new("Table_write_units")),
+            Some(&12.5),
+            "numeric strings must be accepted"
+        );
+    }
+
+    #[test]
+    fn parse_params_rejects_non_numeric_value() {
+        let err = parse_params("Foo_requests: [1, 2]\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Foo_requests") && msg.contains("invalid value"),
+            "error must name the offending param; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_params_rejects_invalid_yaml() {
+        let err = parse_params(": not yaml :\n").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse params file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_bindings_reads_simple_and_expr_modes() {
+        let yaml = "\
+bindings:
+  - target: Worker_requests
+    source: Queue_requests
+    factor: 2
+  - target: Bucket_storage_gb
+    expr: \"Job_executions * 0.5\"
+";
+        let bindings = parse_bindings(yaml).unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].target, VariableName::new("Worker_requests"));
+        assert_eq!(bindings[1].target, VariableName::new("Bucket_storage_gb"));
+    }
+
+    #[test]
+    fn parse_bindings_rejects_invalid_yaml() {
+        let err = parse_bindings("bindings: 42\n").unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse bindings file"),
+            "got: {err}"
+        );
     }
 }
