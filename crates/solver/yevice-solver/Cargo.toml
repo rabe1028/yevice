@@ -21,6 +21,7 @@ workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false }
+proptest = { workspace = true }
 
 [[bench]]
 name = "solve"
