@@ -47,6 +47,53 @@ pub fn resolve(value: &Value, ctx: &ResolveContext) -> Result<ResolvedValue, Cfn
     resolve_inner(value, ctx, 0)
 }
 
+/// Normalize an intrinsic function name to its canonical long-form, or return
+/// `None` if the name is not a known intrinsic.
+///
+/// Both tag-form (`!Sub`, `!Ref`, …) and long-form (`Fn::Sub`, `Ref`, …) are
+/// accepted and mapped to the canonical long-form name. The returned string is
+/// always one of the keys handled in [`dispatch_intrinsic`].
+///
+/// This helper is the single source of truth for "is this name a known
+/// intrinsic?" and is extracted so it can be unit-tested independently.
+fn normalize_intrinsic_name(name: &str) -> Option<&'static str> {
+    match name {
+        "!Ref" | "Ref" => Some("Ref"),
+        "!Sub" | "Fn::Sub" => Some("Fn::Sub"),
+        "!FindInMap" | "Fn::FindInMap" => Some("Fn::FindInMap"),
+        "!Select" | "Fn::Select" => Some("Fn::Select"),
+        "!If" | "Fn::If" => Some("Fn::If"),
+        "!ImportValue" | "Fn::ImportValue" => Some("Fn::ImportValue"),
+        "!Join" | "Fn::Join" => Some("Fn::Join"),
+        "!GetAtt" | "Fn::GetAtt" => Some("Fn::GetAtt"),
+        _ => None,
+    }
+}
+
+/// Dispatch a resolved canonical intrinsic name to its handler.
+///
+/// `canonical` must be a value returned by [`normalize_intrinsic_name`].
+/// `value` is the argument node of the intrinsic.
+fn dispatch_intrinsic(
+    canonical: &str,
+    value: &Value,
+    ctx: &ResolveContext,
+    depth: usize,
+) -> Result<ResolvedValue, CfnError> {
+    match canonical {
+        "Ref" => resolve_ref(value, ctx),
+        "Fn::Sub" => resolve_sub(value, ctx, depth),
+        "Fn::FindInMap" => resolve_find_in_map(value, ctx, depth),
+        "Fn::Select" => resolve_select(value, ctx, depth),
+        "Fn::If" => resolve_if(value, ctx, depth),
+        "Fn::ImportValue" => resolve_import_value(value, ctx, depth),
+        "Fn::Join" => resolve_join(value, ctx, depth),
+        "Fn::GetAtt" => resolve_get_att(value),
+        // Safety: callers must only pass canonical names from normalize_intrinsic_name.
+        other => unreachable!("unknown canonical intrinsic: {other}"),
+    }
+}
+
 /// Depth-aware implementation of [`resolve`].
 ///
 /// `depth` is incremented at every recursive call site. When it exceeds
@@ -64,23 +111,35 @@ fn resolve_inner(
     }
 
     match value {
-        Value::Tagged(tagged) => resolve_tagged(tagged, ctx, depth),
+        Value::Tagged(tagged) => {
+            let tag = tagged.tag.to_string();
+            if let Some(canonical) = normalize_intrinsic_name(tag.as_str()) {
+                dispatch_intrinsic(canonical, &tagged.value, ctx, depth)
+            } else {
+                // Unknown tag — warn and pass through.
+                tracing::warn!(
+                    tag = %tag,
+                    "unknown intrinsic tag encountered; passing through as-is"
+                );
+                Ok(ResolvedValue::Concrete(Value::Tagged(tagged.clone())))
+            }
+        }
         Value::Mapping(map) => {
             // Check for long-form intrinsic functions (e.g., {"Fn::Sub": "..."})
             if map.len() == 1
                 && let Some((key, val)) = map.iter().next()
                 && let Value::String(fn_name) = key
             {
-                match fn_name.as_str() {
-                    "Ref" => return resolve_ref(val, ctx),
-                    "Fn::Sub" => return resolve_sub(val, ctx, depth),
-                    "Fn::FindInMap" => return resolve_find_in_map(val, ctx, depth),
-                    "Fn::Select" => return resolve_select(val, ctx, depth),
-                    "Fn::If" => return resolve_if(val, ctx, depth),
-                    "Fn::ImportValue" => return resolve_import_value(val, ctx, depth),
-                    "Fn::Join" => return resolve_join(val, ctx, depth),
-                    "Fn::GetAtt" => return resolve_get_att(val),
-                    _ => {}
+                if let Some(canonical) = normalize_intrinsic_name(fn_name.as_str()) {
+                    return dispatch_intrinsic(canonical, val, ctx, depth);
+                } else if fn_name.starts_with("Fn::") {
+                    // Single-key map whose key looks like an intrinsic but is
+                    // not one we handle — warn and fall through to the generic
+                    // map resolver below.
+                    tracing::warn!(
+                        fn_name = %fn_name,
+                        "unknown intrinsic function encountered; passing through as-is"
+                    );
                 }
             }
             // Recursively resolve all values in the mapping
@@ -102,28 +161,6 @@ fn resolve_inner(
             Ok(ResolvedValue::Seq(resolved?))
         }
         _ => Ok(ResolvedValue::Concrete(value.clone())),
-    }
-}
-
-fn resolve_tagged(
-    tagged: &serde_yaml_ng::value::TaggedValue,
-    ctx: &ResolveContext,
-    depth: usize,
-) -> Result<ResolvedValue, CfnError> {
-    let tag = tagged.tag.to_string();
-    match tag.as_str() {
-        "!Ref" => resolve_ref(&tagged.value, ctx),
-        "!Sub" => resolve_sub(&tagged.value, ctx, depth),
-        "!FindInMap" => resolve_find_in_map(&tagged.value, ctx, depth),
-        "!Select" => resolve_select(&tagged.value, ctx, depth),
-        "!If" => resolve_if(&tagged.value, ctx, depth),
-        "!ImportValue" => resolve_import_value(&tagged.value, ctx, depth),
-        "!Join" => resolve_join(&tagged.value, ctx, depth),
-        "!GetAtt" => resolve_get_att(&tagged.value),
-        // Return unresolvable tagged values as-is
-        _ => Ok(ResolvedValue::Concrete(Value::Tagged(Box::new(
-            tagged.clone(),
-        )))),
     }
 }
 
@@ -1079,6 +1116,103 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err one level past MAX_INTRINSIC_DEPTH, got: {result:?}"
+        );
+    }
+
+    // --- normalize_intrinsic_name unit tests ---
+
+    /// All tag-form and long-form variants of known intrinsics must return a
+    /// canonical name (not `None`).
+    #[test]
+    fn test_normalize_known_intrinsics_returns_some() {
+        let known = [
+            ("!Ref", "Ref"),
+            ("Ref", "Ref"),
+            ("!Sub", "Fn::Sub"),
+            ("Fn::Sub", "Fn::Sub"),
+            ("!FindInMap", "Fn::FindInMap"),
+            ("Fn::FindInMap", "Fn::FindInMap"),
+            ("!Select", "Fn::Select"),
+            ("Fn::Select", "Fn::Select"),
+            ("!If", "Fn::If"),
+            ("Fn::If", "Fn::If"),
+            ("!ImportValue", "Fn::ImportValue"),
+            ("Fn::ImportValue", "Fn::ImportValue"),
+            ("!Join", "Fn::Join"),
+            ("Fn::Join", "Fn::Join"),
+            ("!GetAtt", "Fn::GetAtt"),
+            ("Fn::GetAtt", "Fn::GetAtt"),
+        ];
+        for (input, expected) in known {
+            assert_eq!(
+                normalize_intrinsic_name(input),
+                Some(expected),
+                "normalize_intrinsic_name({input:?}) should be Some({expected:?})"
+            );
+        }
+    }
+
+    /// Unknown names must return `None`.
+    #[test]
+    fn test_normalize_unknown_intrinsic_returns_none() {
+        let unknown = [
+            "Fn::Base64",
+            "Fn::Cidr",
+            "Fn::Transform",
+            "Fn::Length",
+            "Fn::ToJsonString",
+            "Fn::ForEach",
+            "Fn::Split",
+            "!Base64",
+            "!Split",
+            "SomeRandomKey",
+        ];
+        for name in unknown {
+            assert_eq!(
+                normalize_intrinsic_name(name),
+                None,
+                "normalize_intrinsic_name({name:?}) should be None"
+            );
+        }
+    }
+
+    // --- Unknown intrinsic pass-through (warn) ---
+
+    /// An unknown `!Tag` must pass through as `Concrete` without returning an
+    /// error (silent degradation, but a warning is emitted at runtime).
+    #[test]
+    fn test_unknown_tag_passes_through() {
+        let ctx = make_ctx();
+        let tagged_val = Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
+            tag: serde_yaml_ng::value::Tag::new("!Base64"),
+            value: Value::String("hello".into()),
+        }));
+        let result = resolve(&tagged_val, &ctx);
+        assert!(
+            result.is_ok(),
+            "unknown tag must not return an error, got: {result:?}"
+        );
+        // The returned value must be Concrete (pass-through), not a reference.
+        assert!(
+            result.unwrap().references().is_empty(),
+            "unknown tag pass-through must carry no references"
+        );
+    }
+
+    /// An unknown `Fn::*` single-key map must pass through as a resolved map
+    /// (the key and value are kept) without returning an error.
+    #[test]
+    fn test_unknown_fn_map_passes_through() {
+        let ctx = make_ctx();
+        let mut m = serde_yaml_ng::Mapping::new();
+        m.insert(
+            Value::String("Fn::Transform".into()),
+            Value::String("some-macro".into()),
+        );
+        let result = resolve(&Value::Mapping(m), &ctx);
+        assert!(
+            result.is_ok(),
+            "unknown Fn::* map must not return an error, got: {result:?}"
         );
     }
 }
