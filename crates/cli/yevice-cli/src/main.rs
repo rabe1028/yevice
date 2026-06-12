@@ -319,18 +319,28 @@ fn main() -> Result<()> {
             profile,
             quotas,
             output_format,
-        } => commands::validate(
-            &template,
-            parameters.as_deref(),
-            imports.as_deref(),
-            &params,
-            profile.as_deref(),
-            bindings.as_deref(),
-            quotas.as_deref(),
-            &output_format,
-            &cli.region,
-            cli.input_format.to_command_format(),
-        ),
+        } => {
+            let status = commands::validate(
+                &template,
+                parameters.as_deref(),
+                imports.as_deref(),
+                &params,
+                profile.as_deref(),
+                bindings.as_deref(),
+                quotas.as_deref(),
+                &output_format,
+                &cli.region,
+                cli.input_format.to_command_format(),
+            )?;
+            // Constraint violations are a structured outcome, not an error:
+            // the command's own Result only covers operational failures.
+            // Translate the outcome into the process exit code here, so that
+            // std::process::exit never appears outside main.rs.
+            match status {
+                commands::ValidationStatus::Passed => Ok(()),
+                commands::ValidationStatus::Failed => std::process::exit(1),
+            }
+        }
         Commands::Simulate {
             cost_models,
             profile,

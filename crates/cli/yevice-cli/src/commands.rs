@@ -318,6 +318,18 @@ pub fn sensitivity(
     Ok(())
 }
 
+/// Outcome of a `validate` run that completed without an operational error.
+///
+/// `Failed` means at least one capacity constraint was violated with
+/// [`Severity::Error`]; the caller (main.rs) maps it to a non-zero exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStatus {
+    /// No error-severity violations were found.
+    Passed,
+    /// At least one error-severity violation was found.
+    Failed,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn validate(
     template_path: &str,
@@ -330,7 +342,7 @@ pub fn validate(
     output_format: &str,
     region: &str,
     input_format: Option<InputFormat>,
-) -> Result<()> {
+) -> Result<ValidationStatus> {
     let format = resolve_input_format(template_path, input_format)?;
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
@@ -417,10 +429,10 @@ pub fn validate(
     }
 
     if result.has_errors() {
-        std::process::exit(1);
+        Ok(ValidationStatus::Failed)
+    } else {
+        Ok(ValidationStatus::Passed)
     }
-
-    Ok(())
 }
 
 /// Find the optimal decision-variable assignment that minimizes (or maximizes)
