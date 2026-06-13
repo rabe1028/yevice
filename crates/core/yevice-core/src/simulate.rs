@@ -34,6 +34,7 @@ use serde_yaml_ng::Value;
 use thiserror::Error;
 
 use crate::cost::ArchitectureCost;
+use crate::currency::Money;
 use crate::error::CoreError;
 use crate::evaluate::{Params, evaluate_architecture};
 use crate::io::{ParamValueError, params_from_yaml_map};
@@ -198,17 +199,24 @@ impl SimulationProfile {
 }
 
 /// Simulation result for a single architecture.
+///
+/// Phase 1 simulation is **single-currency**: hourly totals are stored as raw
+/// `f64` because the simulation API is consumed by 24-hour load curves that
+/// don't carry a notion of mixed currency. Multi-currency simulation is
+/// tracked separately; see ADR-0001 scope.
 #[derive(Debug)]
 pub struct ArchSimulation {
     /// Architecture name.
     pub name: String,
-    /// Aggregated monthly cost across all 24 hourly slices.
+    /// Aggregated monthly cost across all 24 hourly slices (sum of all
+    /// currency totals — meaningful only when the architecture is
+    /// single-currency).
     pub total_monthly_cost: f64,
     /// `(hour, monthly-equivalent cost at that hour's load rate)` for each hour.
     pub hourly_costs: Vec<(u32, f64)>,
     /// Per-resource `(label, monthly_cost)` evaluated at `base_params`.
     /// Empty unless `with_base_breakdown` was requested.
-    pub base_resource_costs: Vec<(String, f64)>,
+    pub base_resource_costs: Vec<(String, Money)>,
 }
 
 /// Simulate one architecture's cost over a 24-hour load pattern.
@@ -265,9 +273,10 @@ pub fn simulate_architecture(
             Ok(result) => {
                 // Each of the 24 hourly slices contributes 1/24 of its
                 // monthly-rate cost, independent of days_per_month.
-                let hour_cost = result.total_monthly_cost / 24.0;
+                let monthly = result.naive_total();
+                let hour_cost = monthly / 24.0;
                 total_monthly += hour_cost;
-                hourly_costs.push((hour, result.total_monthly_cost));
+                hourly_costs.push((hour, monthly));
             }
             Err(e) => {
                 return Err(SimulateError::HourEvaluation {

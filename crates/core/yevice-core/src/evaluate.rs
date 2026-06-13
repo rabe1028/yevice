@@ -1,8 +1,16 @@
+use std::collections::BTreeMap;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::cost::{ArchitectureCost, Expr};
+use crate::currency::Money;
 use crate::error::CoreError;
 use crate::types::{ArchitectureName, LogicalId, ResourceType, VariableName};
+
+/// Default fallback currency applied when a `ResourceCost` does not declare
+/// `currency` and components do not override it. See ADR-0001
+/// "後方互換 (migration period)".
+pub const FALLBACK_CURRENCY: &str = "USD";
 
 /// Parameters for cost evaluation: variable name -> value.
 pub type Params = FxHashMap<VariableName, f64>;
@@ -93,22 +101,73 @@ pub fn evaluate(expr: &Expr, params: &Params) -> Result<f64, CoreError> {
 }
 
 /// Result of evaluating a single resource's cost.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResourceResult {
     pub logical_id: LogicalId,
     pub resource_type: ResourceType,
     pub label: String,
-    pub monthly_cost: f64,
-    /// Named cost component breakdown (name, cost).
-    pub component_costs: Vec<(String, f64)>,
+    /// Monthly cost as a runtime-tagged [`Money`] (currency derived from
+    /// `ResourceCost.currency` with USD fallback per ADR-0001).
+    pub monthly_cost: Money,
+    /// Named cost component breakdown (name, money).
+    pub component_costs: Vec<(String, Money)>,
 }
 
 /// Result of evaluating an entire architecture's cost.
-#[derive(Debug)]
+///
+/// `totals_by_currency` holds the per-currency aggregate. `display_total` is
+/// an FX-converted single-currency summary (populated by the CLI when
+/// `--display-currency` is supplied); the evaluator itself leaves it `None`.
+#[derive(Debug, Clone)]
 pub struct ArchitectureResult {
     pub name: ArchitectureName,
     pub resources: Vec<ResourceResult>,
-    pub total_monthly_cost: f64,
+    /// Per-currency monthly totals. Keys are currency codes (e.g. `"USD"`,
+    /// `"JPY"`) and values are the summed monthly amount in that currency.
+    pub totals_by_currency: BTreeMap<String, f64>,
+    /// Optional FX-converted single-currency display total, populated by the
+    /// CLI layer when `--display-currency` is supplied and rates are
+    /// available.
+    pub display_total: Option<Money>,
+}
+
+impl ArchitectureResult {
+    /// `true` when every resource shares the same currency.
+    pub fn is_single_currency(&self) -> bool {
+        self.totals_by_currency.len() <= 1
+    }
+
+    /// Sum of all per-currency totals as a raw `f64`. **Only meaningful in
+    /// single-currency mode** — for multi-currency results, callers must
+    /// either pick `display_total` (after FX conversion) or iterate
+    /// `totals_by_currency`.
+    pub fn naive_total(&self) -> f64 {
+        self.totals_by_currency.values().sum()
+    }
+}
+
+/// Resolve the effective currency for a `ResourceCost.expr` evaluation.
+///
+/// Priority: explicit resource currency → first non-None component currency →
+/// fallback (`FALLBACK_CURRENCY`). When the resource carries no currency at
+/// all, a `tracing::warn!` is emitted once per evaluation; the value is then
+/// treated as USD so legacy `cost_model.json` files still load.
+fn resource_currency(rc: &crate::cost::ResourceCost) -> String {
+    if let Some(c) = &rc.currency {
+        return c.clone();
+    }
+    if let Some(first) = rc.components.iter().find_map(|c| c.currency.clone()) {
+        return first;
+    }
+    tracing::warn!(
+        resource = %rc.logical_id,
+        "ResourceCost.currency is None and no component overrides; falling back to {FALLBACK_CURRENCY}"
+    );
+    FALLBACK_CURRENCY.to_string()
+}
+
+fn component_currency(c: &crate::cost::CostComponent, parent: &str) -> String {
+    c.currency.clone().unwrap_or_else(|| parent.to_string())
 }
 
 /// Evaluate all resource costs in an architecture.
@@ -128,14 +187,18 @@ pub fn evaluate_architecture(
     }
 
     let mut resources = Vec::new();
-    let mut total = 0.0;
+    let mut totals_by_currency: BTreeMap<String, f64> = BTreeMap::new();
 
     for rc in &arch.resources {
-        let component_costs: Vec<(String, f64)> = rc
+        let parent_currency = resource_currency(rc);
+        let component_costs: Vec<(String, Money)> = rc
             .components
             .iter()
             .filter_map(|c| match evaluate(&c.expr, &effective_params) {
-                Ok(v) => Some((c.name.clone(), v)),
+                Ok(v) => Some((
+                    c.name.clone(),
+                    Money::monthly(v, component_currency(c, &parent_currency)),
+                )),
                 Err(e) => {
                     tracing::warn!(
                         component = %c.name,
@@ -149,17 +212,20 @@ pub fn evaluate_architecture(
 
         // Derive total from components when all evaluated successfully; otherwise re-evaluate expr.
         let cost = if component_costs.len() == rc.components.len() && !rc.components.is_empty() {
-            component_costs.iter().map(|(_, v)| v).sum()
+            component_costs.iter().map(|(_, m)| m.value).sum()
         } else {
             evaluate(&rc.expr, &effective_params)?
         };
 
-        total += cost;
+        *totals_by_currency
+            .entry(parent_currency.clone())
+            .or_insert(0.0) += cost;
+
         resources.push(ResourceResult {
             logical_id: rc.logical_id.clone(),
             resource_type: rc.resource_type.clone(),
             label: rc.label.clone(),
-            monthly_cost: cost,
+            monthly_cost: Money::monthly(cost, parent_currency),
             component_costs,
         });
     }
@@ -167,7 +233,8 @@ pub fn evaluate_architecture(
     Ok(ArchitectureResult {
         name: arch.name.clone(),
         resources,
-        total_monthly_cost: total,
+        totals_by_currency,
+        display_total: None,
     })
 }
 
