@@ -518,16 +518,16 @@ fn simulate_header_currency<'a>(
 
 /// Build the hourly load simulation table for `simulate`.
 ///
-/// When `display_currency` is `Some(target)`, hourly cells show the
-/// `display_total`-equivalent rate from `sim.display_total` scaled linearly
-/// (not available per-hour, so the column shows the per-currency hourly rate
-/// broken down). For the hourly cells we use the native per-hour amounts from
-/// `sim.hourly_costs`; when the model is mixed-currency and no
-/// `--display-currency` was given, each cell shows `"mixed"`.
+/// When `conversion` is `Some((rates, target, at))`, every hourly cell is
+/// converted to `target` currency via [`try_convert_money`].  Rows whose
+/// per-hour value cannot be converted (e.g. missing rate) show `"n/a"`.
+/// When `conversion` is `None` and the model has mixed currencies, each cell
+/// shows `"mixed"`.
 pub(crate) fn render_simulate_table(
     arch_results: &[ArchSimulation],
     multiplier_at: impl Fn(u32) -> f64,
     display_currency: Option<&str>,
+    conversion: Option<(&StaticRates, &str, RateDate)>,
 ) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -557,7 +557,13 @@ pub(crate) fn render_simulate_table(
                 .find(|(h, _)| *h == hour)
                 .map(|(_, m)| m)
             {
-                if by_ccy.len() == 1 {
+                if let Some((rates, target, at)) = conversion {
+                    // --display-currency is set: convert the hourly total to target.
+                    match convert_to(by_ccy, target, rates, at) {
+                        Ok(money) => fmt_money(&money),
+                        Err(_) => "n/a".to_string(),
+                    }
+                } else if by_ccy.len() == 1 {
                     let (ccy, &v) = by_ccy.iter().next().unwrap();
                     fmt_amount(v, ccy)
                 } else if by_ccy.is_empty() {
@@ -635,5 +641,157 @@ pub(crate) fn format_number(n: f64) -> String {
         format!("{:.1}K", n / 1_000.0)
     } else {
         format!("{n:.2}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::NaiveDate;
+    use yevice_core::fx::{RateDate, StaticRates};
+    use yevice_core::simulate::ArchSimulation;
+
+    use super::render_simulate_table;
+
+    /// Build a minimal [`ArchSimulation`] with a single currency.
+    fn make_jpy_sim(name: &str, jpy_per_hour: f64) -> ArchSimulation {
+        let mut totals_by_currency = BTreeMap::new();
+        totals_by_currency.insert("JPY".to_string(), jpy_per_hour * 24.0);
+
+        let mut hourly_costs = Vec::new();
+        for hour in 0..24_u32 {
+            let mut by_ccy = BTreeMap::new();
+            by_ccy.insert("JPY".to_string(), jpy_per_hour);
+            hourly_costs.push((hour, by_ccy));
+        }
+
+        ArchSimulation {
+            name: name.to_string(),
+            totals_by_currency,
+            display_total: None,
+            hourly_costs,
+            base_resource_costs: vec![],
+        }
+    }
+
+    /// Build a mixed-currency [`ArchSimulation`] (USD + JPY per hour).
+    fn make_mixed_sim(name: &str, usd_per_hour: f64, jpy_per_hour: f64) -> ArchSimulation {
+        let mut totals_by_currency = BTreeMap::new();
+        totals_by_currency.insert("USD".to_string(), usd_per_hour * 24.0);
+        totals_by_currency.insert("JPY".to_string(), jpy_per_hour * 24.0);
+
+        let mut hourly_costs = Vec::new();
+        for hour in 0..24_u32 {
+            let mut by_ccy = BTreeMap::new();
+            by_ccy.insert("USD".to_string(), usd_per_hour);
+            by_ccy.insert("JPY".to_string(), jpy_per_hour);
+            hourly_costs.push((hour, by_ccy));
+        }
+
+        ArchSimulation {
+            name: name.to_string(),
+            totals_by_currency,
+            display_total: None,
+            hourly_costs,
+            base_resource_costs: vec![],
+        }
+    }
+
+    fn make_rates_jpy_to_usd(rate: f64) -> StaticRates {
+        let mut rates = StaticRates::new();
+        rates.insert("JPY", "USD", rate);
+        rates
+    }
+
+    fn test_date() -> RateDate {
+        RateDate::new(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
+    }
+
+    /// JPY-only model with `--display-currency USD`: hourly cells must show USD values.
+    #[test]
+    fn simulate_hourly_jpy_model_converted_to_usd() {
+        // 1 JPY per hour; JPY=USD rate 0.0067 → ~0.0067 USD per hour.
+        let sim = make_jpy_sim("arch-jpy", 1.0);
+        let rates = make_rates_jpy_to_usd(0.0067);
+        let at = test_date();
+        let conversion = Some((&rates, "USD", at));
+
+        let table = render_simulate_table(&[sim], |_hour| 1.0, Some("USD"), conversion);
+        let rendered = table.to_string();
+
+        // Header should mention USD.
+        assert!(
+            rendered.contains("USD"),
+            "header should contain USD, got:\n{rendered}"
+        );
+        // Each hourly cell should be a dollar amount, not a raw JPY value.
+        // 1 JPY * 0.0067 = 0.0067 USD → renders as "$0.01" (two decimal places).
+        assert!(
+            rendered.contains("$0.01"),
+            "hourly cells should show USD amounts, got:\n{rendered}"
+        );
+        // Must NOT contain raw JPY formatting like "1.00 JPY" in hourly rows.
+        // (The header row might contain "USD" which is fine.)
+        assert!(
+            !rendered.contains("1.00 JPY"),
+            "hourly cells must not contain JPY after conversion, got:\n{rendered}"
+        );
+    }
+
+    /// Mixed-currency model with `--display-currency USD`: all rows should be
+    /// converted to USD, not "mixed".
+    #[test]
+    fn simulate_hourly_mixed_model_converted_to_usd() {
+        // 1.0 USD + 100.0 JPY per hour; with JPY=USD:0.01 → 1.0 + 1.0 = 2.0 USD/hr.
+        let sim = make_mixed_sim("arch-mixed", 1.0, 100.0);
+        let mut rates = StaticRates::new();
+        rates.insert("JPY", "USD", 0.01);
+        rates.insert("USD", "USD", 1.0);
+        let at = test_date();
+        let conversion = Some((&rates, "USD", at));
+
+        let table = render_simulate_table(&[sim], |_hour| 1.0, Some("USD"), conversion);
+        let rendered = table.to_string();
+
+        // Hourly cells must NOT contain "mixed" since conversion is active.
+        // The MONTHLY TOTAL row may still show "mixed (see breakdown)" because
+        // display_total is set by the CLI layer (apply_simulate_display_currency),
+        // not by render_simulate_table itself.  We only verify that the per-hour
+        // cells are converted correctly.
+        assert!(
+            rendered.contains("$2.00"),
+            "hourly cells should show USD dollar amounts ($2.00), got:\n{rendered}"
+        );
+        // The only "mixed" occurrence allowed is in the MONTHLY TOTAL row
+        // ("mixed (see breakdown)").  Individual hourly rows (lines starting with
+        // e.g. "│ 00:00") must not contain "mixed".
+        for line in rendered.lines() {
+            // Lines that contain a time stamp like "│ 00:00" are hourly rows.
+            if line.contains(":00") && !line.contains("MONTHLY") {
+                assert!(
+                    !line.contains("mixed"),
+                    "hourly row must not show 'mixed' when --display-currency is set: {line}"
+                );
+            }
+        }
+    }
+
+    /// Without `--display-currency`, mixed-currency model rows still show "mixed".
+    #[test]
+    fn simulate_hourly_mixed_model_no_conversion_shows_mixed() {
+        let sim = make_mixed_sim("arch-mixed", 1.0, 100.0);
+
+        let table = render_simulate_table(&[sim], |_hour| 1.0, None, None);
+        let rendered = table.to_string();
+
+        assert!(
+            rendered.contains("mixed"),
+            "without --display-currency, mixed rows should show 'mixed', got:\n{rendered}"
+        );
     }
 }

@@ -819,11 +819,16 @@ pub fn simulate(
         arch_results.push(sim);
     }
 
+    // Build the conversion context for hourly cells when --display-currency is set.
+    let at = RateDate::new(Utc::now().date_naive());
+    let conversion = display_currency.map(|target| (&rates, target, at));
+
     // Print hourly breakdown table
     let table = crate::render::render_simulate_table(
         &arch_results,
         |hour| profile.multiplier_at(hour),
         display_currency,
+        conversion,
     );
 
     println!("\nLoad Simulation ({} days/month)", profile.days_per_month);
