@@ -28,7 +28,7 @@
 //! days_per_month: 30
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_yaml_ng::Value;
 use thiserror::Error;
@@ -200,23 +200,59 @@ impl SimulationProfile {
 
 /// Simulation result for a single architecture.
 ///
-/// Phase 1 simulation is **single-currency**: hourly totals are stored as raw
-/// `f64` because the simulation API is consumed by 24-hour load curves that
-/// don't carry a notion of mixed currency. Multi-currency simulation is
-/// tracked separately; see ADR-0001 scope.
+/// `totals_by_currency` holds the per-currency aggregate across all 24 hourly
+/// slices. `display_total` is an FX-converted single-currency summary
+/// (populated by the CLI when `--display-currency` is supplied).
 #[derive(Debug)]
 pub struct ArchSimulation {
     /// Architecture name.
     pub name: String,
-    /// Aggregated monthly cost across all 24 hourly slices (sum of all
-    /// currency totals — meaningful only when the architecture is
-    /// single-currency).
-    pub total_monthly_cost: f64,
-    /// `(hour, monthly-equivalent cost at that hour's load rate)` for each hour.
-    pub hourly_costs: Vec<(u32, f64)>,
+    /// Per-currency aggregated monthly cost across all 24 hourly slices.
+    /// Keys are ISO 4217 currency codes; values are summed monthly amounts.
+    /// For single-currency models this map contains exactly one entry.
+    pub totals_by_currency: BTreeMap<String, f64>,
+    /// Optional FX-converted single-currency display total, populated by the
+    /// CLI layer when `--display-currency` is supplied.
+    pub display_total: Option<Money>,
+    /// `(hour, per-currency totals at that hour's load rate)` for each hour.
+    pub hourly_costs: Vec<(u32, BTreeMap<String, f64>)>,
     /// Per-resource `(label, monthly_cost)` evaluated at `base_params`.
     /// Empty unless `with_base_breakdown` was requested.
     pub base_resource_costs: Vec<(String, Money)>,
+}
+
+impl ArchSimulation {
+    /// `true` when every resource shares the same currency.
+    pub fn is_single_currency(&self) -> bool {
+        self.totals_by_currency.len() <= 1
+    }
+
+    /// Sum of all per-currency totals as a raw `f64`. **Only meaningful in
+    /// single-currency mode** — for multi-currency results, callers must
+    /// either pick `display_total` (after FX conversion) or iterate
+    /// `totals_by_currency`.
+    pub fn naive_total(&self) -> f64 {
+        self.totals_by_currency.values().sum()
+    }
+
+    /// The single currency code when the simulation is single-currency.
+    /// Returns `None` for mixed-currency simulations.
+    pub fn single_currency(&self) -> Option<&str> {
+        if self.totals_by_currency.len() == 1 {
+            self.totals_by_currency.keys().next().map(String::as_str)
+        } else {
+            None
+        }
+    }
+
+    /// The naive total at a specific hour as a raw `f64`. Only meaningful in
+    /// single-currency mode.
+    pub fn naive_hourly_cost(&self, hour: u32) -> f64 {
+        self.hourly_costs
+            .iter()
+            .find(|(h, _)| *h == hour)
+            .map_or(0.0, |(_, m)| m.values().sum())
+    }
 }
 
 /// Simulate one architecture's cost over a 24-hour load pattern.
@@ -235,7 +271,7 @@ pub fn simulate_architecture(
     with_base_breakdown: bool,
 ) -> Result<ArchSimulation, SimulateError> {
     let arch_name = arch.name.to_string();
-    let mut total_monthly = 0.0;
+    let mut totals_by_currency: BTreeMap<String, f64> = BTreeMap::new();
     let mut hourly_costs = Vec::new();
 
     // Evaluate at base_params once for the resource breakdown display.
@@ -272,11 +308,14 @@ pub fn simulate_architecture(
         match evaluate_architecture(arch, &params) {
             Ok(result) => {
                 // Each of the 24 hourly slices contributes 1/24 of its
-                // monthly-rate cost, independent of days_per_month.
-                let monthly = result.naive_total();
-                let hour_cost = monthly / 24.0;
-                total_monthly += hour_cost;
-                hourly_costs.push((hour, monthly));
+                // monthly-rate cost per currency, independent of days_per_month.
+                let mut hour_by_currency: BTreeMap<String, f64> = BTreeMap::new();
+                for (ccy, &monthly_rate) in &result.totals_by_currency {
+                    let hour_cost = monthly_rate / 24.0;
+                    *totals_by_currency.entry(ccy.clone()).or_insert(0.0) += hour_cost;
+                    hour_by_currency.insert(ccy.clone(), monthly_rate);
+                }
+                hourly_costs.push((hour, hour_by_currency));
             }
             Err(e) => {
                 return Err(SimulateError::HourEvaluation {
@@ -290,7 +329,8 @@ pub fn simulate_architecture(
 
     Ok(ArchSimulation {
         name: arch_name,
-        total_monthly_cost: total_monthly,
+        totals_by_currency,
+        display_total: None,
         hourly_costs,
         base_resource_costs,
     })
@@ -395,8 +435,145 @@ hourly_pattern:
 
         let sim = simulate_architecture(&arch, &profile, true).unwrap();
         assert_eq!(sim.name, "empty");
-        assert_eq!(sim.total_monthly_cost, 0.0);
+        assert_eq!(sim.naive_total(), 0.0);
+        assert!(sim.totals_by_currency.is_empty());
         assert_eq!(sim.hourly_costs.len(), 24);
         assert!(sim.base_resource_costs.is_empty());
+        assert!(sim.display_total.is_none());
+    }
+
+    #[test]
+    fn simulates_jpy_only_model_tracks_jpy_currency() {
+        let arch: ArchitectureCost = serde_json::from_value(serde_json::json!({
+            "name": "jpy-arch",
+            "region": "ap-northeast-1",
+            "resources": [
+                {
+                    "logical_id": "Fn",
+                    "resource_type": "AWS::Lambda::Function",
+                    "label": "Lambda: Fn",
+                    "currency": "JPY",
+                    "required_variables": [
+                        { "name": "Fn_requests", "description": "requests", "unit": "requests" }
+                    ],
+                    "optional_variables": [],
+                    "expr": {
+                        "type": "Product",
+                        "exprs": [
+                            { "type": "Variable", "name": "Fn_requests" },
+                            { "type": "Constant", "value": 1.0 }
+                        ]
+                    },
+                    "components": []
+                }
+            ],
+            "bindings": [],
+            "topology": { "nodes": [], "connections": [] }
+        }))
+        .unwrap();
+        let profile = SimulationProfile::from_yaml_str(PROFILE_YAML).unwrap();
+
+        let sim = simulate_architecture(&arch, &profile, false).unwrap();
+        assert_eq!(sim.name, "jpy-arch");
+        // Must be tracked as JPY only — no USD in the map
+        assert_eq!(sim.totals_by_currency.len(), 1);
+        assert!(
+            sim.totals_by_currency.contains_key("JPY"),
+            "expected JPY key"
+        );
+        assert!(
+            !sim.totals_by_currency.contains_key("USD"),
+            "must not have USD key"
+        );
+        assert!(sim.is_single_currency());
+        assert_eq!(sim.single_currency(), Some("JPY"));
+        // naive_total is the JPY sum
+        let jpy_total = sim.totals_by_currency["JPY"];
+        assert!(jpy_total > 0.0, "JPY total should be positive");
+        assert_eq!(sim.naive_total(), jpy_total);
+        assert!(sim.display_total.is_none());
+    }
+
+    #[test]
+    fn simulates_mixed_currency_model_keeps_separate_buckets() {
+        let arch: ArchitectureCost = serde_json::from_value(serde_json::json!({
+            "name": "mixed-arch",
+            "region": "ap-northeast-1",
+            "resources": [
+                {
+                    "logical_id": "FnUsd",
+                    "resource_type": "AWS::Lambda::Function",
+                    "label": "Lambda: FnUsd",
+                    "currency": "USD",
+                    "required_variables": [
+                        { "name": "FnUsd_requests", "description": "requests", "unit": "requests" }
+                    ],
+                    "optional_variables": [],
+                    "expr": {
+                        "type": "Product",
+                        "exprs": [
+                            { "type": "Variable", "name": "FnUsd_requests" },
+                            { "type": "Constant", "value": 0.000001 }
+                        ]
+                    },
+                    "components": []
+                },
+                {
+                    "logical_id": "FnJpy",
+                    "resource_type": "AWS::Lambda::Function",
+                    "label": "Lambda: FnJpy",
+                    "currency": "JPY",
+                    "required_variables": [
+                        { "name": "FnJpy_requests", "description": "requests", "unit": "requests" }
+                    ],
+                    "optional_variables": [],
+                    "expr": {
+                        "type": "Product",
+                        "exprs": [
+                            { "type": "Variable", "name": "FnJpy_requests" },
+                            { "type": "Constant", "value": 1.0 }
+                        ]
+                    },
+                    "components": []
+                }
+            ],
+            "bindings": [],
+            "topology": { "nodes": [], "connections": [] }
+        }))
+        .unwrap();
+
+        // Profile with both variables supplied
+        let profile_yaml = "\
+base_params:
+  FnUsd_requests: 7200
+  FnJpy_requests: 7200
+hourly_pattern:
+  - hour: 0
+    multiplier: 0.5
+  - hour: 12
+    multiplier: 2.0
+scaled_variables:
+  - FnUsd_requests
+  - FnJpy_requests
+days_per_month: 30
+";
+        let profile = SimulationProfile::from_yaml_str(profile_yaml).unwrap();
+
+        let sim = simulate_architecture(&arch, &profile, false).unwrap();
+        assert_eq!(sim.name, "mixed-arch");
+        assert_eq!(
+            sim.totals_by_currency.len(),
+            2,
+            "must have USD and JPY buckets"
+        );
+        assert!(sim.totals_by_currency.contains_key("USD"));
+        assert!(sim.totals_by_currency.contains_key("JPY"));
+        assert!(!sim.is_single_currency());
+        assert_eq!(sim.single_currency(), None);
+        // naive_total() is a raw sum of USD + JPY — only used when mixed is acceptable
+        let usd = sim.totals_by_currency["USD"];
+        let jpy = sim.totals_by_currency["JPY"];
+        assert!((sim.naive_total() - (usd + jpy)).abs() < 1e-9);
+        assert!(sim.display_total.is_none());
     }
 }

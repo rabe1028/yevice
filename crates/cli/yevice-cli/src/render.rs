@@ -490,17 +490,57 @@ pub(crate) fn render_validate_table(violations: &[Violation]) -> Table {
 // simulate
 // ---------------------------------------------------------------------------
 
+/// Determine the display currency string for the column header of a simulate
+/// table. Mirrors the logic used by `eval`/`compare`:
+/// - `display_currency` set → use that code
+/// - all sims are single-currency and share the same code → use it
+/// - otherwise (mixed) → `None` (header shows `"rate/mo"`)
+fn simulate_header_currency<'a>(
+    arch_results: &'a [ArchSimulation],
+    display_currency: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(target) = display_currency {
+        return Some(target);
+    }
+    if arch_results.is_empty() {
+        return None;
+    }
+    let first = arch_results[0].single_currency()?;
+    if arch_results
+        .iter()
+        .all(|s| s.single_currency() == Some(first))
+    {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 /// Build the hourly load simulation table for `simulate`.
+///
+/// When `display_currency` is `Some(target)`, hourly cells show the
+/// `display_total`-equivalent rate from `sim.display_total` scaled linearly
+/// (not available per-hour, so the column shows the per-currency hourly rate
+/// broken down). For the hourly cells we use the native per-hour amounts from
+/// `sim.hourly_costs`; when the model is mixed-currency and no
+/// `--display-currency` was given, each cell shows `"mixed"`.
 pub(crate) fn render_simulate_table(
     arch_results: &[ArchSimulation],
     multiplier_at: impl Fn(u32) -> f64,
+    display_currency: Option<&str>,
 ) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
 
+    let header_ccy = simulate_header_currency(arch_results, display_currency);
+
     let mut header = vec![Cell::new("Hour"), Cell::new("Multiplier")];
     for sim in arch_results {
-        header.push(Cell::new(format!("{} (rate/mo)", sim.name)));
+        let col_label = match header_ccy {
+            Some(ccy) => format!("{} (rate/mo, {})", sim.name, ccy),
+            None => format!("{} (rate/mo)", sim.name),
+        };
+        header.push(Cell::new(col_label));
     }
     table.set_header(header);
 
@@ -511,12 +551,25 @@ pub(crate) fn render_simulate_table(
             Cell::new(format!("{mult:.2}x")),
         ];
         for sim in arch_results {
-            let cost = sim
+            let cell_str = if let Some(by_ccy) = sim
                 .hourly_costs
                 .iter()
                 .find(|(h, _)| *h == hour)
-                .map_or(0.0, |(_, c)| *c);
-            row.push(Cell::new(format!("${cost:.2}")));
+                .map(|(_, m)| m)
+            {
+                if by_ccy.len() == 1 {
+                    let (ccy, &v) = by_ccy.iter().next().unwrap();
+                    fmt_amount(v, ccy)
+                } else if by_ccy.is_empty() {
+                    fmt_amount(0.0, "USD")
+                } else {
+                    // Mixed currencies per hour: show "mixed"
+                    "mixed".to_string()
+                }
+            } else {
+                fmt_amount(0.0, "USD")
+            };
+            row.push(Cell::new(cell_str));
         }
         table.add_row(row);
     }
@@ -524,7 +577,17 @@ pub(crate) fn render_simulate_table(
     // Total row
     let mut total_row = vec![Cell::new("MONTHLY TOTAL").fg(Color::Green), Cell::new("")];
     for sim in arch_results {
-        total_row.push(Cell::new(format!("${:.2}", sim.total_monthly_cost)).fg(Color::Green));
+        let total_str = if let Some(money) = &sim.display_total {
+            fmt_money(money)
+        } else if sim.totals_by_currency.len() > 1 {
+            "mixed (see breakdown)".to_string()
+        } else if sim.totals_by_currency.len() == 1 {
+            let (ccy, &v) = sim.totals_by_currency.iter().next().unwrap();
+            fmt_amount(v, ccy)
+        } else {
+            fmt_amount(0.0, "USD")
+        };
+        total_row.push(Cell::new(total_str).fg(Color::Green));
     }
     table.add_row(total_row);
 
@@ -552,7 +615,7 @@ pub(crate) fn render_simulate_breakdown_table(
                 .base_resource_costs
                 .iter()
                 .find(|(l, _)| l == label)
-                .map_or_else(|| "-".to_string(), |(_, c)| format!("${c:.2}"));
+                .map_or_else(|| "-".to_string(), |(_, c)| fmt_money(c));
             row.push(Cell::new(cost));
         }
         bd_table.add_row(row);

@@ -227,6 +227,14 @@ enum Commands {
         /// Show per-resource cost breakdown in addition to totals.
         #[arg(long)]
         breakdown: bool,
+
+        /// Optional display currency (e.g. `USD`, `JPY`). See `eval --display-currency`.
+        #[arg(long = "display-currency", value_name = "CODE")]
+        display_currency: Option<String>,
+
+        /// Static exchange rate. See `eval --exchange-rate`.
+        #[arg(long = "exchange-rate", value_name = "FROM=TO:RATE")]
+        exchange_rate: Vec<String>,
     },
 
     /// Download and update AWS pricing data for the specified region.
@@ -408,7 +416,15 @@ fn main() -> Result<()> {
             cost_models,
             profile,
             breakdown,
-        } => commands::simulate(&cost_models, &profile, breakdown),
+            display_currency,
+            exchange_rate,
+        } => commands::simulate(
+            &cost_models,
+            &profile,
+            breakdown,
+            display_currency.as_deref(),
+            &exchange_rate,
+        ),
         Commands::UpdatePricing { output_dir } => {
             commands::update_pricing(&cli.region, &output_dir)
         }

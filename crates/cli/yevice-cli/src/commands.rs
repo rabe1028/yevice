@@ -766,44 +766,136 @@ fn load_quotas(path: &str) -> Result<Quotas> {
     yevice_core::io::parse_quotas(&content).with_context(|| format!("invalid quota file: {path}"))
 }
 
+/// Apply `--display-currency` to a simulation result in the same way
+/// `apply_display_currency` does for `ArchitectureResult`.
+///
+/// Populates `sim.display_total` when `display_currency` is `Some` and rates
+/// are available, warns (without error) when the model is mixed-currency and
+/// no `display_currency` was given.
+pub(crate) fn apply_simulate_display_currency(
+    sim: &mut ArchSimulation,
+    display_currency: Option<&str>,
+    rates: &StaticRates,
+) -> Result<()> {
+    let Some(target) = display_currency else {
+        if sim.totals_by_currency.len() > 1 {
+            tracing::warn!(
+                currencies = ?sim.totals_by_currency.keys().collect::<Vec<_>>(),
+                arch = %sim.name,
+                "simulation contains mixed currencies — pass --display-currency to merge into a single total"
+            );
+        }
+        return Ok(());
+    };
+    let at = RateDate::new(Utc::now().date_naive());
+    let money = convert_to(&sim.totals_by_currency, target, rates, at)
+        .map_err(|e| anyhow::anyhow!("failed to apply --display-currency {target}: {e}"))?;
+    sim.display_total = Some(money);
+    Ok(())
+}
+
 /// Simulate cost over time with varying load patterns.
 ///
 /// Reads the load profile and cost models from disk, delegates the actual
 /// simulation to [`yevice_core::simulate`], and renders the result tables.
-pub fn simulate(cost_model_paths: &[String], profile_path: &str, breakdown: bool) -> Result<()> {
+pub fn simulate(
+    cost_model_paths: &[String],
+    profile_path: &str,
+    breakdown: bool,
+    display_currency: Option<&str>,
+    exchange_rates: &[String],
+) -> Result<()> {
     let content = std::fs::read_to_string(profile_path)
         .with_context(|| format!("failed to read: {profile_path}"))?;
     let profile = SimulationProfile::from_yaml_str(&content)?;
 
+    let rates = parse_exchange_rates(exchange_rates)?;
+
     let mut arch_results: Vec<ArchSimulation> = Vec::new();
     for path in cost_model_paths {
         let arch = load_cost_model(path)?;
-        arch_results.push(simulate_architecture(&arch, &profile, breakdown)?);
+        let mut sim = simulate_architecture(&arch, &profile, breakdown)?;
+        apply_simulate_display_currency(&mut sim, display_currency, &rates)?;
+        arch_results.push(sim);
     }
 
     // Print hourly breakdown table
-    let table =
-        crate::render::render_simulate_table(&arch_results, |hour| profile.multiplier_at(hour));
+    let table = crate::render::render_simulate_table(
+        &arch_results,
+        |hour| profile.multiplier_at(hour),
+        display_currency,
+    );
 
     println!("\nLoad Simulation ({} days/month)", profile.days_per_month);
     println!("{table}");
 
-    // Winner
+    // Mixed-currency without --display-currency: print per-currency breakdown.
+    if display_currency.is_none()
+        && arch_results
+            .iter()
+            .any(|sim| sim.totals_by_currency.len() > 1)
+    {
+        println!("\nPer-currency totals (mixed-currency models):");
+        for sim in &arch_results {
+            if sim.totals_by_currency.len() > 1 {
+                println!("  {}", sim.name);
+                for (code, total) in &sim.totals_by_currency {
+                    println!("    {code}: {total:.2}");
+                }
+            }
+        }
+    }
+
+    // Winner (only when both totals are commensurate)
     if arch_results.len() == 2 {
-        let diff = arch_results[1].total_monthly_cost - arch_results[0].total_monthly_cost;
-        if diff > 0.0 {
-            println!(
-                "\n{} is ${:.2}/month cheaper than {}",
-                arch_results[0].name,
-                diff.abs(),
-                arch_results[1].name
-            );
+        let comparable: Option<(f64, String)> = match (
+            &arch_results[0].display_total,
+            &arch_results[1].display_total,
+        ) {
+            (Some(a), Some(b)) if a.currency == b.currency => {
+                Some((b.value - a.value, b.currency.clone()))
+            }
+            _ if arch_results[0].totals_by_currency.len() == 1
+                && arch_results[1].totals_by_currency.len() == 1
+                && arch_results[0].totals_by_currency.keys().next()
+                    == arch_results[1].totals_by_currency.keys().next() =>
+            {
+                let ccy = arch_results[1]
+                    .single_currency()
+                    .unwrap_or("USD")
+                    .to_string();
+                Some((
+                    arch_results[1].naive_total() - arch_results[0].naive_total(),
+                    ccy,
+                ))
+            }
+            _ => None,
+        };
+
+        if let Some((diff, ccy)) = comparable {
+            let (cheaper, pricier, amt) = if diff > 0.0 {
+                (
+                    arch_results[0].name.clone(),
+                    arch_results[1].name.clone(),
+                    diff.abs(),
+                )
+            } else {
+                (
+                    arch_results[1].name.clone(),
+                    arch_results[0].name.clone(),
+                    diff.abs(),
+                )
+            };
+            let amt_str = if ccy == "USD" {
+                format!("${amt:.2}")
+            } else {
+                format!("{amt:.2} {ccy}")
+            };
+            println!("\n{cheaper} is {amt_str}/month cheaper than {pricier}");
         } else {
             println!(
-                "\n{} is ${:.2}/month cheaper than {}",
-                arch_results[1].name,
-                diff.abs(),
-                arch_results[0].name
+                "\nCannot compare totals: architectures have different or mixed currencies. \
+                 Pass --display-currency to convert to a common currency."
             );
         }
     }

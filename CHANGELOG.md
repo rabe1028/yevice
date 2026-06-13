@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeatable `--exchange-rate FROM=TO:RATE` for FX conversion of
   mixed-currency totals. Missing rate → hard error; mixed currencies with no
   `--display-currency` → warning + per-currency breakdown.
+- `yevice simulate` is now currency-aware: `ArchSimulation` tracks
+  `totals_by_currency: BTreeMap<String, f64>` and `display_total: Option<Money>`
+  matching the `eval`/`compare`/`sensitivity` pattern. The `simulate` command
+  accepts `--display-currency` and `--exchange-rate` flags. Mixed-currency
+  models without `--display-currency` print a per-currency breakdown and warn
+  instead of silently summing incompatible amounts. The `$`-hardcoded renderer
+  is replaced by `fmt_money`-based formatting that respects the declared
+  currency (e.g., `¥`-style or `JPY` suffix).
 
 ### Changed (BREAKING — major)
 
