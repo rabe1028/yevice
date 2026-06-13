@@ -3,6 +3,8 @@
 pub mod cfn;
 pub mod common;
 pub mod connection_rules;
+#[macro_use]
+pub mod macros;
 pub mod plugin;
 pub mod pricing_adapter;
 pub mod pricing_provider;
@@ -19,6 +21,20 @@ pub use pricing_adapter::AwsPricingCatalog;
 pub use quotas::AwsQuotaProvider;
 
 /// Register all AWS services, CFN adapters, TF adapters, and connection rules.
+///
+/// The service/adapter table below is the single source of truth for adding a
+/// new AWS service: one row registers the service, its CFN adapter, and
+/// (optionally) its TF adapter. The `register_aws_services!` macro expands
+/// this table into the underlying `register` calls.
+///
+/// Invariants enforced by `tests/registration_consistency.rs`:
+/// - Every row's service appears in `EXPECTED_SERVICE_TO_CFN`.
+/// - Every row's CFN adapter has its resource type listed there.
+/// - Rows with `tf = ...` appear in `EXPECTED_SERVICE_TO_TF`; rows without
+///   `tf = ...` appear in `SERVICES_WITHOUT_TF_ADAPTER`.
+/// - Use `=> shared` for services that piggyback on a CFN/TF adapter already
+///   registered by an earlier row (e.g. `EcsCfnAdapter` covers both
+///   `aws.ecs_fargate` and `aws.ecs_ec2`).
 pub fn register(
     catalog: &mut yevice_service_api::ServiceCatalog,
     cfn: &mut yevice_service_api::CfnAdapterRegistry,
@@ -30,128 +46,101 @@ pub fn register(
     // Quota provider
     catalog.register_quota_provider(Box::new(AwsQuotaProvider));
 
-    // Services
-    catalog.register(services::lambda::LambdaService);
-    catalog.register(services::dynamodb::DynamoDbService);
-    catalog.register(services::kinesis::KinesisService);
-    catalog.register(services::s3::S3Service);
-    catalog.register(services::sqs::SqsService);
-    catalog.register(services::ec2::Ec2Service);
-    catalog.register(services::ecs_fargate::EcsFargateService);
-    catalog.register(services::ecs_ec2::EcsEc2Service);
-    catalog.register(services::ecr::EcrService);
-    catalog.register(services::rds::RdsService);
-    catalog.register(services::opensearch_serverless::OpenSearchServerlessService);
-    catalog.register(services::cloudwatch_logs::CloudWatchLogsService);
-    catalog.register(services::api_gateway::ApiGatewayService);
-    catalog.register(services::nat_gateway::NatGatewayService);
-    catalog.register(services::cloudfront::CloudFrontService);
-    catalog.register(services::elasticache::ElastiCacheService);
-    catalog.register(services::step_functions::StepFunctionsService);
-    catalog.register(services::eventbridge_scheduler::EventBridgeSchedulerService);
-    catalog.register(services::batch::BatchService);
-    catalog.register(services::bedrock::BedrockService);
-    catalog.register(services::alb::AlbService);
-    catalog.register(services::sns::SnsService);
-    catalog.register(services::msk::MskService);
-    catalog.register(services::eks::EksService);
-    catalog.register(services::firehose::FirehoseService);
-    catalog.register(services::secrets_manager::SecretsManagerService);
-    catalog.register(services::waf::WafService);
-    catalog.register(services::efs::EfsService);
-    catalog.register(services::eventbridge_rule::EventBridgeRuleService);
-    catalog.register(services::athena::AthenaService);
-    catalog.register(services::opensearch_service::OpenSearchServiceService);
-    catalog.register(services::documentdb::DocumentDbService);
-    catalog.register(services::glue::GlueService);
-    catalog.register(services::appsync::AppSyncService);
-    catalog.register(services::cognito::CognitoService);
-    catalog.register(services::redshift::RedshiftService);
-    catalog.register(services::route53::Route53Service);
-    catalog.register(services::quicksight::QuickSightService);
-    catalog.register(services::lightsail::LightsailService);
-    catalog.register(services::container_insights::ContainerInsightsService);
-    catalog.register(services::ebs::EbsService);
-    catalog.register(services::vpn::VpnService);
-    catalog.register(services::kendra::KendraService);
-    catalog.register(services::transcribe::TranscribeService);
-    catalog.register(services::fsx_windows::FsxWindowsService);
-    catalog.register(services::directory_service::DirectoryServiceService);
-    catalog.register(services::cloudwatch::CloudWatchService);
-    catalog.register(services::guardduty::GuardDutyService);
-    catalog.register(services::cloudtrail::CloudTrailService);
-    catalog.register(services::backup::BackupService);
-    catalog.register(services::data_transfer::DataTransferService);
+    register_aws_services! {
+        catalog, cfn, tf;
 
-    // CFN adapters
-    cfn.register(cfn::lambda::LambdaCfnAdapter);
-    cfn.register(cfn::dynamodb::DynamoDbCfnAdapter);
-    cfn.register(cfn::kinesis::KinesisCfnAdapter);
-    cfn.register(cfn::s3::S3CfnAdapter);
-    cfn.register(cfn::sqs::SqsCfnAdapter);
-    cfn.register(cfn::ec2::Ec2CfnAdapter);
-    cfn.register(cfn::ecs::EcsCfnAdapter);
-    cfn.register(cfn::ecr::EcrCfnAdapter);
-    cfn.register(cfn::rds::RdsCfnAdapter);
-    cfn.register(cfn::opensearch_serverless::OpenSearchServerlessCfnAdapter);
-    cfn.register(cfn::cloudwatch_logs::CloudWatchLogsCfnAdapter);
-    cfn.register(cfn::api_gateway::ApiGatewayCfnAdapter);
-    cfn.register(cfn::nat_gateway::NatGatewayCfnAdapter);
-    cfn.register(cfn::cloudfront::CloudFrontCfnAdapter);
-    cfn.register(cfn::elasticache::ElastiCacheCfnAdapter);
-    cfn.register(cfn::step_functions::StepFunctionsCfnAdapter);
-    cfn.register(cfn::eventbridge_scheduler::EventBridgeSchedulerCfnAdapter);
-    cfn.register(cfn::batch::BatchCfnAdapter);
-    cfn.register(cfn::bedrock::BedrockCfnAdapter);
-    cfn.register(cfn::alb::AlbCfnAdapter);
-    cfn.register(cfn::sns::SnsCfnAdapter);
-    cfn.register(cfn::msk::MskCfnAdapter);
-    cfn.register(cfn::eks::EksCfnAdapter);
-    cfn.register(cfn::firehose::FirehoseCfnAdapter);
-    cfn.register(cfn::secrets_manager::SecretsManagerCfnAdapter);
-    cfn.register(cfn::waf::WafCfnAdapter);
-    cfn.register(cfn::efs::EfsCfnAdapter);
-    cfn.register(cfn::eventbridge_rule::EventBridgeRuleCfnAdapter);
-    cfn.register(cfn::athena::AthenaCfnAdapter);
-    cfn.register(cfn::opensearch_service::OpenSearchServiceCfnAdapter);
-    cfn.register(cfn::documentdb::DocumentDbCfnAdapter);
-    cfn.register(cfn::glue::GlueCfnAdapter);
-    cfn.register(cfn::appsync::AppSyncCfnAdapter);
-    cfn.register(cfn::cognito::CognitoCfnAdapter);
-    cfn.register(cfn::redshift::RedshiftCfnAdapter);
-    cfn.register(cfn::route53::Route53CfnAdapter);
-    cfn.register(cfn::quicksight::QuickSightCfnAdapter);
-    cfn.register(cfn::lightsail::LightsailCfnAdapter);
-    cfn.register(cfn::container_insights::EcsClusterCfnAdapter);
-    cfn.register(cfn::ebs::EbsCfnAdapter);
-    cfn.register(cfn::vpn::VpnCfnAdapter);
-    cfn.register(cfn::kendra::KendraCfnAdapter);
-    cfn.register(cfn::transcribe::TranscribeCfnAdapter);
-    cfn.register(cfn::fsx_windows::FsxWindowsCfnAdapter);
-    cfn.register(cfn::directory_service::DirectoryServiceCfnAdapter);
-    cfn.register(cfn::cloudwatch::CloudWatchCfnAdapter);
-    cfn.register(cfn::guardduty::GuardDutyCfnAdapter);
-    cfn.register(cfn::cloudtrail::CloudTrailCfnAdapter);
-    cfn.register(cfn::backup::BackupCfnAdapter);
-    cfn.register(cfn::data_transfer::DataTransferCfnAdapter);
+        // --- Services with TF adapters ---
+        services::lambda::LambdaService
+            => cfn = cfn::lambda::LambdaCfnAdapter, tf = tf::lambda::LambdaTfAdapter;
+        services::dynamodb::DynamoDbService
+            => cfn = cfn::dynamodb::DynamoDbCfnAdapter, tf = tf::dynamodb::DynamoDbTfAdapter;
+        services::kinesis::KinesisService
+            => cfn = cfn::kinesis::KinesisCfnAdapter, tf = tf::kinesis::KinesisTfAdapter;
+        services::s3::S3Service
+            => cfn = cfn::s3::S3CfnAdapter, tf = tf::s3::S3TfAdapter;
+        services::sqs::SqsService
+            => cfn = cfn::sqs::SqsCfnAdapter, tf = tf::sqs::SqsTfAdapter;
+        services::ec2::Ec2Service
+            => cfn = cfn::ec2::Ec2CfnAdapter, tf = tf::ec2::Ec2TfAdapter;
+        services::ecs_fargate::EcsFargateService
+            => cfn = cfn::ecs::EcsCfnAdapter, tf = tf::ecs::EcsTfAdapter;
+        // EcsCfnAdapter / EcsTfAdapter already registered above for ecs_fargate.
+        services::ecs_ec2::EcsEc2Service => shared;
+        services::ecr::EcrService
+            => cfn = cfn::ecr::EcrCfnAdapter, tf = tf::ecr::EcrTfAdapter;
+        services::rds::RdsService
+            => cfn = cfn::rds::RdsCfnAdapter, tf = tf::rds::RdsTfAdapter;
+        services::opensearch_serverless::OpenSearchServerlessService
+            => cfn = cfn::opensearch_serverless::OpenSearchServerlessCfnAdapter,
+               tf = tf::opensearch_serverless::OpenSearchServerlessTfAdapter;
+        services::cloudwatch_logs::CloudWatchLogsService
+            => cfn = cfn::cloudwatch_logs::CloudWatchLogsCfnAdapter,
+               tf = tf::cloudwatch_logs::CloudWatchLogsTfAdapter;
+        services::api_gateway::ApiGatewayService
+            => cfn = cfn::api_gateway::ApiGatewayCfnAdapter,
+               tf = tf::api_gateway::ApiGatewayTfAdapter;
+        services::nat_gateway::NatGatewayService
+            => cfn = cfn::nat_gateway::NatGatewayCfnAdapter,
+               tf = tf::nat_gateway::NatGatewayTfAdapter;
+        services::cloudfront::CloudFrontService
+            => cfn = cfn::cloudfront::CloudFrontCfnAdapter,
+               tf = tf::cloudfront::CloudFrontTfAdapter;
+        services::elasticache::ElastiCacheService
+            => cfn = cfn::elasticache::ElastiCacheCfnAdapter,
+               tf = tf::elasticache::ElastiCacheTfAdapter;
+        services::step_functions::StepFunctionsService
+            => cfn = cfn::step_functions::StepFunctionsCfnAdapter,
+               tf = tf::step_functions::StepFunctionsTfAdapter;
+        services::eventbridge_scheduler::EventBridgeSchedulerService
+            => cfn = cfn::eventbridge_scheduler::EventBridgeSchedulerCfnAdapter,
+               tf = tf::eventbridge_scheduler::EventBridgeSchedulerTfAdapter;
+        services::batch::BatchService
+            => cfn = cfn::batch::BatchCfnAdapter, tf = tf::batch::BatchTfAdapter;
 
-    // TF adapters (subset — adapters with no corresponding tf/ file are omitted)
-    tf.register(tf::lambda::LambdaTfAdapter);
-    tf.register(tf::dynamodb::DynamoDbTfAdapter);
-    tf.register(tf::kinesis::KinesisTfAdapter);
-    tf.register(tf::s3::S3TfAdapter);
-    tf.register(tf::sqs::SqsTfAdapter);
-    tf.register(tf::ec2::Ec2TfAdapter);
-    tf.register(tf::ecs::EcsTfAdapter);
-    tf.register(tf::ecr::EcrTfAdapter);
-    tf.register(tf::rds::RdsTfAdapter);
-    tf.register(tf::opensearch_serverless::OpenSearchServerlessTfAdapter);
-    tf.register(tf::cloudwatch_logs::CloudWatchLogsTfAdapter);
-    tf.register(tf::api_gateway::ApiGatewayTfAdapter);
-    tf.register(tf::nat_gateway::NatGatewayTfAdapter);
-    tf.register(tf::cloudfront::CloudFrontTfAdapter);
-    tf.register(tf::elasticache::ElastiCacheTfAdapter);
-    tf.register(tf::step_functions::StepFunctionsTfAdapter);
-    tf.register(tf::eventbridge_scheduler::EventBridgeSchedulerTfAdapter);
-    tf.register(tf::batch::BatchTfAdapter);
+        // --- Services without TF adapters (see registration_consistency tests) ---
+        services::bedrock::BedrockService     => cfn = cfn::bedrock::BedrockCfnAdapter;
+        services::alb::AlbService             => cfn = cfn::alb::AlbCfnAdapter;
+        services::sns::SnsService             => cfn = cfn::sns::SnsCfnAdapter;
+        services::msk::MskService             => cfn = cfn::msk::MskCfnAdapter;
+        services::eks::EksService             => cfn = cfn::eks::EksCfnAdapter;
+        services::firehose::FirehoseService   => cfn = cfn::firehose::FirehoseCfnAdapter;
+        services::secrets_manager::SecretsManagerService
+            => cfn = cfn::secrets_manager::SecretsManagerCfnAdapter;
+        services::waf::WafService             => cfn = cfn::waf::WafCfnAdapter;
+        services::efs::EfsService             => cfn = cfn::efs::EfsCfnAdapter;
+        services::eventbridge_rule::EventBridgeRuleService
+            => cfn = cfn::eventbridge_rule::EventBridgeRuleCfnAdapter;
+        services::athena::AthenaService       => cfn = cfn::athena::AthenaCfnAdapter;
+        services::opensearch_service::OpenSearchServiceService
+            => cfn = cfn::opensearch_service::OpenSearchServiceCfnAdapter;
+        services::documentdb::DocumentDbService
+            => cfn = cfn::documentdb::DocumentDbCfnAdapter;
+        services::glue::GlueService           => cfn = cfn::glue::GlueCfnAdapter;
+        services::appsync::AppSyncService     => cfn = cfn::appsync::AppSyncCfnAdapter;
+        services::cognito::CognitoService     => cfn = cfn::cognito::CognitoCfnAdapter;
+        services::redshift::RedshiftService   => cfn = cfn::redshift::RedshiftCfnAdapter;
+        services::route53::Route53Service     => cfn = cfn::route53::Route53CfnAdapter;
+        services::quicksight::QuickSightService
+            => cfn = cfn::quicksight::QuickSightCfnAdapter;
+        services::lightsail::LightsailService => cfn = cfn::lightsail::LightsailCfnAdapter;
+        services::container_insights::ContainerInsightsService
+            => cfn = cfn::container_insights::EcsClusterCfnAdapter;
+        services::ebs::EbsService             => cfn = cfn::ebs::EbsCfnAdapter;
+        services::vpn::VpnService             => cfn = cfn::vpn::VpnCfnAdapter;
+        services::kendra::KendraService       => cfn = cfn::kendra::KendraCfnAdapter;
+        services::transcribe::TranscribeService
+            => cfn = cfn::transcribe::TranscribeCfnAdapter;
+        services::fsx_windows::FsxWindowsService
+            => cfn = cfn::fsx_windows::FsxWindowsCfnAdapter;
+        services::directory_service::DirectoryServiceService
+            => cfn = cfn::directory_service::DirectoryServiceCfnAdapter;
+        services::cloudwatch::CloudWatchService
+            => cfn = cfn::cloudwatch::CloudWatchCfnAdapter;
+        services::guardduty::GuardDutyService => cfn = cfn::guardduty::GuardDutyCfnAdapter;
+        services::cloudtrail::CloudTrailService
+            => cfn = cfn::cloudtrail::CloudTrailCfnAdapter;
+        services::backup::BackupService       => cfn = cfn::backup::BackupCfnAdapter;
+        services::data_transfer::DataTransferService
+            => cfn = cfn::data_transfer::DataTransferCfnAdapter;
+    }
 }
