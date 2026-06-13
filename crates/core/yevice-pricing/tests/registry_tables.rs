@@ -1,5 +1,5 @@
-use yevice_core::cost::Tier;
-use yevice_pricing::{PriceRecord, Sku, gcp_hardcoded_pricing, registry::PricingRegistry};
+use yevice_pricing::PricedTier;
+use yevice_pricing::{PricedValue, Sku, gcp_hardcoded_pricing, registry::PricingRegistry};
 
 fn assert_close(actual: f64, expected: f64) {
     assert!(
@@ -14,21 +14,26 @@ fn sku_display_and_price_record_helpers_preserve_values() {
     assert_eq!(sku.as_str(), "aws.lambda.requests");
     assert_eq!(sku.to_string(), "aws.lambda.requests");
 
-    let flat = PriceRecord::flat(0.42);
-    assert_close(flat.as_flat().unwrap(), 0.42);
+    let flat = PricedValue::scalar(0.42, "USD");
+    assert_close(flat.as_scalar().unwrap(), 0.42);
 
     let tiers = vec![
-        Tier {
+        PricedTier {
             upper_limit: Some(1_000.0),
             unit_price: 0.10,
         },
-        Tier {
+        PricedTier {
             upper_limit: None,
             unit_price: 0.08,
         },
     ];
-    let tiered = PriceRecord::tiered(tiers.clone());
-    assert_eq!(tiered.as_tiered().unwrap(), tiers.as_slice());
+    let tiered = PricedValue::tiered(tiers.clone(), "USD");
+    let got = tiered.as_tiered().unwrap();
+    assert_eq!(got.len(), tiers.len());
+    for (a, b) in got.iter().zip(tiers.iter()) {
+        assert_eq!(a.upper_limit, b.upper_limit);
+        assert_eq!(a.unit_price, b.unit_price);
+    }
 }
 
 #[test]

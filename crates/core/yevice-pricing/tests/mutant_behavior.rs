@@ -1,6 +1,6 @@
-use yevice_core::cost::Tier;
+use yevice_pricing::PricedTier;
 use yevice_pricing::{
-    PriceRecord, Sku, catalog::PriceCatalog, error::PricingError, gcp_hardcoded_pricing,
+    PricedValue, Sku, catalog::PriceCatalog, error::PricingError, gcp_hardcoded_pricing,
 };
 
 fn assert_close(actual: f64, expected: f64) {
@@ -17,19 +17,22 @@ impl PriceCatalog for LookupCatalog {
         "test"
     }
 
-    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+    fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
         match sku.as_str() {
-            "flat" => Ok(PriceRecord::flat(2.7)),
-            "tiered" => Ok(PriceRecord::tiered(vec![
-                Tier {
-                    upper_limit: Some(4.0),
-                    unit_price: 0.2,
-                },
-                Tier {
-                    upper_limit: None,
-                    unit_price: 0.6,
-                },
-            ])),
+            "flat" => Ok(PricedValue::scalar(2.7, "USD")),
+            "tiered" => Ok(PricedValue::tiered(
+                vec![
+                    PricedTier {
+                        upper_limit: Some(4.0),
+                        unit_price: 0.2,
+                    },
+                    PricedTier {
+                        upper_limit: None,
+                        unit_price: 0.6,
+                    },
+                ],
+                "USD",
+            )),
             other => Err(PricingError::NotFound {
                 service: other.to_string(),
                 region: "test".to_string(),
