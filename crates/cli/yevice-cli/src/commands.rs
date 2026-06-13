@@ -10,6 +10,7 @@ use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
+use yevice_core::parse_policy::{ParsePolicy, Severity as DiagSeverity};
 use yevice_core::resource::Provider;
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
@@ -63,6 +64,11 @@ pub fn generate(
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
     let cfn_inputs = load_cfn_inputs(parameters_path, imports_path)?;
+    let policy = if strict {
+        ParsePolicy::Strict
+    } else {
+        ParsePolicy::Lenient
+    };
     let request = GenerateRequest {
         format,
         template_path: Path::new(template_path),
@@ -72,8 +78,16 @@ pub fn generate(
         provider_regions,
         strict,
         list_price,
+        policy,
     };
-    let mut cost_model = yevice_engine::generate_cost_model(&provider_plugins(), &request)?;
+    let outcome = yevice_engine::generate_cost_model(&provider_plugins(), &request)?;
+    let had_errors = outcome.had_errors;
+    let mut cost_model = outcome.value;
+
+    // Surface diagnostics to the operator regardless of policy (Lenient
+    // succeeds; Strict aborts later if any Error-severity diagnostic is
+    // present). This matches ADR-0003 "stderr に tracing::warn! で表示".
+    report_diagnostics(&cost_model.diagnostics);
 
     if format == InputFormat::Cfn
         && let Some(path) = bindings_path
@@ -104,7 +118,42 @@ pub fn generate(
     println!("Generated: {output_path}");
     println!("Schema:    {}", schema_path.display());
     println!("Template:  {}", template_path_out.display());
+
+    // Under Strict, any Error-severity parse diagnostic that survived (e.g. a
+    // hard error that the parser still wanted to demote) is fatal. Under
+    // Lenient `had_errors` is informational only and does not change the
+    // exit code (ADR-0003 終了コード section).
+    if strict && had_errors {
+        bail!("strict mode: IaC parse produced error-severity diagnostics");
+    }
     Ok(())
+}
+
+/// Emit each diagnostic to stderr via `tracing` so operators see them even
+/// without `--strict`. Severity is mapped to `error!` / `warn!` / `info!`.
+fn report_diagnostics(diagnostics: &[yevice_core::parse_policy::IacParseDiagnostic]) {
+    for d in diagnostics {
+        match d.severity {
+            DiagSeverity::Error => tracing::error!(
+                source = ?d.source,
+                code = %d.code,
+                "{}",
+                d.message
+            ),
+            DiagSeverity::Warning => tracing::warn!(
+                source = ?d.source,
+                code = %d.code,
+                "{}",
+                d.message
+            ),
+            DiagSeverity::Info => tracing::info!(
+                source = ?d.source,
+                code = %d.code,
+                "{}",
+                d.message
+            ),
+        }
+    }
 }
 
 pub fn evaluate(cost_model_path: &str, params_path: &str, breakdown: bool) -> Result<()> {
@@ -280,20 +329,32 @@ pub fn validate(
     output_format: &str,
     region: &str,
     input_format: Option<InputFormat>,
+    strict: bool,
 ) -> Result<ValidationStatus> {
     let format = resolve_input_format(template_path, input_format)?;
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
     let registries = yevice_engine::build_registries(&provider_plugins());
     let cfn_inputs = load_cfn_inputs(parameters_path, imports_path)?;
-    let architecture = yevice_engine::build_architecture_from_input(
+    let policy = if strict {
+        ParsePolicy::Strict
+    } else {
+        ParsePolicy::Lenient
+    };
+    let arch_outcome = yevice_engine::build_architecture_from_input_with_policy(
         format,
         Path::new(template_path),
         &cfn_inputs,
         (format != InputFormat::Wrangler).then_some("validate"),
         region,
         &registries,
+        policy,
     )?;
+    report_diagnostics(&arch_outcome.diagnostics);
+    if strict && arch_outcome.had_errors {
+        bail!("strict mode: IaC parse produced error-severity diagnostics");
+    }
+    let architecture = arch_outcome.value;
     let catalog = registries.catalog;
 
     let quotas = match quotas_path {

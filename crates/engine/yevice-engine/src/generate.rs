@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use yevice_core::cost::ArchitectureCost;
+use yevice_core::parse_policy::{ParseOutcome, ParsePolicy};
 use yevice_core::resource::Provider;
 use yevice_service_api::ProviderPlugin;
 
-use crate::architecture::{CfnInputs, build_architecture_from_input};
+use crate::architecture::{CfnInputs, build_architecture_from_input_with_policy};
 use crate::error::EngineError;
 use crate::input::InputFormat;
 use crate::registry::{build_pricing_resolver, build_registries};
@@ -30,6 +31,8 @@ pub struct GenerateRequest<'a> {
     pub strict: bool,
     /// Ignore promotional free-tier allowances in pricing catalogs.
     pub list_price: bool,
+    /// Parse-failure policy applied to IaC parsers (ADR-0003).
+    pub policy: ParsePolicy,
 }
 
 /// Run the full generate pipeline: parse the IaC input, build the
@@ -37,31 +40,42 @@ pub struct GenerateRequest<'a> {
 /// catalogs for the providers present, and build the cost model.
 ///
 /// Provider support is injected through `plugins`; the engine itself is
-/// provider-agnostic.
+/// provider-agnostic. The returned [`ParseOutcome`] carries any
+/// IaC parse diagnostics collected under
+/// [`ParsePolicy::Lenient`](yevice_core::parse_policy::ParsePolicy::Lenient).
 pub fn generate_cost_model(
     plugins: &[Box<dyn ProviderPlugin>],
     request: &GenerateRequest<'_>,
-) -> Result<ArchitectureCost, EngineError> {
+) -> Result<ParseOutcome<ArchitectureCost>, EngineError> {
     let registries = build_registries(plugins);
-    let architecture = build_architecture_from_input(
+    let arch_outcome = build_architecture_from_input_with_policy(
         request.format,
         request.template_path,
         &request.cfn_inputs,
         Some(request.name),
         request.region,
         &registries,
+        request.policy,
     )?;
 
     let pricing = build_pricing_resolver(
         plugins,
-        &architecture,
+        &arch_outcome.value,
         request.region,
         request.provider_regions,
         request.list_price,
     );
 
-    registries
+    let mut cost_model = registries
         .catalog
-        .build_cost_model(&architecture, &pricing, request.strict)
-        .map_err(EngineError::CostModel)
+        .build_cost_model(&arch_outcome.value, &pricing, request.strict)
+        .map_err(EngineError::CostModel)?;
+    // Embed diagnostics into the cost model so `cost_model.json` carries
+    // them (ADR-0003 JSON 出力 section).
+    cost_model.diagnostics.clone_from(&arch_outcome.diagnostics);
+    Ok(ParseOutcome {
+        value: cost_model,
+        diagnostics: arch_outcome.diagnostics,
+        had_errors: arch_outcome.had_errors,
+    })
 }

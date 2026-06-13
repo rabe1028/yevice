@@ -1656,6 +1656,7 @@ dependencies = [
  "comfy-table",
  "serde_json",
  "serde_yaml_ng",
+ "tracing",
  "tracing-subscriber",
  "yevice-cfn",
  "yevice-core",

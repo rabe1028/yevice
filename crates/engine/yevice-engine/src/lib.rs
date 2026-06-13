@@ -27,8 +27,9 @@ pub mod input;
 pub mod registry;
 
 pub use architecture::{
-    CfnInputs, build_architecture_from_input, resolve_cfn_template, resolve_cfn_template_str,
-    resolve_tf_input,
+    CfnInputs, build_architecture_from_input, build_architecture_from_input_with_policy,
+    resolve_cfn_template, resolve_cfn_template_str, resolve_cfn_template_str_with_policy,
+    resolve_cfn_template_with_policy, resolve_tf_input, resolve_tf_input_with_policy,
 };
 pub use error::EngineError;
 pub use generate::{GenerateRequest, generate_cost_model};
