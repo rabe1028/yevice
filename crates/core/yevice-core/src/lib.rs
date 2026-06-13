@@ -10,6 +10,7 @@ pub mod expr_parser;
 pub mod fx;
 pub mod io;
 pub mod optimize;
+pub mod parse_policy;
 pub mod resource;
 pub mod schema;
 pub mod simulate;
@@ -21,6 +22,9 @@ pub use expr_introspect::LinearForm;
 pub use fx::{ExchangeRates, FxError, Rate, RateDate, StaticRates, convert_to};
 pub use optimize::{
     DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
+};
+pub use parse_policy::{
+    DiagnosticSource, IacParseDiagnostic, ParseOutcome, ParsePolicy, Severity, SourceLocation,
 };
 pub use topology::{Topology, TopologyNode};
 

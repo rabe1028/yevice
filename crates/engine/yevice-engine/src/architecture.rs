@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use yevice_core::parse_policy::{ParseOutcome, ParsePolicy};
 use yevice_core::resource::Architecture;
 
 use crate::DEFAULT_ARCHITECTURE_NAME;
@@ -25,42 +26,81 @@ pub struct CfnInputs {
 
 /// Parse and resolve a CloudFormation template from a file path.
 ///
-/// Path-based convenience over [`resolve_cfn_template_str`].
+/// Path-based convenience over [`resolve_cfn_template_str`]. Defaults to
+/// [`ParsePolicy::Strict`] to preserve the historical CFN-side "hard
+/// failure on missing parameter / unresolved import value / unknown
+/// mapping key" semantics for callers that have not migrated to the
+/// policy-aware API yet. New callers should prefer
+/// [`resolve_cfn_template_with_policy`].
 pub fn resolve_cfn_template(
     template_path: &Path,
     inputs: &CfnInputs,
 ) -> Result<yevice_cfn::parser::ResolvedTemplate, EngineError> {
+    let outcome = resolve_cfn_template_with_policy(template_path, inputs, ParsePolicy::Strict)?;
+    Ok(outcome.value)
+}
+
+/// Parse and resolve a CloudFormation template from a file path under the
+/// given [`ParsePolicy`], returning structured diagnostics.
+pub fn resolve_cfn_template_with_policy(
+    template_path: &Path,
+    inputs: &CfnInputs,
+    policy: ParsePolicy,
+) -> Result<ParseOutcome<yevice_cfn::parser::ResolvedTemplate>, EngineError> {
     let template =
         yevice_cfn::parser::parse_template(template_path).map_err(EngineError::CfnParse)?;
-    resolve_parsed_template(template, inputs)
+    resolve_parsed_template(template, inputs, policy, Some(template_path))
 }
 
 /// Parse and resolve a CloudFormation template from YAML text.
 ///
 /// String-based core of [`resolve_cfn_template`], suitable for hosts that
-/// receive templates over the wire instead of from the filesystem.
+/// receive templates over the wire instead of from the filesystem. Defaults
+/// to [`ParsePolicy::Strict`].
 pub fn resolve_cfn_template_str(
     template_src: &str,
     inputs: &CfnInputs,
 ) -> Result<yevice_cfn::parser::ResolvedTemplate, EngineError> {
+    let outcome = resolve_cfn_template_str_with_policy(template_src, inputs, ParsePolicy::Strict)?;
+    Ok(outcome.value)
+}
+
+/// String-based variant of [`resolve_cfn_template_with_policy`].
+pub fn resolve_cfn_template_str_with_policy(
+    template_src: &str,
+    inputs: &CfnInputs,
+    policy: ParsePolicy,
+) -> Result<ParseOutcome<yevice_cfn::parser::ResolvedTemplate>, EngineError> {
     let template =
         yevice_cfn::parser::parse_template_str(template_src).map_err(EngineError::CfnParse)?;
-    resolve_parsed_template(template, inputs)
+    resolve_parsed_template(template, inputs, policy, None)
 }
 
 fn resolve_parsed_template(
     template: yevice_cfn::parser::CfnTemplate,
     inputs: &CfnInputs,
-) -> Result<yevice_cfn::parser::ResolvedTemplate, EngineError> {
-    let resolved =
-        yevice_cfn::parser::resolve_template(&template, &inputs.parameters, &inputs.imports)
-            .map_err(EngineError::CfnResolve)?;
+    policy: ParsePolicy,
+    template_path: Option<&Path>,
+) -> Result<ParseOutcome<yevice_cfn::parser::ResolvedTemplate>, EngineError> {
+    let outcome = yevice_cfn::parser::resolve_template_with_policy(
+        &template,
+        &inputs.parameters,
+        &inputs.imports,
+        policy,
+        template_path,
+    )
+    .map_err(EngineError::CfnResolve)?;
 
-    Ok(yevice_cfn::parser::CfnTemplate {
+    let resolved_template = yevice_cfn::parser::CfnTemplate {
         parameters: template.parameters,
         mappings: template.mappings,
         conditions: template.conditions,
-        resources: resolved,
+        resources: outcome.value,
+    };
+    Ok(ParseOutcome {
+        value: resolved_template,
+        diagnostics: outcome.diagnostics,
+        had_errors: outcome.had_errors,
     })
 }
 
@@ -69,6 +109,16 @@ fn resolve_parsed_template(
 /// `architecture_name` falls back to [`DEFAULT_ARCHITECTURE_NAME`] when
 /// `None`. For Wrangler inputs the name embedded in the config wins unless an
 /// explicit non-default name is supplied.
+///
+/// The policy default is **per-format** and matches pre-#38 behaviour:
+///
+/// * CFN: [`ParsePolicy::Strict`] (historical hard-fail on
+///   `MissingParameters` / `ImportValueNotFound` / `MappingNotFound`).
+/// * TF: [`ParsePolicy::Lenient`] (unresolved `var.*` / `local.*` stay
+///   `VarRef` / `LocalRef`; adapters fall back to defaults).
+/// * Wrangler: no policy-controllable variants; policy is moot.
+///
+/// New callers should prefer [`build_architecture_from_input_with_policy`].
 pub fn build_architecture_from_input(
     format: InputFormat,
     template_path: &Path,
@@ -77,48 +127,91 @@ pub fn build_architecture_from_input(
     region: &str,
     registries: &Registries,
 ) -> Result<Architecture, EngineError> {
+    let policy = match format {
+        InputFormat::Cfn => ParsePolicy::Strict,
+        InputFormat::Tf | InputFormat::Wrangler => ParsePolicy::Lenient,
+    };
+    let outcome = build_architecture_from_input_with_policy(
+        format,
+        template_path,
+        cfn_inputs,
+        architecture_name,
+        region,
+        registries,
+        policy,
+    )?;
+    Ok(outcome.value)
+}
+
+/// Policy-aware variant of [`build_architecture_from_input`].
+///
+/// Returns a [`ParseOutcome`] so callers can surface IaC parse diagnostics
+/// alongside the constructed architecture.
+pub fn build_architecture_from_input_with_policy(
+    format: InputFormat,
+    template_path: &Path,
+    cfn_inputs: &CfnInputs,
+    architecture_name: Option<&str>,
+    region: &str,
+    registries: &Registries,
+    policy: ParsePolicy,
+) -> Result<ParseOutcome<Architecture>, EngineError> {
     match format {
         InputFormat::Cfn => {
-            let resolved_template = resolve_cfn_template(template_path, cfn_inputs)?;
-            Ok(yevice_cfn::convert::build_architecture(
+            let template_outcome =
+                resolve_cfn_template_with_policy(template_path, cfn_inputs, policy)?;
+            let architecture = yevice_cfn::convert::build_architecture(
                 architecture_name.unwrap_or(DEFAULT_ARCHITECTURE_NAME),
                 region,
-                &resolved_template,
+                &template_outcome.value,
                 &registries.cfn_adapters,
-            ))
+            );
+            Ok(ParseOutcome {
+                value: architecture,
+                diagnostics: template_outcome.diagnostics,
+                had_errors: template_outcome.had_errors,
+            })
         }
         InputFormat::Tf => {
-            let resolved = resolve_tf_input(template_path)?;
-            if detect_tf_provider(&resolved) == TfProvider::Unknown {
+            let resolved_outcome = resolve_tf_input_with_policy(template_path, policy)?;
+            if detect_tf_provider(&resolved_outcome.value) == TfProvider::Unknown {
                 return Err(EngineError::UnknownTfProvider {
                     path: template_path.to_path_buf(),
                 });
             }
 
-            Ok(yevice_tf::build_architecture(
+            let architecture = yevice_tf::build_architecture(
                 architecture_name.unwrap_or(DEFAULT_ARCHITECTURE_NAME),
                 region,
-                &resolved,
+                &resolved_outcome.value,
                 &registries.tf_adapters,
-            ))
+            );
+            Ok(ParseOutcome {
+                value: architecture,
+                diagnostics: resolved_outcome.diagnostics,
+                had_errors: resolved_outcome.had_errors,
+            })
         }
         InputFormat::Wrangler => {
             let wrangler_path = resolve_wrangler_input_path(template_path)?;
-            let mut architecture =
-                yevice_wrangler::parse_wrangler(&wrangler_path).map_err(|source| {
-                    EngineError::WranglerParse {
-                        path: wrangler_path.clone(),
-                        source,
-                    }
+            let outcome = yevice_wrangler::parse_wrangler_with_policy(&wrangler_path, policy)
+                .map_err(|source| EngineError::WranglerParse {
+                    path: wrangler_path.clone(),
+                    source,
                 })?;
 
+            let mut architecture = outcome.value;
             if let Some(name_override) =
                 architecture_name.filter(|name| *name != DEFAULT_ARCHITECTURE_NAME)
             {
                 architecture.name = name_override.to_string();
             }
 
-            Ok(architecture)
+            Ok(ParseOutcome {
+                value: architecture,
+                diagnostics: outcome.diagnostics,
+                had_errors: outcome.had_errors,
+            })
         }
     }
 }
@@ -134,6 +227,21 @@ pub fn build_architecture_from_input(
 ///
 /// (HCL `.tfvars` only; the JSON variants are not parsed here.)
 pub fn resolve_tf_input(path: &Path) -> Result<yevice_tf::ResolvedConfig, EngineError> {
+    // Lenient (default policy) preserves the pre-#38 Terraform UX: variables
+    // without default + no tfvars value stay as `VarRef` and adapter
+    // defaults fill in. Callers that want structured diagnostics or strict
+    // failure should use `resolve_tf_input_with_policy`.
+    let outcome = resolve_tf_input_with_policy(path, ParsePolicy::Lenient)?;
+    Ok(outcome.value)
+}
+
+/// Policy-aware variant of [`resolve_tf_input`] that returns a
+/// [`ParseOutcome`] carrying any structured Terraform diagnostics
+/// (unresolved `var.*` / `local.*` under Lenient).
+pub fn resolve_tf_input_with_policy(
+    path: &Path,
+    policy: ParsePolicy,
+) -> Result<ParseOutcome<yevice_tf::ResolvedConfig>, EngineError> {
     let config_dir = terraform_config_dir(path)?;
     let config = yevice_tf::parse_tf_dir(config_dir).map_err(|source| EngineError::TfParse {
         path: config_dir.to_path_buf(),
@@ -180,7 +288,7 @@ pub fn resolve_tf_input(path: &Path) -> Result<yevice_tf::ResolvedConfig, Engine
         Some(merged)
     };
 
-    yevice_tf::resolve_config(config, tfvars).map_err(EngineError::TfResolve)
+    yevice_tf::resolve_config_with_policy(config, tfvars, policy).map_err(EngineError::TfResolve)
 }
 
 fn terraform_config_dir(path: &Path) -> Result<&Path, EngineError> {

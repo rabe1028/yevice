@@ -16,6 +16,17 @@ categories = ["development-tools"]
 yevice-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# HiGHS LP/MIP backend, gated behind the `highs` feature. `highs-sys` vendors
+# the HiGHS C++ sources and builds them statically by default (needs a C++
+# compiler + cmake on the build host; no system HiGHS install required).
+highs = { version = "2", optional = true }
+
+[features]
+default = []
+# Enable the HiGHS MILP backend. Compiles the vendored HiGHS C++ sources
+# statically. Adds a one-off build cost but introduces no extra runtime
+# dependency.
+highs = ["dep:highs"]
 
 [lints]
 workspace = true

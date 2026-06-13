@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
-use yevice_solver::{Solver, SolverError, solver_from_name};
+use yevice_solver::milp::MilpOptions;
+use yevice_solver::{Solver, SolverError, solver_from_name_with_options};
 
 use yevice_core::Money;
 use yevice_core::bindings::derive_bindings;
@@ -14,6 +15,7 @@ use yevice_core::cost::ArchitectureCost;
 use yevice_core::evaluate::ArchitectureResult;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
 use yevice_core::fx::{RateDate, StaticRates, convert_to};
+use yevice_core::parse_policy::{ParsePolicy, Severity as DiagSeverity};
 use yevice_core::resource::Provider;
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
@@ -101,6 +103,11 @@ pub fn generate(
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
     let cfn_inputs = load_cfn_inputs(parameters_path, imports_path)?;
+    let policy = if strict {
+        ParsePolicy::Strict
+    } else {
+        ParsePolicy::Lenient
+    };
     let request = GenerateRequest {
         format,
         template_path: Path::new(template_path),
@@ -110,8 +117,16 @@ pub fn generate(
         provider_regions,
         strict,
         list_price,
+        policy,
     };
-    let mut cost_model = yevice_engine::generate_cost_model(&provider_plugins(), &request)?;
+    let outcome = yevice_engine::generate_cost_model(&provider_plugins(), &request)?;
+    let had_errors = outcome.had_errors;
+    let mut cost_model = outcome.value;
+
+    // Surface diagnostics to the operator regardless of policy (Lenient
+    // succeeds; Strict aborts later if any Error-severity diagnostic is
+    // present). This matches ADR-0003 "stderr に tracing::warn! で表示".
+    report_diagnostics(&cost_model.diagnostics, policy);
 
     if format == InputFormat::Cfn
         && let Some(path) = bindings_path
@@ -142,7 +157,62 @@ pub fn generate(
     println!("Generated: {output_path}");
     println!("Schema:    {}", schema_path.display());
     println!("Template:  {}", template_path_out.display());
+
+    // Under Strict, any Error-severity parse diagnostic that survived (e.g. a
+    // hard error that the parser still wanted to demote) is fatal. Under
+    // Lenient `had_errors` is informational only and does not change the
+    // exit code (ADR-0003 終了コード section).
+    if strict && had_errors {
+        bail!("strict mode: IaC parse produced error-severity diagnostics");
+    }
     Ok(())
+}
+
+/// Emit each diagnostic to stderr via `tracing` so operators see them even
+/// without `--strict`.
+///
+/// Under [`ParsePolicy::Strict`] the command will abort on any error-severity
+/// diagnostic, so emitting them at `error!` is appropriate (the process is
+/// failing). Under [`ParsePolicy::Lenient`] the command will still succeed,
+/// so error-severity diagnostics are demoted to `warn!` to avoid making a
+/// successful run look failed to log scrapers (per ADR-0003 "Lenient ->
+/// stderr に tracing::warn! で表示"). Diagnostic
+/// [`DiagSeverity::Warning`] / [`DiagSeverity::Info`] entries always use
+/// `warn!` / `info!`.
+fn report_diagnostics(
+    diagnostics: &[yevice_core::parse_policy::IacParseDiagnostic],
+    policy: ParsePolicy,
+) {
+    for d in diagnostics {
+        match d.severity {
+            DiagSeverity::Error => match policy {
+                ParsePolicy::Strict => tracing::error!(
+                    source = ?d.source,
+                    code = %d.code,
+                    "{}",
+                    d.message
+                ),
+                ParsePolicy::Lenient => tracing::warn!(
+                    source = ?d.source,
+                    code = %d.code,
+                    "{}",
+                    d.message
+                ),
+            },
+            DiagSeverity::Warning => tracing::warn!(
+                source = ?d.source,
+                code = %d.code,
+                "{}",
+                d.message
+            ),
+            DiagSeverity::Info => tracing::info!(
+                source = ?d.source,
+                code = %d.code,
+                "{}",
+                d.message
+            ),
+        }
+    }
 }
 
 pub fn evaluate(
@@ -465,20 +535,32 @@ pub fn validate(
     output_format: &str,
     region: &str,
     input_format: Option<InputFormat>,
+    strict: bool,
 ) -> Result<ValidationStatus> {
     let format = resolve_input_format(template_path, input_format)?;
     reject_cfn_only_options(format, parameters_path, imports_path, bindings_path)?;
 
     let registries = yevice_engine::build_registries(&provider_plugins());
     let cfn_inputs = load_cfn_inputs(parameters_path, imports_path)?;
-    let architecture = yevice_engine::build_architecture_from_input(
+    let policy = if strict {
+        ParsePolicy::Strict
+    } else {
+        ParsePolicy::Lenient
+    };
+    let arch_outcome = yevice_engine::build_architecture_from_input_with_policy(
         format,
         Path::new(template_path),
         &cfn_inputs,
         (format != InputFormat::Wrangler).then_some("validate"),
         region,
         &registries,
+        policy,
     )?;
+    report_diagnostics(&arch_outcome.diagnostics, policy);
+    if strict && arch_outcome.had_errors {
+        bail!("strict mode: IaC parse produced error-severity diagnostics");
+    }
+    let architecture = arch_outcome.value;
     let catalog = registries.catalog;
 
     let quotas = match quotas_path {
@@ -574,6 +656,9 @@ pub fn optimize(
     decisions: &[String],
     direction: &str,
     solver_name: &str,
+    time_limit: f64,
+    mip_gap: f64,
+    threads: i32,
 ) -> Result<()> {
     let arch = load_cost_model(cost_model_path)?;
     let objective = arch.total_expr();
@@ -621,13 +706,21 @@ pub fn optimize(
 
     // Select the solver backend (default: enumeration). Unknown names map to
     // a typed error so the CLI can show the allowed list.
-    let solver: Box<dyn Solver> = match solver_from_name(solver_name) {
+    let milp_options = MilpOptions {
+        time_limit_sec: Some(time_limit),
+        mip_gap: Some(mip_gap),
+        threads: Some(threads),
+    };
+    let solver: Box<dyn Solver> = match solver_from_name_with_options(solver_name, milp_options) {
         Ok(s) => s,
         Err(SolverError::UnknownSolver { requested, allowed }) => {
             bail!(
                 "unknown --solver value '{requested}'. Allowed values: {}",
                 allowed.join(", ")
             );
+        }
+        Err(SolverError::MilpBackend { message }) => {
+            bail!("MILP backend unavailable: {message}");
         }
         Err(e) => return Err(e.into()),
     };
@@ -1236,6 +1329,9 @@ mod tests {
             &["MyVar=".to_string()],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1269,6 +1365,9 @@ mod tests {
             &["MyVar=  ".to_string()],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1309,6 +1408,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(result.is_ok(), "min direction must be accepted: {result:?}");
     }
@@ -1333,6 +1435,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(
             result.is_ok(),
@@ -1359,6 +1464,9 @@ mod tests {
             &[],
             "min",
             "no-such-solver",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1389,6 +1497,9 @@ mod tests {
             &[],
             "max",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(result.is_ok(), "max direction must be accepted: {result:?}");
     }
@@ -1410,6 +1521,9 @@ mod tests {
             &[],
             "sideways",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1481,6 +1595,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1541,6 +1658,9 @@ mod tests {
             &["Widget_source_input=100,200".to_string()],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(
             result.is_ok(),
@@ -1683,6 +1803,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(result.is_ok(), "optimize must return Ok; got: {result:?}");
     }

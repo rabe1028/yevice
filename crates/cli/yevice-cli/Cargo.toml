@@ -34,6 +34,13 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 
+[features]
+default = []
+# Forward the HiGHS MILP backend from yevice-solver so users can simply run
+# `cargo install yevice-cli --features highs` without typing the full
+# `yevice-solver/highs` path.
+highs = ["yevice-solver/highs"]
+
 [dev-dependencies]
 yevice-cfn = { workspace = true }
 serde_yaml_ng = { workspace = true }

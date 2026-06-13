@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::expr::{Expr, Tier};
+use crate::parse_policy::IacParseDiagnostic;
 use crate::topology::Topology;
 use crate::types::{ArchitectureName, LogicalId, Region, ResourceType, VariableName};
 
@@ -201,6 +202,13 @@ pub struct ArchitectureCost {
     /// and optimization consumers need not re-parse the source IaC.
     #[serde(default)]
     pub topology: Topology,
+    /// IaC parse diagnostics collected while building this cost model.
+    ///
+    /// Always emitted in JSON (even when empty) per ADR-0003 so downstream
+    /// consumers can distinguish "no diagnostics emitted" from "field missing
+    /// because the producer predates the schema bump".
+    #[serde(default)]
+    pub diagnostics: Vec<IacParseDiagnostic>,
 }
 
 impl ArchitectureCost {

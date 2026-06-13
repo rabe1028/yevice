@@ -276,10 +276,24 @@ enum Commands {
         #[arg(long = "direction", default_value = "min", value_name = "min|max")]
         direction: String,
 
-        /// Solver backend to use. Currently only `enumeration` is supported;
-        /// future backends (e.g. LP/MIP) will plug in here.
+        /// Solver backend to use. `enumeration` (default) walks the Cartesian
+        /// product of decision-variable domains; `highs` (requires building
+        /// with `--features highs`) translates the problem to MILP and
+        /// dispatches to HiGHS.
         #[arg(long = "solver", default_value = "enumeration", value_name = "NAME")]
         solver: String,
+
+        /// HiGHS only: wall-clock time limit in seconds.
+        #[arg(long = "time-limit", default_value_t = 300.0, value_name = "SEC")]
+        time_limit: f64,
+
+        /// HiGHS only: relative MIP optimality gap.
+        #[arg(long = "mip-gap", default_value_t = 1e-4, value_name = "RATIO")]
+        mip_gap: f64,
+
+        /// HiGHS only: thread count (0 = backend auto).
+        #[arg(long = "threads", default_value_t = 0, value_name = "N")]
+        threads: i32,
     },
 }
 
@@ -402,6 +416,7 @@ fn main() -> Result<()> {
                 &output_format,
                 &cli.region,
                 cli.input_format.to_command_format(),
+                cli.strict,
             )?;
             // Constraint violations are a structured outcome, not an error:
             // the command's own Result only covers operational failures.
@@ -439,12 +454,18 @@ fn main() -> Result<()> {
             decision,
             direction,
             solver,
+            time_limit,
+            mip_gap,
+            threads,
         } => commands::optimize(
             &cost_model,
             params.as_deref(),
             &decision,
             &direction,
             &solver,
+            time_limit,
+            mip_gap,
+            threads,
         ),
     }
 }

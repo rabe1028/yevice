@@ -271,6 +271,7 @@ mod tests {
             bindings: vec![binding],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -349,6 +350,7 @@ mod tests {
             bindings: vec![binding],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         };
 
         let schema = generate_usage_schema(&arch);
@@ -439,6 +441,7 @@ mod tests {
             bindings: vec![binding],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         };
 
         let template = generate_usage_template(&arch);
@@ -493,6 +496,7 @@ mod tests {
             bindings: vec![binding],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         };
 
         let schema = generate_usage_schema(&arch);
@@ -571,6 +575,7 @@ mod tests {
             bindings: vec![binding_a, binding_b],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         };
 
         let schema = generate_usage_schema(&arch);
@@ -651,6 +656,7 @@ mod tests {
             bindings: vec![binding_a, binding_b],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         };
 
         let template = generate_usage_template(&arch);
@@ -700,6 +706,7 @@ mod tests {
             bindings: vec![binding],
             region: Region::new("ap-northeast-1"),
             topology: Topology::default(),
+            diagnostics: Vec::new(),
         };
 
         let template = generate_usage_template(&arch);
