@@ -53,10 +53,14 @@ impl Service for Route53Service {
                 CostComponent {
                     name: "Hosted Zone".into(),
                     expr: zone_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Queries".into(),
                     expr: query_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![VariableInfo::new(
@@ -65,6 +69,8 @@ impl Service for Route53Service {
                 "DNS queries per month",
                 "requests",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

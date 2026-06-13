@@ -51,6 +51,8 @@ impl Service for EcrService {
             components: vec![CostComponent {
                 name: format!("Storage ({repo_type})"),
                 expr: storage_cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -58,6 +60,8 @@ impl Service for EcrService {
                 "Container image storage per month",
                 "GB",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

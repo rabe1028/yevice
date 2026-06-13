@@ -102,13 +102,19 @@ impl Service for KinesisService {
                         CostComponent {
                             name: "Shards".into(),
                             expr: shard_cost,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "PUT Payload".into(),
                             expr: put_cost,
+
+                            currency: None,
                         },
                     ],
                     required_variables: vars,
+
+                    currency: Some("USD".into()),
                 })
             }
             KinesisStreamMode::OnDemand => {
@@ -137,20 +143,28 @@ impl Service for KinesisService {
                         CostComponent {
                             name: "Stream Hours".into(),
                             expr: stream_hour,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Ingestion".into(),
                             expr: ingestion,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Retrieval".into(),
                             expr: retrieval,
+
+                            currency: None,
                         },
                     ],
                     required_variables: vec![
                         VariableInfo::new(id, "data_ingestion_gb", "Data ingested per month", "GB"),
                         VariableInfo::new(id, "retrieval_gb", "Data retrieved per month", "GB"),
                     ],
+
+                    currency: Some("USD".into()),
                 })
             }
         }

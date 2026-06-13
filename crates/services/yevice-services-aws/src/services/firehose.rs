@@ -43,6 +43,8 @@ impl Service for FirehoseService {
             components: vec![CostComponent {
                 name: "Data Ingestion".into(),
                 expr: ingestion,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -50,6 +52,8 @@ impl Service for FirehoseService {
                 "Data ingested per month",
                 "GB",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -71,13 +71,19 @@ impl Service for AlbService {
                 CostComponent {
                     name: format!("{label} Hours"),
                     expr: fixed_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "LCU Hours".into(),
                     expr: lcu_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vars,
+
+            currency: Some("USD".into()),
         })
     }
 }

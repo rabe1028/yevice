@@ -58,7 +58,7 @@ fn build_cdp(name: &str, template_file: &str, list_price: bool) -> ArchitectureC
 
 fn total(arch: &ArchitectureCost, params: &[(&str, f64)]) -> f64 {
     let result = evaluate_architecture(arch, &p(params)).expect("evaluate");
-    result.total_monthly_cost
+    result.naive_total()
 }
 
 // =========================================================================

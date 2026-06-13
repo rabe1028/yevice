@@ -4,7 +4,7 @@ use yevice_core::{
     types::{LogicalId, ResourceType, VariableName},
 };
 use yevice_pricing::{
-    catalog::{PriceCatalog, PriceRecord, Sku},
+    catalog::{PriceCatalog, PricedValue, Sku},
     error::PricingError,
 };
 use yevice_service_api::Service;
@@ -20,7 +20,7 @@ impl PriceCatalog for BranchCatalog {
         "test"
     }
 
-    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+    fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
         let price = match sku.as_str() {
             "gcp.cloud_sql.vcpu_hour" => 2.3,
             "gcp.cloud_sql.ram_gb_hour" => 3.7,
@@ -37,7 +37,7 @@ impl PriceCatalog for BranchCatalog {
             }
         };
 
-        Ok(PriceRecord::flat(price))
+        Ok(PricedValue::scalar(price, "USD"))
     }
 }
 

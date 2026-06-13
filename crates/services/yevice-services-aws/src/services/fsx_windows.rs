@@ -143,17 +143,25 @@ impl Service for FsxWindowsService {
                 CostComponent {
                     name: format!("Storage ({storage_label})"),
                     expr: storage,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Throughput Capacity".into(),
                     expr: throughput,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Backups".into(),
                     expr: backup,
+
+                    currency: None,
                 },
             ],
             required_variables: required,
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -56,8 +56,7 @@ impl Service for GuardDutyService {
         let flowlog_tiers = pricing
             .lookup(&Sku::new("aws.guardduty.flowlog_dns_gb_tiers"))?
             .as_tiered()
-            .map_err(CostError::Pricing)?
-            .to_vec();
+            .map_err(CostError::Pricing)?;
         let flowlog = Expr::tiered(flowlog_tiers, Expr::variable(id.var("flowlog_gb")));
 
         Ok(ResourceCost {
@@ -69,10 +68,14 @@ impl Service for GuardDutyService {
                 CostComponent {
                     name: "CloudTrail Event Analysis".into(),
                     expr: cloudtrail,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "VPC Flow Log & DNS Analysis".into(),
                     expr: flowlog,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -89,6 +92,8 @@ impl Service for GuardDutyService {
                     "GB",
                 ),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

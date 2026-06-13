@@ -6,7 +6,7 @@
 //! unexpectedly.
 
 use crate::{
-    catalog::{PriceCatalog, PriceRecord, Sku},
+    catalog::{PriceCatalog, PricedValue, Sku},
     error::PricingError,
 };
 
@@ -21,7 +21,7 @@ impl PriceCatalog for NoopCatalog {
         "global"
     }
 
-    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+    fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
         Err(PricingError::NotFound {
             service: sku.as_str().to_string(),
             region: "global".to_string(),

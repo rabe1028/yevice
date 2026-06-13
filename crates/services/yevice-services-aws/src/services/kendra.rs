@@ -84,14 +84,20 @@ impl Service for KendraService {
                 CostComponent {
                     name: "Index Hours".into(),
                     expr: index,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Connector Document Scans".into(),
                     expr: connector_documents,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Connector Scan Hours".into(),
                     expr: connector_hours,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -108,6 +114,8 @@ impl Service for KendraService {
                     "hours",
                 ),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -52,6 +52,8 @@ impl Service for EventBridgeRuleService {
                 "Custom events per month",
                 "events",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

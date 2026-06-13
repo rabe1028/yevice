@@ -43,8 +43,12 @@ impl Service for EksService {
             components: vec![CostComponent {
                 name: "Cluster Management".into(),
                 expr: cluster_fee,
+
+                currency: None,
             }],
             required_variables: vec![],
+
+            currency: Some("USD".into()),
         })
     }
 }

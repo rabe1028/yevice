@@ -91,17 +91,25 @@ impl Service for RedshiftService {
                 CostComponent {
                     name: "Nodes".into(),
                     expr: nodes,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Managed Storage".into(),
                     expr: storage,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Spectrum Scan".into(),
                     expr: spectrum,
+
+                    currency: None,
                 },
             ],
             required_variables: required,
+
+            currency: Some("USD".into()),
         })
     }
 }

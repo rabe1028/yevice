@@ -68,6 +68,8 @@ impl Service for SqsService {
                 "Requests per month",
                 "requests",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

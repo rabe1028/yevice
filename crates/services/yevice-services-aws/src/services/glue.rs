@@ -65,6 +65,8 @@ impl Service for GlueService {
             components: vec![CostComponent {
                 name: "DPU-Hours".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -72,6 +74,8 @@ impl Service for GlueService {
                 "Job hours per month",
                 "hours",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

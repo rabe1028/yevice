@@ -72,14 +72,20 @@ impl Service for OpenSearchServerlessService {
                 CostComponent {
                     name: "Indexing OCU".into(),
                     expr: indexing,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Search OCU".into(),
                     expr: search,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -87,6 +93,8 @@ impl Service for OpenSearchServerlessService {
                 VariableInfo::new(id, "search_ocu", "Search/query OCU count", "OCU"),
                 VariableInfo::new(id, var::STORAGE_GB, "Managed storage", "GB"),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

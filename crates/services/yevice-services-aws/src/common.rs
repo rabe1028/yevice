@@ -20,10 +20,7 @@ pub(crate) fn egress_cost_expr(
 ) -> Result<(Expr, VariableInfo), CostError> {
     let egress_record = pricing.lookup(&Sku::new("aws.data_transfer.egress_tiers"))?;
     let egress_tiers = egress_record.as_tiered().map_err(CostError::Pricing)?;
-    let expr = Expr::tiered(
-        egress_tiers.to_vec(),
-        Expr::variable(id.var("data_transfer_out_gb")),
-    );
+    let expr = Expr::tiered(egress_tiers, Expr::variable(id.var("data_transfer_out_gb")));
     let info = VariableInfo::new(
         id,
         "data_transfer_out_gb",

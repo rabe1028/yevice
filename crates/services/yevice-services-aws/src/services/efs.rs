@@ -60,6 +60,8 @@ impl Service for EfsService {
             components: vec![CostComponent {
                 name: format!("Storage ({storage_label})"),
                 expr: storage_cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -67,6 +69,8 @@ impl Service for EfsService {
                 "File storage per month",
                 "GB",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

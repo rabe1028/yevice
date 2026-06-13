@@ -83,8 +83,12 @@ impl Service for DirectoryServiceService {
             components: vec![CostComponent {
                 name: format!("Domain Controllers ({})", spec.edition),
                 expr: directory,
+
+                currency: None,
             }],
             required_variables: required,
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -67,10 +67,14 @@ impl Service for GcpBigQueryService {
                 CostComponent {
                     name: "Storage (active)".into(),
                     expr: storage_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Queries (data scanned)".into(),
                     expr: query_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -87,6 +91,8 @@ impl Service for GcpBigQueryService {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

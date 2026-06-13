@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
 use yevice_solver::{Solver, SolverError, solver_from_name};
@@ -9,11 +10,47 @@ use yevice_solver::{Solver, SolverError, solver_from_name};
 use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
+use yevice_core::evaluate::ArchitectureResult;
 use yevice_core::evaluate::{self, Params, evaluate_architecture};
+use yevice_core::fx::{RateDate, StaticRates, convert_to};
 use yevice_core::resource::Provider;
 use yevice_core::schema::{generate_usage_schema, generate_usage_template};
 use yevice_core::simulate::{ArchSimulation, SimulationProfile, simulate_architecture};
 use yevice_core::types::VariableName;
+
+/// Apply the ADR-0001 `--display-currency` behavior to a freshly-evaluated
+/// architecture result.
+///
+/// Behavior matrix:
+///
+/// | display_currency | totals_by_currency size | action                                    |
+/// |------------------|-------------------------|-------------------------------------------|
+/// | `None`           | <= 1                    | leave `display_total` as `None`           |
+/// | `None`           | > 1                     | warn + leave `display_total` as `None`    |
+/// | `Some(code)`     | any                     | FX-convert; `display_total` populated     |
+///
+/// Returns an error when `display_currency` is set but FX rates are missing
+/// for any source currency (hard error per ADR).
+pub(crate) fn apply_display_currency(
+    result: &mut ArchitectureResult,
+    display_currency: Option<&str>,
+    rates: &StaticRates,
+) -> Result<()> {
+    let Some(target) = display_currency else {
+        if result.totals_by_currency.len() > 1 {
+            tracing::warn!(
+                currencies = ?result.totals_by_currency.keys().collect::<Vec<_>>(),
+                "evaluation contains mixed currencies — pass --display-currency to merge into a single total"
+            );
+        }
+        return Ok(());
+    };
+    let at = RateDate::new(Utc::now().date_naive());
+    let money = convert_to(&result.totals_by_currency, target, rates, at)
+        .map_err(|e| anyhow::anyhow!("failed to apply --display-currency {target}: {e}"))?;
+    result.display_total = Some(money);
+    Ok(())
+}
 use yevice_engine::{CfnInputs, EngineError, GenerateRequest};
 use yevice_pricing::download as pricing_download;
 use yevice_service_api::ProviderPlugin;
@@ -107,33 +144,67 @@ pub fn generate(
     Ok(())
 }
 
-pub fn evaluate(cost_model_path: &str, params_path: &str, breakdown: bool) -> Result<()> {
+pub fn evaluate(
+    cost_model_path: &str,
+    params_path: &str,
+    breakdown: bool,
+    display_currency: Option<&str>,
+    exchange_rates: &[String],
+) -> Result<()> {
     let arch = load_cost_model(cost_model_path)?;
     let params = load_params(params_path)?;
 
-    let result = evaluate_architecture(&arch, &params).context("failed to evaluate cost model")?;
+    let mut result =
+        evaluate_architecture(&arch, &params).context("failed to evaluate cost model")?;
+    let rates = parse_exchange_rates(exchange_rates)?;
+    apply_display_currency(&mut result, display_currency, &rates)?;
 
     println!("\n{}: Monthly Cost Estimate", result.name);
 
+    let disp = display_currency.map(|target| {
+        let at = RateDate::new(Utc::now().date_naive());
+        (&rates, target, at)
+    });
     if breakdown {
-        let table = crate::render::render_eval_breakdown_table(&result);
+        let table = crate::render::render_eval_breakdown_table(&result, disp);
         println!("{table}");
     } else {
-        let table = crate::render::render_eval_table(&result);
+        let table = crate::render::render_eval_table(&result, disp);
         println!("{table}");
+    }
+
+    if let Some(money) = &result.display_total {
+        println!(
+            "\nDisplay total ({}): {:.2} {}",
+            money.currency, money.value, money.currency
+        );
+    }
+    if result.totals_by_currency.len() > 1 {
+        println!("\nPer-currency totals:");
+        for (code, total) in &result.totals_by_currency {
+            println!("  {code}: {total:.2}");
+        }
     }
 
     Ok(())
 }
 
-pub fn compare(cost_model_paths: &[String], params_path: &str, breakdown: bool) -> Result<()> {
+pub fn compare(
+    cost_model_paths: &[String],
+    params_path: &str,
+    breakdown: bool,
+    display_currency: Option<&str>,
+    exchange_rates: &[String],
+) -> Result<()> {
     let params = load_params(params_path)?;
 
+    let rates = parse_exchange_rates(exchange_rates)?;
     let mut results = Vec::new();
     for path in cost_model_paths {
         let arch = load_cost_model(path)?;
-        let result =
+        let mut result =
             evaluate_architecture(&arch, &params).context("failed to evaluate cost model")?;
+        apply_display_currency(&mut result, display_currency, &rates)?;
         results.push(result);
     }
 
@@ -142,7 +213,38 @@ pub fn compare(cost_model_paths: &[String], params_path: &str, breakdown: bool) 
     println!("\nArchitecture Cost Comparison");
     println!("{summary}");
 
+    // ADR-0001: when any model is mixed-currency and the user did not pass
+    // --display-currency, print the per-currency breakdown so the comparison
+    // total above does not visually fold incompatible numbers together.
+    if display_currency.is_none() && results.iter().any(|r| r.totals_by_currency.len() > 1) {
+        println!("\nPer-currency totals (mixed-currency models):");
+        for r in &results {
+            println!("  {}", r.name);
+            for (code, total) in &r.totals_by_currency {
+                println!("    {code}: {total:.2}");
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// Parse `--exchange-rate FROM=TO:RATE` entries into a [`StaticRates`] table.
+fn parse_exchange_rates(specs: &[String]) -> Result<StaticRates> {
+    let mut rates = StaticRates::new();
+    for spec in specs {
+        let (pair, rate_str) = spec
+            .split_once(':')
+            .with_context(|| format!("--exchange-rate '{spec}' must be FROM=TO:RATE"))?;
+        let (from, to) = pair
+            .split_once('=')
+            .with_context(|| format!("--exchange-rate '{spec}' must be FROM=TO:RATE"))?;
+        let rate: f64 = rate_str
+            .parse()
+            .with_context(|| format!("--exchange-rate '{spec}' rate must be a number"))?;
+        rates.insert(from, to, rate);
+    }
+    Ok(rates)
 }
 
 pub fn sensitivity(
@@ -165,7 +267,7 @@ pub fn sensitivity(
 
     let base_result =
         evaluate_architecture(&arch, &base_params).context("failed to evaluate base cost")?;
-    let base_cost = base_result.total_monthly_cost;
+    let base_cost = base_result.naive_total();
 
     // Collect resource labels from the base result to use as breakdown columns.
     let resource_labels: Vec<String> = base_result
@@ -185,10 +287,10 @@ pub fn sensitivity(
 
         match evaluate_architecture(&arch, &params) {
             Ok(result) => {
-                let delta = result.total_monthly_cost - base_cost;
+                let delta = result.naive_total() - base_cost;
                 sensitivity_rows.push(crate::render::SensitivityRow::Ok {
                     value,
-                    total: result.total_monthly_cost,
+                    total: result.naive_total(),
                     delta,
                 });
 
@@ -200,7 +302,7 @@ pub fn sensitivity(
                                 .resources
                                 .iter()
                                 .find(|r| &r.label == label)
-                                .map_or(0.0, |r| r.monthly_cost)
+                                .map_or(0.0, |r| r.monthly_cost.value)
                         })
                         .collect();
                     breakdown_rows.push((value, costs));
@@ -718,7 +820,19 @@ pub fn diagram(cost_model_path: &str, format: &str, output: Option<&str>) -> Res
 fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read cost model: {path}"))?;
-    Ok(yevice_core::io::parse_cost_model(&content)?)
+    let arch = yevice_core::io::parse_cost_model(&content)?;
+    // ADR-0001 post-deserialize hook: a hand-edited cost_model.json could mix
+    // currencies inside a single ResourceCost. ResourceCost::new enforces the
+    // invariant at construction time, but deserialize bypasses that path.
+    for rc in &arch.resources {
+        rc.validate().with_context(|| {
+            format!(
+                "invalid cost model {path}: resource {} has mixed component currencies",
+                rc.logical_id
+            )
+        })?;
+    }
+    Ok(arch)
 }
 
 /// Load usage parameters from a YAML file.

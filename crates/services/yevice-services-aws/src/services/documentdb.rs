@@ -70,13 +70,19 @@ impl Service for DocumentDbService {
                 CostComponent {
                     name: "Instances".into(),
                     expr: instance_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: required,
+
+            currency: Some("USD".into()),
         })
     }
 }

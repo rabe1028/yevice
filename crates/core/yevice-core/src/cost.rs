@@ -1,6 +1,7 @@
 //! Cost model types built on top of [`Expr`].
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 pub use crate::expr::{Expr, Tier};
 use crate::topology::Topology;
@@ -12,6 +13,31 @@ pub struct CostComponent {
     /// Human-readable name (e.g., "Compute (Fargate)", "Storage (EBS gp3)").
     pub name: String,
     pub expr: Expr,
+    /// Currency override for this component. When `None`, the parent
+    /// `ResourceCost.currency` (or fallback to `"USD"`) is used. See ADR-0001
+    /// for the priority resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
+impl CostComponent {
+    /// Construct a component with no currency override (inherits from parent).
+    pub fn new(name: impl Into<String>, expr: Expr) -> Self {
+        Self {
+            name: name.into(),
+            expr,
+            currency: None,
+        }
+    }
+
+    /// Construct a component with an explicit currency override.
+    pub fn with_currency(name: impl Into<String>, expr: Expr, currency: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            expr,
+            currency: Some(currency.into()),
+        }
+    }
 }
 
 /// Cost model for a single resource.
@@ -24,6 +50,85 @@ pub struct ResourceCost {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<CostComponent>,
     pub required_variables: Vec<VariableInfo>,
+    /// Resource-level default currency. `None` triggers the USD fallback at
+    /// evaluation time (with a `tracing::warn!`). See ADR-0001 schema-side
+    /// "案 (b+)" — two-tier currency persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
+impl ResourceCost {
+    /// Construct a `ResourceCost`, validating that all currency overrides
+    /// agree (per ADR-0001 §"ResourceCost 構築時の Validation 契約").
+    ///
+    /// Errors with [`CostBuildError::ComponentCurrencyMismatch`] when any
+    /// component carries a `Some(currency)` that disagrees with another
+    /// component's `Some(currency)` or with the resource-level `currency`.
+    /// All-None or unanimous-Some(same) is accepted.
+    pub fn new(
+        logical_id: LogicalId,
+        resource_type: ResourceType,
+        label: impl Into<String>,
+        expr: Expr,
+        components: Vec<CostComponent>,
+        required_variables: Vec<VariableInfo>,
+        currency: Option<String>,
+    ) -> Result<Self, CostBuildError> {
+        validate_currency(&logical_id, currency.as_deref(), &components)?;
+        Ok(Self {
+            logical_id,
+            resource_type,
+            label: label.into(),
+            expr,
+            components,
+            required_variables,
+            currency,
+        })
+    }
+
+    /// Re-run the currency-mismatch validation after `serde` deserialization.
+    ///
+    /// `Deserialize` cannot run custom logic on a struct literal, so callers
+    /// loading `cost_model.json` should invoke this on the freshly-decoded
+    /// `ArchitectureCost.resources` to catch hand-written corrupt files.
+    pub fn validate(&self) -> Result<(), CostBuildError> {
+        validate_currency(&self.logical_id, self.currency.as_deref(), &self.components)
+    }
+}
+
+fn validate_currency(
+    logical_id: &LogicalId,
+    resource_currency: Option<&str>,
+    components: &[CostComponent],
+) -> Result<(), CostBuildError> {
+    use std::collections::BTreeSet;
+
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if let Some(rc) = resource_currency {
+        seen.insert(rc.to_string());
+    }
+    for c in components {
+        if let Some(cc) = &c.currency {
+            seen.insert(cc.clone());
+        }
+    }
+    if seen.len() > 1 {
+        return Err(CostBuildError::ComponentCurrencyMismatch {
+            resource_id: logical_id.to_string(),
+            currencies: seen.into_iter().collect(),
+        });
+    }
+    Ok(())
+}
+
+/// Errors raised while assembling a [`ResourceCost`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CostBuildError {
+    #[error("resource {resource_id} has inconsistent component currencies: {currencies:?}")]
+    ComponentCurrencyMismatch {
+        resource_id: String,
+        currencies: Vec<String>,
+    },
 }
 
 /// Indicates whether a variable is a usage (observed) input or a decision
@@ -140,5 +245,66 @@ mod tests {
         let cost: ArchitectureCost = serde_json::from_str(json).expect("deserialize");
         assert_eq!(cost.name, ArchitectureName::new("arch"));
         assert!(cost.topology.is_empty());
+    }
+
+    #[test]
+    fn resource_cost_new_accepts_unanimous_currencies() {
+        let rc = ResourceCost::new(
+            LogicalId::new("R"),
+            ResourceType::new("AWS::Foo::Bar"),
+            "label",
+            Expr::constant(0.0),
+            vec![
+                CostComponent::with_currency("a", Expr::constant(0.0), "USD"),
+                CostComponent::with_currency("b", Expr::constant(0.0), "USD"),
+            ],
+            vec![],
+            Some("USD".into()),
+        );
+        assert!(rc.is_ok());
+    }
+
+    #[test]
+    fn resource_cost_new_rejects_mismatched_currencies() {
+        let err = ResourceCost::new(
+            LogicalId::new("R"),
+            ResourceType::new("AWS::Foo::Bar"),
+            "label",
+            Expr::constant(0.0),
+            vec![
+                CostComponent::with_currency("a", Expr::constant(0.0), "USD"),
+                CostComponent::with_currency("b", Expr::constant(0.0), "JPY"),
+            ],
+            vec![],
+            Some("USD".into()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CostBuildError::ComponentCurrencyMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn resource_cost_validate_catches_corrupt_deserialized_struct() {
+        // Directly build the struct (bypassing `new`) to simulate
+        // deserialization of a hand-edited cost_model.json.
+        let rc = ResourceCost {
+            logical_id: LogicalId::new("R"),
+            resource_type: ResourceType::new("AWS::Foo::Bar"),
+            label: "x".into(),
+            expr: Expr::constant(0.0),
+            components: vec![
+                CostComponent::with_currency("a", Expr::constant(0.0), "USD"),
+                CostComponent::with_currency("b", Expr::constant(0.0), "EUR"),
+            ],
+            required_variables: vec![],
+            currency: Some("USD".into()),
+        };
+        let err = rc.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            CostBuildError::ComponentCurrencyMismatch { .. }
+        ));
     }
 }

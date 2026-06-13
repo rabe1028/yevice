@@ -4,40 +4,138 @@
 //! returns it ready for printing.  The calling command function calls
 //! `println!("{table}")` — no formatting logic lives outside this module.
 
+use std::collections::BTreeMap;
+
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
+use yevice_core::Money;
 use yevice_core::capacity::{Severity, Violation};
 use yevice_core::evaluate::ArchitectureResult;
+use yevice_core::fx::{RateDate, StaticRates, convert_to};
 use yevice_core::simulate::ArchSimulation;
+
+/// Render a [`Money`] amount with its declared currency code suffix.
+///
+/// USD uses the historical `$<value>` glyph for backward-compatible output;
+/// other currencies render as `<value> <CODE>` (e.g. `1000.00 JPY`). This is
+/// the only place in the CLI that decides between symbol vs. ISO code, so
+/// updating the convention later only touches this function.
+fn fmt_money(m: &Money) -> String {
+    fmt_amount(m.value, &m.currency)
+}
+
+fn fmt_money_4(m: &Money) -> String {
+    fmt_amount_4(m.value, &m.currency)
+}
+
+fn fmt_amount(value: f64, currency: &str) -> String {
+    if currency == "USD" {
+        format!("${value:.2}")
+    } else {
+        format!("{value:.2} {currency}")
+    }
+}
+
+fn fmt_amount_4(value: f64, currency: &str) -> String {
+    if currency == "USD" {
+        format!("${value:.4}")
+    } else {
+        format!("{value:.4} {currency}")
+    }
+}
+
+/// Pick the single-currency code most representative of the result for the
+/// header label. Returns `"USD"` for empty/multi-currency models so the
+/// header stays stable across mixed evaluations (the per-currency
+/// breakdown printed underneath the table conveys the full picture).
+fn header_currency(result: &ArchitectureResult) -> &str {
+    if let Some(money) = &result.display_total {
+        return money.currency.as_str();
+    }
+    if result.totals_by_currency.len() == 1 {
+        return result.totals_by_currency.keys().next().unwrap();
+    }
+    "USD"
+}
 
 // ---------------------------------------------------------------------------
 // eval
 // ---------------------------------------------------------------------------
 
+/// Convert a single [`Money`] value to `target_currency` using `rates`.
+///
+/// Returns `None` when the rate is missing so callers can fall back to a
+/// placeholder rather than mixing currencies silently.
+fn try_convert_money(
+    money: &Money,
+    target: &str,
+    rates: &StaticRates,
+    at: RateDate,
+) -> Option<Money> {
+    let mut single: BTreeMap<String, f64> = BTreeMap::new();
+    single.insert(money.currency.clone(), money.value);
+    convert_to(&single, target, rates, at).ok()
+}
+
 /// Build the per-resource cost table for `eval --breakdown`.
 ///
 /// Each resource appears as a coloured row followed by indented component rows.
 /// A green TOTAL row is appended at the bottom.
-pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table {
+///
+/// When `display_currency` is `Some((rates, target, at))`, per-resource costs
+/// are converted to `target`; rows that cannot be converted show `"n/a"`.
+pub(crate) fn render_eval_breakdown_table(
+    result: &ArchitectureResult,
+    display_currency: Option<(&StaticRates, &str, RateDate)>,
+) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec!["Resource / Component", "Monthly Cost (USD)"]);
+    let header_ccy = header_currency(result).to_string();
+    table.set_header(vec![
+        "Resource / Component".to_string(),
+        format!("Monthly Cost ({header_ccy})"),
+    ]);
 
     for r in &result.resources {
+        let cost_str = if let Some((rates, target, at)) = display_currency {
+            match try_convert_money(&r.monthly_cost, target, rates, at) {
+                Some(m) => fmt_money(&m),
+                None => "n/a".to_string(),
+            }
+        } else {
+            fmt_money(&r.monthly_cost)
+        };
         table.add_row(vec![
             Cell::new(&r.label).fg(Color::Cyan),
-            Cell::new(format!("${:.2}", r.monthly_cost)).fg(Color::Cyan),
+            Cell::new(cost_str).fg(Color::Cyan),
         ]);
         for (name, cost) in &r.component_costs {
-            table.add_row(vec![
-                Cell::new(format!("  └─ {name}")),
-                Cell::new(format!("${cost:.4}")),
-            ]);
+            let comp_str = if let Some((rates, target, at)) = display_currency {
+                match try_convert_money(cost, target, rates, at) {
+                    Some(m) => fmt_money_4(&m),
+                    None => "n/a".to_string(),
+                }
+            } else {
+                fmt_money_4(cost)
+            };
+            table.add_row(vec![Cell::new(format!("  └─ {name}")), Cell::new(comp_str)]);
         }
     }
 
+    // When --display-currency was applied, show the FX-converted total.
+    // Single-currency results show the native total. Mixed currencies
+    // without --display-currency render `mixed (see breakdown)` so the
+    // table never folds heterogeneous numbers; the caller prints the
+    // per-currency breakdown.
+    let total_cell = if let Some(money) = &result.display_total {
+        fmt_money(money)
+    } else if result.totals_by_currency.len() > 1 {
+        "mixed (see breakdown)".to_string()
+    } else {
+        fmt_amount(result.naive_total(), &header_ccy)
+    };
     table.add_row(vec![
         Cell::new("TOTAL").fg(Color::Green),
-        Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
+        Cell::new(total_cell).fg(Color::Green),
     ]);
 
     table
@@ -47,23 +145,49 @@ pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table 
 ///
 /// Each resource appears on one row with label, type, and monthly cost.
 /// A green TOTAL row is appended at the bottom.
-pub(crate) fn render_eval_table(result: &ArchitectureResult) -> Table {
+///
+/// When `display_currency` is `Some((rates, target, at))`, per-resource costs
+/// are converted to `target`; rows that cannot be converted show `"n/a"`.
+pub(crate) fn render_eval_table(
+    result: &ArchitectureResult,
+    display_currency: Option<(&StaticRates, &str, RateDate)>,
+) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec!["Resource", "Type", "Monthly Cost (USD)"]);
+    let header_ccy = header_currency(result).to_string();
+    table.set_header(vec![
+        "Resource".to_string(),
+        "Type".to_string(),
+        format!("Monthly Cost ({header_ccy})"),
+    ]);
 
     for r in &result.resources {
+        let cost_str = if let Some((rates, target, at)) = display_currency {
+            match try_convert_money(&r.monthly_cost, target, rates, at) {
+                Some(m) => fmt_money(&m),
+                None => "n/a".to_string(),
+            }
+        } else {
+            fmt_money(&r.monthly_cost)
+        };
         table.add_row(vec![
             Cell::new(&r.label),
             Cell::new(&r.resource_type),
-            Cell::new(format!("${:.2}", r.monthly_cost)),
+            Cell::new(cost_str),
         ]);
     }
 
+    let total_cell = if let Some(money) = &result.display_total {
+        fmt_money(money)
+    } else if result.totals_by_currency.len() > 1 {
+        "mixed (see breakdown)".to_string()
+    } else {
+        fmt_amount(result.naive_total(), &header_ccy)
+    };
     table.add_row(vec![
         Cell::new("TOTAL").fg(Color::Green),
         Cell::new(""),
-        Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
+        Cell::new(total_cell).fg(Color::Green),
     ]);
 
     table
@@ -88,10 +212,21 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
     }
     summary.set_header(header);
 
-    // Total row
+    // Total row — prefer the FX-converted display_total when present,
+    // otherwise show the native single-currency total. Mixed-currency
+    // results without --display-currency render `mixed (see breakdown)`
+    // so the table never folds incompatible numbers into a single cell;
+    // the caller is responsible for printing the per-currency breakdown.
     let mut total_row = vec![Cell::new("Total Monthly Cost").fg(Color::Green)];
     for r in results {
-        total_row.push(Cell::new(format!("${:.2}", r.total_monthly_cost)));
+        let cell = if let Some(money) = &r.display_total {
+            fmt_money(money)
+        } else if r.totals_by_currency.len() > 1 {
+            "mixed (see breakdown)".to_string()
+        } else {
+            fmt_amount(r.naive_total(), header_currency(r))
+        };
+        total_row.push(Cell::new(cell));
     }
     summary.add_row(total_row);
 
@@ -112,10 +247,7 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
                 .resources
                 .iter()
                 .find(|res| &res.label == label)
-                .map_or_else(
-                    || "-".to_string(),
-                    |res| format!("${:.2}", res.monthly_cost),
-                );
+                .map_or_else(|| "-".to_string(), |res| fmt_money(&res.monthly_cost));
             row.push(Cell::new(cost));
         }
         summary.add_row(row);
@@ -139,7 +271,7 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
                         .iter()
                         .find(|res| &res.label == label)
                         .and_then(|res| res.component_costs.iter().find(|(n, _)| n == comp_name))
-                        .map_or_else(|| "-".to_string(), |(_, v)| format!("${v:.4}"));
+                        .map_or_else(|| "-".to_string(), |(_, v)| fmt_money_4(v));
                     comp_row.push(Cell::new(comp_cost));
                 }
                 summary.add_row(comp_row);
@@ -147,20 +279,46 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
         }
     }
 
-    // Difference row (only when exactly 2 architectures are compared).
+    // Difference row (only when exactly 2 architectures are compared, and
+    // only when both totals are commensurate — i.e. both have a converted
+    // `display_total` in the same currency, or both are single-currency in
+    // the same native currency). Mixed currencies without `--display-currency`
+    // get an "n/a (mixed)" row instead of a misleading scalar diff.
     if results.len() == 2 {
-        let diff = results[1].total_monthly_cost - results[0].total_monthly_cost;
-        let diff_str = if diff >= 0.0 {
-            format!("+${diff:.2}")
+        let comparable: Option<(f64, String)> =
+            match (&results[0].display_total, &results[1].display_total) {
+                (Some(a), Some(b)) if a.currency == b.currency => {
+                    Some((b.value - a.value, b.currency.clone()))
+                }
+                _ if results[0].totals_by_currency.len() == 1
+                    && results[1].totals_by_currency.len() == 1
+                    && results[0].totals_by_currency.keys().next()
+                        == results[1].totals_by_currency.keys().next() =>
+                {
+                    let ccy = header_currency(&results[1]).to_string();
+                    Some((results[1].naive_total() - results[0].naive_total(), ccy))
+                }
+                _ => None,
+            };
+        if let Some((diff, ccy)) = comparable {
+            let diff_str = if diff >= 0.0 {
+                format!("+{}", fmt_amount(diff, &ccy))
+            } else {
+                format!("-{}", fmt_amount(diff.abs(), &ccy))
+            };
+            let color = if diff > 0.0 { Color::Red } else { Color::Green };
+            summary.add_row(vec![
+                Cell::new("Difference"),
+                Cell::new("-"),
+                Cell::new(diff_str).fg(color),
+            ]);
         } else {
-            format!("-${:.2}", diff.abs())
-        };
-        let color = if diff > 0.0 { Color::Red } else { Color::Green };
-        summary.add_row(vec![
-            Cell::new("Difference"),
-            Cell::new("-"),
-            Cell::new(diff_str).fg(color),
-        ]);
+            summary.add_row(vec![
+                Cell::new("Difference"),
+                Cell::new("-"),
+                Cell::new("n/a (currency mismatch)").fg(Color::Yellow),
+            ]);
+        }
     }
 
     summary

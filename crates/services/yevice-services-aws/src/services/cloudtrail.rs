@@ -65,10 +65,14 @@ impl Service for CloudTrailService {
                 CostComponent {
                     name: "Data Events".into(),
                     expr: data_events,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Management Event Copies".into(),
                     expr: mgmt_copies,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -85,6 +89,8 @@ impl Service for CloudTrailService {
                     "100k events",
                 ),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

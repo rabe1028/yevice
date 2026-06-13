@@ -131,7 +131,7 @@ fn test_base_dynamodb_cost_evaluation() {
     let result = evaluate_architecture(&arch, &usage).unwrap();
 
     // Total should be positive
-    assert!(result.total_monthly_cost > 0.0);
+    assert!(result.naive_total() > 0.0);
 
     // OrderTable (highest usage) should cost the most
     let event = result
@@ -144,7 +144,7 @@ fn test_base_dynamodb_cost_evaluation() {
         .iter()
         .find(|r| r.logical_id == "CustomerTable")
         .unwrap();
-    assert!(event.monthly_cost > metadata.monthly_cost);
+    assert!(event.monthly_cost.value > metadata.monthly_cost.value);
 }
 
 // =========================================================================
@@ -213,17 +213,17 @@ fn test_kinesis_prd_vs_dev_shard_count() {
 
     // prd (2 shards) should cost more than dev (1 shard)
     assert!(
-        prd_result.total_monthly_cost > dev_result.total_monthly_cost,
+        prd_result.naive_total() > dev_result.naive_total(),
         "prd ({}) should cost more than dev ({})",
-        prd_result.total_monthly_cost,
-        dev_result.total_monthly_cost
+        prd_result.naive_total(),
+        dev_result.naive_total()
     );
 
     // Shard cost difference should be exactly 1 shard * hours
     let shard_hour_price = 0.0195;
     let hours_per_month = 730.0;
     let expected_diff = shard_hour_price * hours_per_month;
-    let actual_diff = prd_result.total_monthly_cost - dev_result.total_monthly_cost;
+    let actual_diff = prd_result.naive_total() - dev_result.naive_total();
     assert!(
         (actual_diff - expected_diff).abs() < 0.01,
         "shard cost diff should be ~${expected_diff:.2}, got ${actual_diff:.2}"
@@ -258,9 +258,9 @@ fn test_aoss_minimum_ocu_cost() {
     // Min 2 OCU indexing + 2 OCU search = 4 OCU * $0.334/hr * 730 hrs = ~$975
     let min_cost = 4.0 * 0.334 * 730.0;
     assert!(
-        result.total_monthly_cost >= min_cost,
+        result.naive_total() >= min_cost,
         "AOSS cost ${:.2} should be >= min OCU cost ${:.2}",
-        result.total_monthly_cost,
+        result.naive_total(),
         min_cost
     );
 }
@@ -319,7 +319,7 @@ fn test_ingest_pipeline_cost_evaluation() {
     let usage = load_usage("usage.yaml");
     let result = evaluate_architecture(&arch, &usage).unwrap();
 
-    assert!(result.total_monthly_cost > 0.0);
+    assert!(result.naive_total() > 0.0);
 
     // OrderIngestFunction (5M requests, 256MB, 200ms) should be the most expensive Lambda
     let ingest = result
@@ -333,10 +333,10 @@ fn test_ingest_pipeline_cost_evaluation() {
         .find(|r| r.logical_id == "OrderBackupFunction")
         .unwrap();
     assert!(
-        ingest.monthly_cost > backup.monthly_cost,
+        ingest.monthly_cost.value > backup.monthly_cost.value,
         "OrderIngestFunction (${:.2}) should cost more than OrderBackupFunction (${:.2})",
         ingest.monthly_cost,
-        backup.monthly_cost
+        backup.monthly_cost.value
     );
 }
 
@@ -379,10 +379,10 @@ fn test_ingest_sam_memory_from_findinmap() {
         .find(|r| r.logical_id == "OrderIngestFunction")
         .unwrap();
     assert!(
-        prd_ingest.monthly_cost > dev_ingest.monthly_cost,
+        prd_ingest.monthly_cost.value > dev_ingest.monthly_cost.value,
         "prd 256MB (${:.2}) should cost more than dev 128MB (${:.2})",
         prd_ingest.monthly_cost,
-        dev_ingest.monthly_cost
+        dev_ingest.monthly_cost.value
     );
 }
 
@@ -441,7 +441,7 @@ fn test_full_stack_prd_vs_dev_comparison() {
         let prd_res = parser::resolve_template(&tmpl, &prd_params, &imports).unwrap();
         let prd_arch = build_architecture_cost(tmpl_name, &prd_res, (), false);
         if let Ok(r) = evaluate_architecture(&prd_arch, &usage) {
-            prd_total += r.total_monthly_cost;
+            prd_total += r.naive_total();
         }
 
         let tmpl = parser::parse_template(fixtures_dir().join(tmpl_name).as_ref()).unwrap();
@@ -449,7 +449,7 @@ fn test_full_stack_prd_vs_dev_comparison() {
         let dev_res = parser::resolve_template(&tmpl, &dev_params, &imports).unwrap();
         let dev_arch = build_architecture_cost(tmpl_name, &dev_res, (), false);
         if let Ok(r) = evaluate_architecture(&dev_arch, &usage) {
-            dev_total += r.total_monthly_cost;
+            dev_total += r.naive_total();
         }
     }
 
@@ -481,10 +481,10 @@ fn test_hierarchical_usage_produces_same_results() {
     let hier_result = evaluate_architecture(&arch, &hierarchical_usage).unwrap();
 
     assert!(
-        (flat_result.total_monthly_cost - hier_result.total_monthly_cost).abs() < 0.01,
+        (flat_result.naive_total() - hier_result.naive_total()).abs() < 0.01,
         "flat (${:.2}) and hierarchical (${:.2}) should produce same results",
-        flat_result.total_monthly_cost,
-        hier_result.total_monthly_cost
+        flat_result.naive_total(),
+        hier_result.naive_total()
     );
 }
 
@@ -656,7 +656,7 @@ fn test_binding_derives_lambda_requests_from_sqs() {
         .unwrap();
     // 10000 SQS messages / batch_size 1 = 10000 Lambda invocations
     // All within free tier (1M) so cost should be ~0 for requests
-    assert!(backup.monthly_cost >= 0.0);
+    assert!(backup.monthly_cost.value >= 0.0);
 }
 
 #[test]
@@ -730,13 +730,15 @@ fn test_binding_can_be_overridden_by_explicit_param() {
         .iter()
         .find(|r| r.logical_id == "OrderBackupFunction")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let cost_without = result_without
         .resources
         .iter()
         .find(|r| r.logical_id == "OrderBackupFunction")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // 5M requests (above free tier) > 10000 (within free tier) => cost_with > cost_without
     assert!(
@@ -789,7 +791,8 @@ fn test_batch_job_cost_calculation() {
         .iter()
         .find(|r| r.logical_id == "ProcessingJob")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // Fargate: (4*0.05056 + 30*0.00553) * (220/3600) * 1000 = ~$22.50
     // EBS: (512*0.096 + 2000*0.006 + 875*0.048) / 730 * (220/3600) * 1000 = ~$8.64
@@ -808,14 +811,15 @@ fn test_batch_job_cost_calculation() {
         .iter()
         .find(|r| r.logical_id == "OutputBucket")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     assert!(
         s3_cost > 1.0 && s3_cost < 20.0,
         "S3 cost should be $1-20, got ${s3_cost:.2}"
     );
 
     // Total
-    assert!(result.total_monthly_cost > 25.0, "Total should be > $25");
+    assert!(result.naive_total() > 25.0, "Total should be > $25");
 }
 
 // =========================================================================
@@ -1024,9 +1028,9 @@ fn test_batch_scenario_evaluation_with_user_bindings() {
 
     // Total cost should be positive (sanity check)
     assert!(
-        result.total_monthly_cost > 0.0,
+        result.naive_total() > 0.0,
         "total monthly cost should be positive, got: {}",
-        result.total_monthly_cost
+        result.naive_total()
     );
 
     // Batch Job (ProcessingJob) should be the most expensive resource:
@@ -1036,7 +1040,8 @@ fn test_batch_scenario_evaluation_with_user_bindings() {
         .iter()
         .find(|r| r.logical_id == "ProcessingJob")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     assert!(
         batch_cost > 20.0,
         "ProcessingJob cost should be > $20 (1000 executions x 220s), got: ${batch_cost:.2}"
@@ -1052,7 +1057,8 @@ fn test_batch_scenario_evaluation_with_user_bindings() {
         .iter()
         .find(|r| r.logical_id == "OutputBucket")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     assert!(
         s3_cost > 1.0 && s3_cost < 20.0,
         "OutputBucket cost should be $1-20, got: ${s3_cost:.2}"
@@ -1060,9 +1066,9 @@ fn test_batch_scenario_evaluation_with_user_bindings() {
 
     // Total should be greater than batch alone
     assert!(
-        result.total_monthly_cost > batch_cost,
+        result.naive_total() > batch_cost,
         "total (${:.2}) should exceed batch-only cost (${:.2})",
-        result.total_monthly_cost,
+        result.naive_total(),
         batch_cost
     );
 }
@@ -1119,10 +1125,10 @@ fn test_batch_scenario_bindings_derive_correct_values() {
 
     // Both evaluations should produce the same total cost (bindings derive the same values)
     assert!(
-        (result_bindings.total_monthly_cost - result_explicit.total_monthly_cost).abs() < 0.01,
+        (result_bindings.naive_total() - result_explicit.naive_total()).abs() < 0.01,
         "binding-derived cost (${:.4}) should match explicitly-provided cost (${:.4})",
-        result_bindings.total_monthly_cost,
-        result_explicit.total_monthly_cost
+        result_bindings.naive_total(),
+        result_explicit.naive_total()
     );
 }
 
@@ -1162,13 +1168,15 @@ fn test_batch_scenario_bindings_overridable() {
         .iter()
         .find(|r| r.logical_id == "ProcessingJob")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let batch_override = result_override
         .resources
         .iter()
         .find(|r| r.logical_id == "ProcessingJob")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // 5000 executions should cost ~5x more than 1000 executions
     assert!(

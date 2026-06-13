@@ -74,13 +74,19 @@ impl Service for MskService {
                 CostComponent {
                     name: format!("Brokers ({})", spec.broker_instance_type),
                     expr: instance_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vars,
+
+            currency: Some("USD".into()),
         })
     }
 }

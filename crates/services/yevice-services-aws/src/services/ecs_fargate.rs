@@ -92,17 +92,25 @@ impl Service for EcsFargateService {
                 CostComponent {
                     name: "vCPU".into(),
                     expr: vcpu_cost_total,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Memory".into(),
                     expr: memory_cost_total,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Data Transfer Out".into(),
                     expr: egress_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vars,
+
+            currency: Some("USD".into()),
         })
     }
 }
@@ -111,8 +119,7 @@ impl Service for EcsFargateService {
 mod tests {
     use super::*;
     use yevice_core::evaluate::evaluate;
-    use yevice_core::expr::Tier;
-    use yevice_pricing::catalog::PriceRecord;
+    use yevice_pricing::catalog::{PricedTier, PricedValue};
     use yevice_pricing::error::PricingError;
 
     struct TestCatalog;
@@ -122,14 +129,17 @@ mod tests {
             "test"
         }
 
-        fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+        fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
             match sku.as_str() {
-                "aws.fargate.vcpu_hour_price" => Ok(PriceRecord::flat(0.04)),
-                "aws.fargate.memory_gb_hour_price" => Ok(PriceRecord::flat(0.004)),
-                "aws.data_transfer.egress_tiers" => Ok(PriceRecord::tiered(vec![Tier {
-                    upper_limit: None,
-                    unit_price: 0.09,
-                }])),
+                "aws.fargate.vcpu_hour_price" => Ok(PricedValue::scalar(0.04, "USD")),
+                "aws.fargate.memory_gb_hour_price" => Ok(PricedValue::scalar(0.004, "USD")),
+                "aws.data_transfer.egress_tiers" => Ok(PricedValue::tiered(
+                    vec![PricedTier {
+                        upper_limit: None,
+                        unit_price: 0.09,
+                    }],
+                    "USD",
+                )),
                 other => Err(PricingError::NotFound {
                     service: other.to_string(),
                     region: "test".to_string(),

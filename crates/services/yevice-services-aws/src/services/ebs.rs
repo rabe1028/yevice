@@ -109,13 +109,19 @@ impl Service for EbsService {
                 CostComponent {
                     name: format!("Volume ({}{perf_note})", spec.volume_type),
                     expr: volume,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Snapshots".into(),
                     expr: snapshot,
+
+                    currency: None,
                 },
             ],
             required_variables: required,
+
+            currency: Some("USD".into()),
         })
     }
 }

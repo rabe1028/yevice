@@ -127,10 +127,10 @@ fn test_sqs_cost_scales_with_requests() {
     let high_result = evaluate_architecture(&arch, &high_params).unwrap();
 
     assert!(
-        high_result.total_monthly_cost > low_result.total_monthly_cost,
+        high_result.naive_total() > low_result.naive_total(),
         "10M SQS requests (${:.4}) should cost more than 1M requests (${:.4})",
-        high_result.total_monthly_cost,
-        low_result.total_monthly_cost
+        high_result.naive_total(),
+        low_result.naive_total()
     );
 }
 
@@ -179,7 +179,8 @@ fn test_fifo_costs_more_than_standard() {
         .iter()
         .find(|r| r.logical_id == "InputQueue")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // Extract just the ApiQueue cost from fifo
     let fifo_queue_cost = fifo_result
@@ -187,7 +188,8 @@ fn test_fifo_costs_more_than_standard() {
         .iter()
         .find(|r| r.logical_id == "ApiQueue")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         fifo_queue_cost > standard_queue_cost,
@@ -249,7 +251,8 @@ fn test_step_functions_standard_free_tier() {
         .iter()
         .find(|r| r.logical_id == "OrderWorkflow")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         sfn_cost.abs() < 0.001,
@@ -287,7 +290,8 @@ fn test_step_functions_standard_above_free_tier() {
         .iter()
         .find(|r| r.logical_id == "OrderWorkflow")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     let expected = (100_000.0 - 4_000.0) * 0.000025; // $2.40
     assert!(
@@ -328,10 +332,10 @@ fn test_express_workflow_scales_with_requests() {
     let high_result = evaluate_architecture(&arch, &high_params).unwrap();
 
     assert!(
-        high_result.total_monthly_cost > low_result.total_monthly_cost,
+        high_result.naive_total() > low_result.naive_total(),
         "Express workflow at 10M requests (${:.4}) should cost more than 100K requests (${:.4})",
-        high_result.total_monthly_cost,
-        low_result.total_monthly_cost
+        high_result.naive_total(),
+        low_result.naive_total()
     );
 }
 
@@ -362,7 +366,8 @@ fn test_sns_free_tier_applies() {
         .iter()
         .find(|r| r.logical_id == "NotificationTopic")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         sns_cost.abs() < 0.001,
@@ -396,9 +401,9 @@ fn test_sqs_fifo_with_async_api_total() {
     let result = evaluate_architecture(&arch, &params).unwrap();
 
     assert!(
-        result.total_monthly_cost > 0.0,
+        result.naive_total() > 0.0,
         "async-api total cost should be positive with realistic params, got ${:.4}",
-        result.total_monthly_cost
+        result.naive_total()
     );
 }
 
@@ -450,14 +455,16 @@ fn test_standard_vs_express_workflow_cost_comparison() {
         .iter()
         .find(|r| r.logical_id == "OrderWorkflow")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     let exp_sfn_cost = exp_result
         .resources
         .iter()
         .find(|r| r.logical_id == "EventWorkflow")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // Standard at 1M transitions: (1M - 4K) * $0.000025 = $24.90
     let expected_standard = (1_000_000.0 - 4_000.0) * 0.000025;

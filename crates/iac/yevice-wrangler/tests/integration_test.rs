@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use yevice_core::resource::Provider;
-use yevice_pricing::{PriceCatalog, PriceRecord, Sku, error::PricingError};
+use yevice_pricing::{PriceCatalog, PricedValue, Sku, error::PricingError};
 use yevice_service_api::{PriceCatalogResolver, ServiceCatalog};
 use yevice_wrangler::{parser, services::CloudflareWorkerSpec};
 
@@ -22,7 +22,7 @@ impl PriceCatalog for EmptyCatalog {
         "global"
     }
 
-    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+    fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
         Err(PricingError::NotFound {
             service: sku.as_str().to_string(),
             region: "global".to_string(),
