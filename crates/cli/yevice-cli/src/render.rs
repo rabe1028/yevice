@@ -44,9 +44,11 @@ fn fmt_amount_4(value: f64, currency: &str) -> String {
 }
 
 /// Pick the single-currency code most representative of the result for the
-/// header label. Returns `"USD"` for empty/multi-currency models so the
-/// header stays stable across mixed evaluations (the per-currency
-/// breakdown printed underneath the table conveys the full picture).
+/// header label.
+/// - `display_total` present → use that currency (i.e. `--display-currency` target)
+/// - single-currency model → use that currency
+/// - mixed-currency model (or empty) without `--display-currency` → `"mixed"`,
+///   so the column header honestly reflects heterogeneous values.
 fn header_currency(result: &ArchitectureResult) -> &str {
     if let Some(money) = &result.display_total {
         return money.currency.as_str();
@@ -54,7 +56,7 @@ fn header_currency(result: &ArchitectureResult) -> &str {
     if result.totals_by_currency.len() == 1 {
         return result.totals_by_currency.keys().next().unwrap();
     }
-    "USD"
+    "mixed"
 }
 
 // ---------------------------------------------------------------------------
@@ -699,7 +701,10 @@ mod tests {
 
     use yevice_core::evaluate::ArchitectureResult;
 
-    use super::{render_compare_table, render_simulate_breakdown_table, render_simulate_table};
+    use super::{
+        render_compare_table, render_eval_breakdown_table, render_eval_table,
+        render_simulate_breakdown_table, render_simulate_table,
+    };
 
     /// Build a minimal [`ArchSimulation`] with a single currency.
     fn make_jpy_sim(name: &str, jpy_per_hour: f64) -> ArchSimulation {
@@ -1029,6 +1034,103 @@ mod tests {
         assert!(
             rendered.contains("0.00"),
             "empty vs empty should show a zero diff, got:\n{rendered}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // eval header_currency tests
+    // -----------------------------------------------------------------------
+
+    use yevice_core::evaluate::ResourceResult;
+    use yevice_core::types::{LogicalId, ResourceType};
+
+    /// Build an [`ArchitectureResult`] with mixed USD+JPY resources.
+    fn make_arch_result_mixed(name: &str) -> ArchitectureResult {
+        let mut totals_by_currency = BTreeMap::new();
+        totals_by_currency.insert("USD".to_string(), 10.0);
+        totals_by_currency.insert("JPY".to_string(), 1000.0);
+        let resources = vec![
+            ResourceResult {
+                logical_id: LogicalId::new("ResA"),
+                resource_type: ResourceType::new("AWS::Lambda::Function"),
+                label: "ResA".to_string(),
+                monthly_cost: Money::monthly(10.0, "USD"),
+                component_costs: vec![],
+            },
+            ResourceResult {
+                logical_id: LogicalId::new("ResB"),
+                resource_type: ResourceType::new("AWS::DynamoDB::Table"),
+                label: "ResB".to_string(),
+                monthly_cost: Money::monthly(1000.0, "JPY"),
+                component_costs: vec![],
+            },
+        ];
+        ArchitectureResult {
+            name: name.to_string().into(),
+            resources,
+            totals_by_currency,
+            display_total: None,
+        }
+    }
+
+    /// Mixed-currency model without `--display-currency`: column header must
+    /// say `Monthly Cost (mixed)` for both eval and breakdown tables.
+    #[test]
+    fn eval_table_mixed_currency_no_display_currency_shows_mixed_header() {
+        let result = make_arch_result_mixed("arch-mixed");
+        let table = render_eval_table(&result, None);
+        let rendered = table.to_string();
+        assert!(
+            rendered.contains("Monthly Cost (mixed)"),
+            "mixed-currency without --display-currency should show 'Monthly Cost (mixed)', got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn eval_breakdown_table_mixed_currency_no_display_currency_shows_mixed_header() {
+        let result = make_arch_result_mixed("arch-mixed");
+        let table = render_eval_breakdown_table(&result, None);
+        let rendered = table.to_string();
+        assert!(
+            rendered.contains("Monthly Cost (mixed)"),
+            "mixed breakdown without --display-currency should show 'Monthly Cost (mixed)', got:\n{rendered}"
+        );
+    }
+
+    /// Single-currency USD model without `--display-currency`: header must
+    /// say `Monthly Cost (USD)`.
+    #[test]
+    fn eval_table_single_usd_currency_shows_usd_header() {
+        let result = make_arch_result_usd("arch-usd", 50.0);
+        let table = render_eval_table(&result, None);
+        let rendered = table.to_string();
+        assert!(
+            rendered.contains("Monthly Cost (USD)"),
+            "single USD model should show 'Monthly Cost (USD)', got:\n{rendered}"
+        );
+    }
+
+    /// Mixed-currency model WITH `--display-currency JPY`: header must say
+    /// `Monthly Cost (JPY)`.
+    #[test]
+    fn eval_table_mixed_currency_with_display_currency_shows_target_header() {
+        let mut result = make_arch_result_mixed("arch-mixed");
+        // Simulate what the CLI does: set display_total to the FX-converted total.
+        result.display_total = Some(Money::monthly(2500.0, "JPY"));
+
+        let mut rates = StaticRates::new();
+        rates.insert("USD", "JPY", 150.0);
+        rates.insert("JPY", "JPY", 1.0);
+        let at = test_date();
+        let table = render_eval_table(&result, Some((&rates, "JPY", at)));
+        let rendered = table.to_string();
+        assert!(
+            rendered.contains("Monthly Cost (JPY)"),
+            "mixed with --display-currency JPY should show 'Monthly Cost (JPY)', got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Monthly Cost (mixed)"),
+            "header must not say 'mixed' when --display-currency is set, got:\n{rendered}"
         );
     }
 }
