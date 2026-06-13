@@ -85,11 +85,14 @@ pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table 
     }
 
     // When --display-currency was applied, show the FX-converted total.
-    // Otherwise fall back to naive_total() (sum of native currencies) — for
-    // mixed-currency models, the per-currency breakdown printed by the
-    // caller carries the authoritative numbers.
+    // Single-currency results show the native total. Mixed currencies
+    // without --display-currency render `mixed (see breakdown)` so the
+    // table never folds heterogeneous numbers; the caller prints the
+    // per-currency breakdown.
     let total_cell = if let Some(money) = &result.display_total {
         fmt_money(money)
+    } else if result.totals_by_currency.len() > 1 {
+        "mixed (see breakdown)".to_string()
     } else {
         fmt_amount(result.naive_total(), &header_ccy)
     };
@@ -125,6 +128,8 @@ pub(crate) fn render_eval_table(result: &ArchitectureResult) -> Table {
 
     let total_cell = if let Some(money) = &result.display_total {
         fmt_money(money)
+    } else if result.totals_by_currency.len() > 1 {
+        "mixed (see breakdown)".to_string()
     } else {
         fmt_amount(result.naive_total(), &header_ccy)
     };
@@ -223,36 +228,46 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
         }
     }
 
-    // Difference row (only when exactly 2 architectures are compared).
-    // Uses display_total when both architectures provide it (which implies a
-    // single shared target currency); otherwise compares naive totals — only
-    // meaningful when both architectures are in the same native currency.
+    // Difference row (only when exactly 2 architectures are compared, and
+    // only when both totals are commensurate — i.e. both have a converted
+    // `display_total` in the same currency, or both are single-currency in
+    // the same native currency). Mixed currencies without `--display-currency`
+    // get an "n/a (mixed)" row instead of a misleading scalar diff.
     if results.len() == 2 {
-        let (lhs, rhs, ccy) = match (&results[0].display_total, &results[1].display_total) {
-            (Some(a), Some(b)) if a.currency == b.currency => {
-                (b.value - a.value, b.value, b.currency.clone())
-            }
-            _ => {
-                let diff = results[1].naive_total() - results[0].naive_total();
-                (
-                    diff,
-                    results[1].naive_total(),
-                    header_currency(&results[1]).to_string(),
-                )
-            }
-        };
-        let _ = rhs; // kept for clarity; only sign drives colour
-        let diff_str = if lhs >= 0.0 {
-            format!("+{}", fmt_amount(lhs, &ccy))
+        let comparable: Option<(f64, String)> =
+            match (&results[0].display_total, &results[1].display_total) {
+                (Some(a), Some(b)) if a.currency == b.currency => {
+                    Some((b.value - a.value, b.currency.clone()))
+                }
+                _ if results[0].totals_by_currency.len() == 1
+                    && results[1].totals_by_currency.len() == 1
+                    && results[0].totals_by_currency.keys().next()
+                        == results[1].totals_by_currency.keys().next() =>
+                {
+                    let ccy = header_currency(&results[1]).to_string();
+                    Some((results[1].naive_total() - results[0].naive_total(), ccy))
+                }
+                _ => None,
+            };
+        if let Some((diff, ccy)) = comparable {
+            let diff_str = if diff >= 0.0 {
+                format!("+{}", fmt_amount(diff, &ccy))
+            } else {
+                format!("-{}", fmt_amount(diff.abs(), &ccy))
+            };
+            let color = if diff > 0.0 { Color::Red } else { Color::Green };
+            summary.add_row(vec![
+                Cell::new("Difference"),
+                Cell::new("-"),
+                Cell::new(diff_str).fg(color),
+            ]);
         } else {
-            format!("-{}", fmt_amount(lhs.abs(), &ccy))
-        };
-        let color = if lhs > 0.0 { Color::Red } else { Color::Green };
-        summary.add_row(vec![
-            Cell::new("Difference"),
-            Cell::new("-"),
-            Cell::new(diff_str).fg(color),
-        ]);
+            summary.add_row(vec![
+                Cell::new("Difference"),
+                Cell::new("-"),
+                Cell::new("n/a (currency mismatch)").fg(Color::Yellow),
+            ]);
+        }
     }
 
     summary
