@@ -49,4 +49,19 @@ pub enum SolverError {
     /// A core evaluation error propagated from the expression evaluator.
     #[error("expression evaluation error")]
     Eval(#[from] yevice_core::error::CoreError),
+
+    /// The requested solver backend name is not recognized by the
+    /// [`solver_from_name`] factory.
+    ///
+    /// [`solver_from_name`]: crate::solver_from_name
+    #[error(
+        "unknown solver backend '{requested}'. Allowed values: {}",
+        allowed.join(", ")
+    )]
+    UnknownSolver {
+        /// The name the caller asked for.
+        requested: String,
+        /// The list of backends that the current build understands.
+        allowed: Vec<String>,
+    },
 }

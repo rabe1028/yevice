@@ -11,7 +11,9 @@ use std::collections::HashMap;
 
 pub use error::SolverError;
 use yevice_core::evaluate::{self, Params, resolve_bindings_into};
-use yevice_core::optimize::{ObjectiveDirection, OptimizationProblem, Relation};
+use yevice_core::optimize::{
+    DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
+};
 use yevice_core::types::VariableName;
 
 /// Maximum number of combinations the [`EnumerationSolver`] will attempt.
@@ -106,6 +108,209 @@ pub fn validate_bindings(problem: &OptimizationProblem) -> Result<(), SolverErro
     }
 }
 
+/// Prune each decision variable's domain by applying constraints that depend
+/// on exactly one decision variable.
+///
+/// For every constraint whose left-hand expression references **exactly one**
+/// decision variable (and no other unbound variables), this function evaluates
+/// the constraint for each candidate value of that variable's domain and
+/// discards values that violate the constraint. Multi-variable constraints are
+/// left untouched — they are checked during enumeration as before. This
+/// preserves correctness while reducing the Cartesian product the enumerator
+/// has to walk.
+///
+/// Returns the pruned list of decision variables. If any decision variable's
+/// domain becomes empty after pruning, [`SolverError::Infeasible`] is returned
+/// (no assignment can satisfy that single-variable constraint).
+///
+/// Values for which the constraint LHS fails to evaluate (e.g. division by
+/// zero) are also dropped — they cannot be feasible.
+///
+/// Fixed parameters and `bindings` are taken into account when evaluating the
+/// constraint LHS so that derived values referencing the single decision
+/// variable resolve correctly (e.g. `usage = x * factor`).
+pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariable>, SolverError> {
+    let mut pruned: Vec<DecisionVariable> = problem.decision_variables.clone();
+    if pruned.is_empty() || problem.constraints.is_empty() {
+        return Ok(pruned);
+    }
+
+    // Decision-variable name set, used to detect "this constraint references
+    // exactly one decision variable" robustly even when bindings introduce
+    // other variable names.
+    let decision_names: std::collections::HashSet<VariableName> =
+        pruned.iter().map(|dv| dv.name.clone()).collect();
+
+    // Pre-compute, for each constraint, the set of *decision* variables it
+    // depends on (transitively through bindings).  We treat fixed-param-only
+    // dependencies as "no decision dependency".
+    let single_var_constraints: Vec<(&OptimizationConstraint, VariableName)> = problem
+        .constraints
+        .iter()
+        .filter_map(|c| {
+            let depends_on = constraint_decision_dependencies(c, problem, &decision_names);
+            if depends_on.len() == 1 {
+                let name = depends_on.into_iter().next().unwrap();
+                Some((c, name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if single_var_constraints.is_empty() {
+        return Ok(pruned);
+    }
+
+    // Base params: fixed parameters only. Per-variable filtering writes the
+    // candidate domain value into a scratch clone of this base.
+    let base: Params = problem
+        .fixed_params
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
+    let before: u64 = pruned
+        .iter()
+        .map(|dv| dv.domain.len() as u64)
+        .product::<u64>()
+        .max(1);
+
+    for dv in &mut pruned {
+        // Collect the constraints that target this specific decision variable.
+        let relevant: Vec<&OptimizationConstraint> = single_var_constraints
+            .iter()
+            .filter_map(|(c, name)| if name == &dv.name { Some(*c) } else { None })
+            .collect();
+        if relevant.is_empty() {
+            continue;
+        }
+
+        let original_len = dv.domain.len();
+        let mut scratch: Params = base.clone();
+        // Pre-seed *other* decision variables as 0.0 so binding resolution
+        // doesn't accidentally pick them up — single-variable constraints by
+        // definition don't transitively depend on those slots, but their
+        // presence keeps `resolve_bindings_into` from creating spurious
+        // bindings.
+        for other in &problem.decision_variables {
+            if other.name != dv.name {
+                scratch.entry(other.name.clone()).or_insert(0.0);
+            }
+        }
+
+        dv.domain.retain(|&value| {
+            scratch.insert(dv.name.clone(), value);
+            // Resolve bindings before evaluating the constraint LHS.
+            resolve_bindings_into(&mut scratch, &problem.bindings);
+            let keep = relevant.iter().all(|c| {
+                let lhs = match evaluate::evaluate(&c.lhs, &scratch) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                match c.relation {
+                    Relation::Le => lhs <= c.rhs + CONSTRAINT_TOLERANCE,
+                    Relation::Ge => lhs >= c.rhs - CONSTRAINT_TOLERANCE,
+                    Relation::Eq => (lhs - c.rhs).abs() <= CONSTRAINT_TOLERANCE,
+                }
+            });
+            // Clear binding targets from scratch so the next iteration's
+            // binding resolution sees a fresh slate (per resolve_bindings_into
+            // contains_key semantics, a stale binding result would otherwise
+            // shadow a re-resolve).
+            for b in &problem.bindings {
+                if !base.contains_key(&b.target) && b.target != dv.name {
+                    scratch.remove(&b.target);
+                }
+            }
+            keep
+        });
+
+        if dv.domain.len() < original_len {
+            tracing::debug!(
+                variable = %dv.name,
+                before = original_len,
+                after = dv.domain.len(),
+                "pruned single-variable constraint domain",
+            );
+        }
+
+        if dv.domain.is_empty() {
+            return Err(SolverError::Infeasible);
+        }
+    }
+
+    let after: u64 = pruned
+        .iter()
+        .map(|dv| dv.domain.len() as u64)
+        .product::<u64>()
+        .max(1);
+
+    if after < before {
+        tracing::debug!(
+            combinations_before = before,
+            combinations_after = after,
+            "domain pruning reduced combination count",
+        );
+    }
+
+    Ok(pruned)
+}
+
+/// Identify the **decision-variable** names that the given constraint depends
+/// on, walking through `bindings` transitively. Fixed-parameter references are
+/// ignored. The returned set contains only names from the problem's decision
+/// variables.
+fn constraint_decision_dependencies(
+    constraint: &OptimizationConstraint,
+    problem: &OptimizationProblem,
+    decision_names: &std::collections::HashSet<VariableName>,
+) -> std::collections::HashSet<VariableName> {
+    // Standard frontier BFS through bindings: start with the LHS's variables,
+    // expand any binding target to its source variables, until no new names are
+    // discovered. Then keep only decision-variable names.
+    let mut visited: std::collections::HashSet<VariableName> = std::collections::HashSet::new();
+    let mut frontier: Vec<VariableName> = constraint.lhs.variables().into_iter().collect();
+
+    while let Some(name) = frontier.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        // If this name is the target of a binding, expand it.
+        for b in &problem.bindings {
+            if b.target == name {
+                for v in b.expr.variables() {
+                    if !visited.contains(&v) {
+                        frontier.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    visited
+        .into_iter()
+        .filter(|v| decision_names.contains(v))
+        .collect()
+}
+
+/// Construct a solver instance by name.
+///
+/// This is the public factory used by the CLI's `--solver` option. New
+/// backends (LP/MIP) will plug in here behind feature gates.
+///
+/// Returns a descriptive error naming the allowed values when `name` is
+/// unknown.
+pub fn solver_from_name(name: &str) -> Result<Box<dyn Solver>, SolverError> {
+    match name {
+        "enumeration" => Ok(Box::new(EnumerationSolver)),
+        other => Err(SolverError::UnknownSolver {
+            requested: other.to_string(),
+            allowed: vec!["enumeration".to_string()],
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EnumerationSolver
 // ---------------------------------------------------------------------------
@@ -153,6 +358,38 @@ impl Solver for EnumerationSolver {
                 first_evaluation_error: None,
             });
         }
+
+        // Domain pre-filtering: drop values that violate any single-variable
+        // constraint up-front to shrink the Cartesian product.  Returns
+        // SolverError::Infeasible when any variable's domain becomes empty.
+        let pruned_vars = match prune_domains(problem) {
+            Ok(v) => v,
+            Err(SolverError::Infeasible) => {
+                return Ok(Solution {
+                    assignments: HashMap::new(),
+                    objective_value: f64::NAN,
+                    feasible: false,
+                    evaluation_failures: 0,
+                    total_combinations: 0,
+                    first_evaluation_error: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Construct a thin shallow copy of the problem with the pruned
+        // decision variables so combination_count and the enumeration loop
+        // walk the reduced domains.  We avoid cloning the whole problem
+        // (which can be large) — only the decision-variable list is replaced.
+        let pruned_problem = OptimizationProblem {
+            objective: problem.objective.clone(),
+            direction: problem.direction,
+            decision_variables: pruned_vars,
+            constraints: problem.constraints.clone(),
+            fixed_params: problem.fixed_params.clone(),
+            bindings: problem.bindings.clone(),
+        };
+        let problem = &pruned_problem;
 
         // Guard against combinatorial explosion.
         let combination_count = combination_count(problem)?;
@@ -2091,6 +2328,210 @@ mod tests {
             matches!(&err, SolverError::UnboundVariables { variables } if variables == &vec!["derived".to_string()]),
             "expected UnboundVariables naming 'derived', got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // prune_domains tests
+    // -----------------------------------------------------------------------
+
+    /// Single-variable Ge constraint shrinks the domain to feasible values
+    /// and the resulting solver run still returns the correct optimum.
+    #[test]
+    fn prune_domains_drops_infeasible_single_variable_values() {
+        // constraint: x >= 3, domain {1, 2, 3, 4, 5} → pruned {3, 4, 5}.
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Ge,
+            rhs: 3.0,
+            label: None,
+        };
+
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0, 4.0, 5.0])],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        let pruned = prune_domains(&problem).expect("expected feasible pruning");
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].domain, vec![3.0, 4.0, 5.0]);
+    }
+
+    /// When every domain value violates a single-variable constraint, the
+    /// pruner reports `SolverError::Infeasible`, and `EnumerationSolver::solve`
+    /// translates that into a non-feasible `Solution`.
+    #[test]
+    fn prune_domains_infeasible_when_all_values_eliminated() {
+        // constraint: x >= 100, domain {1, 2, 3} → all values pruned.
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Ge,
+            rhs: 100.0,
+            label: None,
+        };
+
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        let err = prune_domains(&problem).unwrap_err();
+        assert!(
+            matches!(err, SolverError::Infeasible),
+            "expected Infeasible, got {err:?}"
+        );
+
+        // And the solver as a whole should surface a non-feasible Solution.
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(!sol.feasible);
+    }
+
+    /// Multi-variable constraints must NOT be touched by the pruner — values
+    /// that *individually* look invalid may become feasible once another
+    /// decision variable's value is chosen.
+    #[test]
+    fn prune_domains_leaves_multi_variable_constraints_alone() {
+        // constraint: x + y <= 5
+        // domain x = {1, 2, 3, 4, 5}, y = {1, 2, 3, 4, 5}
+        // No single-variable pruning is valid here: for any x in {1..=4} there
+        // is some y making it feasible. The pruner must leave both domains
+        // untouched.
+        let constraint = OptimizationConstraint {
+            lhs: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            relation: Relation::Le,
+            rhs: 5.0,
+            label: None,
+        };
+
+        let problem = problem_with(
+            Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            ObjectiveDirection::Minimize,
+            vec![
+                dv("x", vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+                dv("y", vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+            ],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        let pruned = prune_domains(&problem).expect("expected feasible pruning");
+        assert_eq!(pruned.len(), 2);
+        assert_eq!(pruned[0].domain, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(pruned[1].domain, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// Pruning is sound: a problem with a Ge constraint on a single variable
+    /// must still return the same optimum as without pruning.
+    #[test]
+    fn prune_preserves_solver_optimum() {
+        // objective = 10 * x;  x ∈ {1, 2, 3, 4, 5};  constraint: x >= 3
+        // Optimum: x=3, objective=30.
+        let objective = Expr::product(vec![Expr::constant(10.0), Expr::variable("x")]);
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Ge,
+            rhs: 3.0,
+            label: None,
+        };
+
+        let problem = problem_with(
+            objective,
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0, 4.0, 5.0])],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(sol.feasible);
+        assert_eq!(sol.assignments[&var("x")], 3.0);
+        assert_eq!(sol.objective_value, 30.0);
+    }
+
+    /// A constraint depending on a single decision variable through a binding
+    /// (e.g. `usage = factor * x`) must still be picked up by the pruner.
+    #[test]
+    fn prune_follows_binding_to_single_decision_variable() {
+        use yevice_core::cost::VariableBinding;
+
+        // binding: usage = factor * x  (factor is a fixed param)
+        // constraint: usage <= 50
+        // x ∈ {1..=10}, factor = 10  → x*10 <= 50  → x ∈ {1..=5}
+        let binding = VariableBinding {
+            target: var("usage"),
+            expr: Expr::product(vec![Expr::variable("factor"), Expr::variable("x")]),
+            description: "usage = factor * x".into(),
+            source: "test".into(),
+        };
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("usage"),
+            relation: Relation::Le,
+            rhs: 50.0,
+            label: None,
+        };
+
+        let mut fixed = HashMap::new();
+        fixed.insert(var("factor"), 10.0);
+
+        let problem = OptimizationProblem {
+            objective: Expr::variable("usage"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![dv(
+                "x",
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            )],
+            constraints: vec![constraint],
+            fixed_params: fixed,
+            bindings: vec![binding],
+        };
+
+        let pruned = prune_domains(&problem).expect("expected feasible pruning");
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].domain, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // solver_from_name tests
+    // -----------------------------------------------------------------------
+
+    /// The `"enumeration"` name maps to a working solver.
+    #[test]
+    fn solver_from_name_enumeration_returns_working_solver() {
+        let solver = solver_from_name("enumeration").expect("must return Ok");
+        // Solve a trivial problem to exercise the boxed solver.
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![],
+            HashMap::new(),
+        );
+        let sol = solver.solve(&problem).unwrap();
+        assert!(sol.feasible);
+        assert_eq!(sol.assignments[&var("x")], 1.0);
+    }
+
+    /// Unknown names return `UnknownSolver` listing the allowed values.
+    #[test]
+    fn solver_from_name_unknown_returns_error() {
+        let result = solver_from_name("simplex");
+        let err = match result {
+            Ok(_) => panic!("expected UnknownSolver error"),
+            Err(e) => e,
+        };
+        match &err {
+            SolverError::UnknownSolver { requested, allowed } => {
+                assert_eq!(requested, "simplex");
+                assert!(allowed.contains(&"enumeration".to_string()));
+            }
+            other => panic!("expected UnknownSolver, got {other:?}"),
+        }
+        assert!(err.to_string().contains("enumeration"));
     }
 
     /// `EnumerationSolver::solve` must reject an unbound objective up-front
