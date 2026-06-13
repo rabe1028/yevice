@@ -87,7 +87,7 @@ pub fn generate(
     // Surface diagnostics to the operator regardless of policy (Lenient
     // succeeds; Strict aborts later if any Error-severity diagnostic is
     // present). This matches ADR-0003 "stderr に tracing::warn! で表示".
-    report_diagnostics(&cost_model.diagnostics);
+    report_diagnostics(&cost_model.diagnostics, policy);
 
     if format == InputFormat::Cfn
         && let Some(path) = bindings_path
@@ -130,16 +130,36 @@ pub fn generate(
 }
 
 /// Emit each diagnostic to stderr via `tracing` so operators see them even
-/// without `--strict`. Severity is mapped to `error!` / `warn!` / `info!`.
-fn report_diagnostics(diagnostics: &[yevice_core::parse_policy::IacParseDiagnostic]) {
+/// without `--strict`.
+///
+/// Under [`ParsePolicy::Strict`] the command will abort on any error-severity
+/// diagnostic, so emitting them at `error!` is appropriate (the process is
+/// failing). Under [`ParsePolicy::Lenient`] the command will still succeed,
+/// so error-severity diagnostics are demoted to `warn!` to avoid making a
+/// successful run look failed to log scrapers (per ADR-0003 "Lenient ->
+/// stderr に tracing::warn! で表示"). Diagnostic
+/// [`DiagSeverity::Warning`] / [`DiagSeverity::Info`] entries always use
+/// `warn!` / `info!`.
+fn report_diagnostics(
+    diagnostics: &[yevice_core::parse_policy::IacParseDiagnostic],
+    policy: ParsePolicy,
+) {
     for d in diagnostics {
         match d.severity {
-            DiagSeverity::Error => tracing::error!(
-                source = ?d.source,
-                code = %d.code,
-                "{}",
-                d.message
-            ),
+            DiagSeverity::Error => match policy {
+                ParsePolicy::Strict => tracing::error!(
+                    source = ?d.source,
+                    code = %d.code,
+                    "{}",
+                    d.message
+                ),
+                ParsePolicy::Lenient => tracing::warn!(
+                    source = ?d.source,
+                    code = %d.code,
+                    "{}",
+                    d.message
+                ),
+            },
             DiagSeverity::Warning => tracing::warn!(
                 source = ?d.source,
                 code = %d.code,
@@ -350,7 +370,7 @@ pub fn validate(
         &registries,
         policy,
     )?;
-    report_diagnostics(&arch_outcome.diagnostics);
+    report_diagnostics(&arch_outcome.diagnostics, policy);
     if strict && arch_outcome.had_errors {
         bail!("strict mode: IaC parse produced error-severity diagnostics");
     }
