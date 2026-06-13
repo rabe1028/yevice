@@ -276,6 +276,119 @@ fn binding_target_referenced_before_definition() {
 }
 
 #[test]
+fn decision_var_wins_over_colliding_fixed_param_bounds() {
+    // Codex round-2 P2: decision-var x ∈ {0,10} must override fixed
+    // param x=100 in expr_bounds, so Max(x, 0) bounds and the optimum
+    // are based on the decision domain.
+    let mut fixed = HashMap::new();
+    fixed.insert(VariableName::new("x"), 100.0);
+    let problem = OptimizationProblem {
+        objective: Expr::Max {
+            expr: Box::new(Expr::variable("x")),
+            floor: 0.0,
+        },
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![0.0, 10.0],
+        }],
+        constraints: vec![],
+        fixed_params: fixed,
+        bindings: vec![],
+    };
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(h.feasible);
+    // Optimum: x=0, max(0, 0) = 0 — NOT 100.
+    assert!(
+        h.objective_value.abs() < 1e-4,
+        "expected 0, got {}",
+        h.objective_value
+    );
+}
+
+#[test]
+fn chained_bindings_max_objective_round_trip() {
+    // Codex round-2 P2: bindings `[b = a + 1, a = x]` with Max(b, 0)
+    // must encode without UnboundedExpression. The fixed-point range
+    // propagation in pass B(.0) should give `a` finite bounds before
+    // `b`'s range is queried.
+    use yevice_core::cost::VariableBinding;
+    let bindings = vec![
+        VariableBinding {
+            target: VariableName::new("b"),
+            expr: Expr::linear(1.0, Expr::variable("a"), 1.0),
+            description: "b = a + 1".into(),
+            source: "test".into(),
+        },
+        VariableBinding {
+            target: VariableName::new("a"),
+            expr: Expr::variable("x"),
+            description: "a = x".into(),
+            source: "test".into(),
+        },
+    ];
+    let problem = OptimizationProblem {
+        objective: Expr::Max {
+            expr: Box::new(Expr::variable("b")),
+            floor: 0.0,
+        },
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![0.0, 1.0, 2.0],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings,
+    };
+    let e = EnumerationSolver.solve(&problem).unwrap();
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(e.feasible && h.feasible);
+    assert_close(
+        e.objective_value,
+        h.objective_value,
+        "chained bindings + Max",
+    );
+}
+
+#[test]
+fn tiered_clamps_negative_usage_to_zero() {
+    // Codex round-2 P2: Tiered evaluator clamps negative usage to 0.
+    // The MILP encoder must too — otherwise an inner expression whose
+    // interval reaches negative values would be infeasible.
+    // Setup: x ∈ {-10, 0, 50}, tiered cost of (x - 5) with a single tier
+    // at 0.10/unit. The evaluator gives x=-10 → cost 0, x=0 → cost 0,
+    // x=50 → 0.10*45 = 4.5. Optimum is cost 0, attained at x=-10 or 0.
+    let problem = OptimizationProblem {
+        objective: Expr::tiered(
+            vec![Tier {
+                upper_limit: None,
+                unit_price: 0.10,
+            }],
+            Expr::linear(1.0, Expr::variable("x"), -5.0),
+        ),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![-10.0, 0.0, 50.0],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings: vec![],
+    };
+    let e = EnumerationSolver.solve(&problem).unwrap();
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(e.feasible, "enumerator must accept negative usage");
+    assert!(h.feasible, "MILP must accept negative usage (clamped to 0)");
+    assert_close(
+        e.objective_value,
+        h.objective_value,
+        "tiered negative usage",
+    );
+    assert!(h.objective_value.abs() < 1e-4);
+}
+
+#[test]
 fn infeasible_problem_consistent() {
     // x ∈ {1,2,3}, constraint x >= 100 → infeasible.
     let problem = OptimizationProblem {

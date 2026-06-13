@@ -288,14 +288,21 @@ pub fn expr_bounds(expr: &Expr, ranges: &VarRanges) -> Bounds {
         Expr::Constant { value } => Bounds::point(*value),
 
         Expr::Variable { name } => {
-            if let Some(&v) = ranges.fixed_params.get(name) {
-                return Bounds::point(v);
-            }
+            // Decision variables win over fixed params on a name collision,
+            // matching the documented last-write-wins semantics of
+            // `EnumerationSolver` (a decision-variable slot's value is
+            // written into `scratch` after fixed_params, and the MILP
+            // encoder also skips a colliding fixed param). Using the fixed
+            // value here would produce a bogus point bound that ignores
+            // the decision domain.
             if let Some(&(lo, hi)) = ranges.decision_var_ranges.get(name) {
                 return Bounds {
                     lower: lo,
                     upper: hi,
                 };
+            }
+            if let Some(&v) = ranges.fixed_params.get(name) {
+                return Bounds::point(v);
             }
             Bounds::unbounded()
         }

@@ -153,8 +153,19 @@ pub(crate) fn encode(
     let mut enc = Encoder::new(backend, build_ranges(problem));
 
     // 1) Register decision variables as binary-indicator combinations.
-    let mut decision_indicators: BTreeMap<VariableName, Vec<(VarId, f64)>> = BTreeMap::new();
+    //
+    // Duplicate names: `EnumerationSolver` documents "last-write-wins"
+    // semantics (a later slot overwrites earlier values in the scratch
+    // map). The MILP encoder honours the same rule by keeping only the
+    // LAST slot per name; encoding multiple indicator sets with the same
+    // value variable would intersect domains and break feasibility for
+    // problems the enumerator accepts.
+    let mut last_slot_by_name: BTreeMap<&VariableName, &DecisionVariable> = BTreeMap::new();
     for dv in &problem.decision_variables {
+        last_slot_by_name.insert(&dv.name, dv);
+    }
+    let mut decision_indicators: BTreeMap<VariableName, Vec<(VarId, f64)>> = BTreeMap::new();
+    for dv in last_slot_by_name.values() {
         let indicators = register_decision_var(&mut enc, dv)?;
         decision_indicators.insert(dv.name.clone(), indicators);
     }
@@ -193,18 +204,41 @@ pub(crate) fn encode(
         enc.var_index.insert(binding.target.clone(), target_id);
         binding_target_ids.push(Some(target_id));
     }
+    // Pass B(.0): propagate ranges in a fixed-point loop so a binding
+    //   whose RHS depends on a *later* binding still picks up a finite
+    //   interval before pass B(.1) encodes RHS expressions (which use the
+    //   ranges for big-M derivation in any nested Max / Min / Tiered).
+    //   `validate_bindings` has already proven the graph is acyclic, so
+    //   the loop terminates within `bindings.len()` passes.
+    let max_passes = problem.bindings.len() + 1;
+    for _ in 0..max_passes {
+        let mut progressed = false;
+        for (binding, target_opt) in problem.bindings.iter().zip(binding_target_ids.iter()) {
+            if target_opt.is_none() {
+                continue;
+            }
+            let already_known = enc.ranges.decision_var_ranges.get(&binding.target).copied();
+            let bounds = expr_bounds(&binding.expr, &enc.ranges);
+            if !bounds.is_finite() {
+                continue;
+            }
+            let new_range = (bounds.lower, bounds.upper);
+            if already_known != Some(new_range) {
+                enc.ranges
+                    .decision_var_ranges
+                    .insert(binding.target.clone(), new_range);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // Pass B(.1): encode each RHS once ranges are stable.
     for (binding, target_opt) in problem.bindings.iter().zip(binding_target_ids.iter()) {
         let Some(target_id) = *target_opt else {
             continue;
         };
-        // Update ranges from the now-resolvable RHS so downstream Max/Min
-        // big-M derivation sees a finite interval where possible.
-        let bounds = expr_bounds(&binding.expr, &enc.ranges);
-        if bounds.is_finite() {
-            enc.ranges
-                .decision_var_ranges
-                .insert(binding.target.clone(), (bounds.lower, bounds.upper));
-        }
         // Constrain: target == linearize(expr).
         let lhs = encode_expr(&mut enc, &binding.expr)?;
         let combined = LinearTerms::from_var(target_id, 1.0).sub(lhs);
@@ -517,7 +551,7 @@ fn encode_tiered(
     tiers: &[yevice_core::expr::Tier],
     inner: &Expr,
 ) -> Result<LinearTerms, SolverError> {
-    let inner_terms = encode_expr(enc, inner)?;
+    let raw_inner_terms = encode_expr(enc, inner)?;
     let b = expr_bounds(inner, &enc.ranges);
     let usage_upper = if b.upper.is_finite() {
         b.upper.max(0.0)
@@ -525,6 +559,42 @@ fn encode_tiered(
         return Err(SolverError::UnboundedExpression {
             expr: format!("{inner:?}"),
         });
+    };
+
+    // The evaluator clamps negative usage to 0 (it exits the tier loop as
+    // soon as `remaining <= 0`). The MILP equality `Σ q_i = inner` would
+    // make a negative inner value infeasible since `q_i ≥ 0`. Whenever the
+    // inner's interval admits negative values, route through an auxiliary
+    // `usage = max(inner, 0)` so the link uses the clamped value instead.
+    let inner_terms = if b.lower < 0.0 && b.lower.is_finite() {
+        // Reuse the Max encoder by emitting it inline with the existing
+        // LinearTerms. Aux var `u ∈ [0, usage_upper]`, plus the same
+        // big-M selector pattern as `encode_max`.
+        let m_lo = 0.0f64;
+        let m_hi = usage_upper;
+        let u = enc.alloc_aux(m_lo, m_hi, VarType::Continuous);
+        let z = enc.alloc_aux(0.0, 1.0, VarType::Binary);
+        let big_m = (b.upper - 0.0)
+            .abs()
+            .max((0.0 - b.lower).abs())
+            .max((b.upper - b.lower).abs())
+            .max(1.0)
+            + 1.0;
+        // u >= inner
+        let t1 = LinearTerms::from_var(u, 1.0).sub(raw_inner_terms.clone());
+        emit_linear_ge(enc.backend, &t1, 0.0);
+        // u >= 0  (already ensured by lower bound).
+        // u <= inner + M(1 - z)
+        let t3 = LinearTerms::from_var(u, 1.0)
+            .sub(raw_inner_terms.clone())
+            .add(LinearTerms::from_var(z, big_m));
+        emit_linear_le(enc.backend, &t3, big_m);
+        // u <= M z
+        let t4 = LinearTerms::from_var(u, 1.0).add(LinearTerms::from_var(z, -big_m));
+        emit_linear_le(enc.backend, &t4, 0.0);
+        LinearTerms::from_var(u, 1.0)
+    } else {
+        raw_inner_terms
     };
 
     // Determine each tier's width.
