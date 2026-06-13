@@ -863,21 +863,45 @@ pub fn simulate(
             (Some(a), Some(b)) if a.currency == b.currency => {
                 Some((b.value - a.value, b.currency.clone()))
             }
-            _ if arch_results[0].totals_by_currency.len() == 1
-                && arch_results[1].totals_by_currency.len() == 1
-                && arch_results[0].totals_by_currency.keys().next()
-                    == arch_results[1].totals_by_currency.keys().next() =>
-            {
-                let ccy = arch_results[1]
-                    .single_currency()
-                    .unwrap_or("USD")
-                    .to_string();
-                Some((
-                    arch_results[1].naive_total() - arch_results[0].naive_total(),
-                    ccy,
-                ))
+            _ => {
+                let a_empty = arch_results[0].totals_by_currency.is_empty();
+                let b_empty = arch_results[1].totals_by_currency.is_empty();
+                let a_single = arch_results[0].totals_by_currency.len() == 1;
+                let b_single = arch_results[1].totals_by_currency.len() == 1;
+                if a_empty && b_empty {
+                    // Both zero-resource: diff is 0 in a fallback currency.
+                    Some((0.0, "USD".to_string()))
+                } else if a_empty && b_single {
+                    // a is zero; adopt b's currency.
+                    let ccy = arch_results[1]
+                        .single_currency()
+                        .unwrap_or("USD")
+                        .to_string();
+                    Some((arch_results[1].naive_total(), ccy))
+                } else if b_empty && a_single {
+                    // b is zero; adopt a's currency.
+                    let ccy = arch_results[0]
+                        .single_currency()
+                        .unwrap_or("USD")
+                        .to_string();
+                    Some((-arch_results[0].naive_total(), ccy))
+                } else if a_single
+                    && b_single
+                    && arch_results[0].totals_by_currency.keys().next()
+                        == arch_results[1].totals_by_currency.keys().next()
+                {
+                    let ccy = arch_results[1]
+                        .single_currency()
+                        .unwrap_or("USD")
+                        .to_string();
+                    Some((
+                        arch_results[1].naive_total() - arch_results[0].naive_total(),
+                        ccy,
+                    ))
+                } else {
+                    None
+                }
             }
-            _ => None,
         };
 
         if let Some((diff, ccy)) = comparable {
@@ -1850,6 +1874,98 @@ mod tests {
         assert!(
             result.is_ok(),
             "sensitivity on mixed-currency model without --display-currency should succeed (warn): {result:?}"
+        );
+    }
+
+    // --- simulate zero-resource comparison tests (#36) ---
+
+    /// Minimal simulation profile YAML with no scaled variables.
+    fn minimal_profile_yaml() -> String {
+        "base_params: {}\nhourly_pattern: []\ndays_per_month: 30\n".to_string()
+    }
+
+    /// Simulate two empty (zero-resource) cost models must succeed without
+    /// "Cannot compare" — both are zero cost, diff = $0.00.
+    #[test]
+    fn simulate_two_empty_models_does_not_error() {
+        use std::fs;
+        let dir = temp_dir("sim-empty-empty");
+        let profile_path = dir.join("profile.yaml");
+        fs::write(&profile_path, minimal_profile_yaml()).unwrap();
+
+        let cost_model = serde_json::json!({
+            "name": "empty-model",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let model_a = dir.join("model-a.json");
+        let model_b = dir.join("model-b.json");
+        fs::write(&model_a, serde_json::to_string(&cost_model).unwrap()).unwrap();
+        fs::write(&model_b, serde_json::to_string(&cost_model).unwrap()).unwrap();
+
+        let result = super::simulate(
+            &[
+                model_a.to_str().unwrap().to_string(),
+                model_b.to_str().unwrap().to_string(),
+            ],
+            profile_path.to_str().unwrap(),
+            false,
+            None,
+            &[],
+        );
+        assert!(
+            result.is_ok(),
+            "simulate with two empty models must succeed: {result:?}"
+        );
+    }
+
+    /// Simulate one empty model vs one USD model must succeed (empty is treated
+    /// as zero in the other model's currency).
+    #[test]
+    fn simulate_empty_vs_usd_model_does_not_error() {
+        use std::fs;
+        let dir = temp_dir("sim-empty-usd");
+        let profile_path = dir.join("profile.yaml");
+        fs::write(&profile_path, minimal_profile_yaml()).unwrap();
+
+        let empty_model = serde_json::json!({
+            "name": "empty",
+            "resources": [],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        // A model with one USD resource so totals_by_currency = {"USD": non-zero}
+        let usd_model = serde_json::json!({
+            "name": "usd-model",
+            "resources": [{
+                "logical_id": "MyFunc",
+                "resource_type": "AWS::Lambda::Function",
+                "label": "MyFunc",
+                "expr": { "type": "Constant", "value": 12.0, "unit": "USD" },
+                "required_variables": []
+            }],
+            "region": "ap-northeast-1",
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let model_a = dir.join("model-a.json");
+        let model_b = dir.join("model-b.json");
+        fs::write(&model_a, serde_json::to_string(&empty_model).unwrap()).unwrap();
+        fs::write(&model_b, serde_json::to_string(&usd_model).unwrap()).unwrap();
+
+        let result = super::simulate(
+            &[
+                model_a.to_str().unwrap().to_string(),
+                model_b.to_str().unwrap().to_string(),
+            ],
+            profile_path.to_str().unwrap(),
+            false,
+            None,
+            &[],
+        );
+        assert!(
+            result.is_ok(),
+            "simulate with empty vs USD model must succeed: {result:?}"
         );
     }
 }
