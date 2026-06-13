@@ -209,6 +209,19 @@ pub fn compare(
     println!("\nArchitecture Cost Comparison");
     println!("{summary}");
 
+    // ADR-0001: when any model is mixed-currency and the user did not pass
+    // --display-currency, print the per-currency breakdown so the comparison
+    // total above does not visually fold incompatible numbers together.
+    if display_currency.is_none() && results.iter().any(|r| r.totals_by_currency.len() > 1) {
+        println!("\nPer-currency totals (mixed-currency models):");
+        for r in &results {
+            println!("  {}", r.name);
+            for (code, total) in &r.totals_by_currency {
+                println!("    {code}: {total:.2}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -803,7 +816,19 @@ pub fn diagram(cost_model_path: &str, format: &str, output: Option<&str>) -> Res
 fn load_cost_model(path: &str) -> Result<ArchitectureCost> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read cost model: {path}"))?;
-    Ok(yevice_core::io::parse_cost_model(&content)?)
+    let arch = yevice_core::io::parse_cost_model(&content)?;
+    // ADR-0001 post-deserialize hook: a hand-edited cost_model.json could mix
+    // currencies inside a single ResourceCost. ResourceCost::new enforces the
+    // invariant at construction time, but deserialize bypasses that path.
+    for rc in &arch.resources {
+        rc.validate().with_context(|| {
+            format!(
+                "invalid cost model {path}: resource {} has mixed component currencies",
+                rc.logical_id
+            )
+        })?;
+    }
+    Ok(arch)
 }
 
 /// Load usage parameters from a YAML file.

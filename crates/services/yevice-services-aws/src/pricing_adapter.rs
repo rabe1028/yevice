@@ -9,7 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use yevice_core::currency::{Currency, USD};
 use yevice_core::resource::Provider;
+use yevice_pricing::catalog::{TypedPriceRecord, TypedPricingProvider, TypedTier};
 use yevice_pricing::{
     catalog::{PriceCatalog, PricedValue, Sku},
     error::PricingError,
@@ -102,6 +104,28 @@ impl AwsPricingCatalog {
     }
 }
 
+impl AwsPricingCatalog {
+    /// ADR-0001 currency guard: if a Bulk-API file declares a currency other
+    /// than `USD`, reject every lookup so silent mislabeling is impossible.
+    /// AWS China region pricing should be served by a separate provider
+    /// instance (see ADR-0001 §"将来の複数通貨 provider 拡張").
+    fn enforce_usd_metadata(&self, sku: &Sku) -> Result<(), PricingError> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        for meta in file.all_metadata() {
+            if meta.currency != <USD as yevice_core::CurrencyCode>::CODE {
+                return Err(PricingError::CurrencyMismatch {
+                    expected: <USD as yevice_core::CurrencyCode>::CODE.to_string(),
+                    actual: meta.currency.clone(),
+                    sku: sku.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PriceCatalog for AwsPricingCatalog {
     fn region(&self) -> &str {
         &self.memory.region
@@ -109,6 +133,11 @@ impl PriceCatalog for AwsPricingCatalog {
 
     #[allow(clippy::too_many_lines)]
     fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
+        // Reject any lookup if downloaded Bulk-API metadata declares a
+        // non-USD currency. The check runs on both the dyn (`PriceCatalog`)
+        // and typed (`TypedPricingProvider<USD>`) entry points so the CLI
+        // path can never silently emit mislabeled USD costs.
+        self.enforce_usd_metadata(sku)?;
         // List-price mode: zero out promotional AWS Free Tier allowances.
         // Only `*free_tier*` SKUs are masked; product-included allocations such
         // as QuickSight `free_spice_gb` or Batch gp3 baseline (`*_free*`) are
@@ -894,34 +923,15 @@ impl PriceCatalogResolver for AwsPricingCatalog {
 // TypedPricingProvider<USD> — ADR-0001 Tier B trait.
 //
 // AwsPricingCatalog is statically USD-tagged. Bulk-API files that declare a
-// non-USD currency are rejected at the SKU boundary with
-// `PricingError::CurrencyMismatch`. The `PriceCatalog::lookup` impl above
-// already returns USD-tagged `PricedValue` values; this trait surface simply
-// re-exposes the typed (`Currency<f64, USD>`) form for callers that want
-// compile-time currency safety inside this crate.
+// non-USD currency are rejected by `enforce_usd_metadata` on the dyn entry
+// point, so this typed surface only needs to re-promote the already-validated
+// `PricedValue` into `Currency<f64, USD>`.
 // -----------------------------------------------------------------------------
-
-use yevice_core::currency::{Currency, USD};
-use yevice_pricing::catalog::{TypedPriceRecord, TypedPricingProvider, TypedTier};
 
 impl TypedPricingProvider<USD> for AwsPricingCatalog {
     fn lookup(&self, sku: &Sku) -> Result<TypedPriceRecord<USD>, PricingError> {
-        // Validate Bulk-API declared currency once at the typed boundary
-        // (currently a no-op for hardcoded SKUs, but in place for when more
-        // SKUs are routed via FilePricingRegistry metadata).
-        if let Some(file) = self.file.as_ref() {
-            for meta in file.all_metadata() {
-                if meta.currency != <USD as yevice_core::CurrencyCode>::CODE {
-                    return Err(PricingError::CurrencyMismatch {
-                        expected: <USD as yevice_core::CurrencyCode>::CODE.to_string(),
-                        actual: meta.currency.clone(),
-                        sku: sku.clone(),
-                    });
-                }
-            }
-        }
-
-        // Delegate to the erased path and re-promote into the typed enum.
+        // Delegate to the dyn path (which has already enforced the USD guard)
+        // and re-promote into the typed enum.
         match <Self as PriceCatalog>::lookup(self, sku)? {
             PricedValue::Scalar { value, .. } => {
                 Ok(TypedPriceRecord::Scalar(Currency::<f64, USD>::new(value)))

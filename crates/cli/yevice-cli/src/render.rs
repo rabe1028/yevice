@@ -157,13 +157,16 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
     summary.set_header(header);
 
     // Total row — prefer the FX-converted display_total when present,
-    // otherwise fall back to the native single-currency total. For mixed
-    // currencies without --display-currency, naive_total() is shown as USD
-    // by convention and the caller prints a separate per-currency breakdown.
+    // otherwise show the native single-currency total. Mixed-currency
+    // results without --display-currency render `mixed (see breakdown)`
+    // so the table never folds incompatible numbers into a single cell;
+    // the caller is responsible for printing the per-currency breakdown.
     let mut total_row = vec![Cell::new("Total Monthly Cost").fg(Color::Green)];
     for r in results {
         let cell = if let Some(money) = &r.display_total {
             fmt_money(money)
+        } else if r.totals_by_currency.len() > 1 {
+            "mixed (see breakdown)".to_string()
         } else {
             fmt_amount(r.naive_total(), header_currency(r))
         };
