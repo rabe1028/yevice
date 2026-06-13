@@ -222,10 +222,39 @@ pub(crate) fn encode(
     //    not yet seen). Pass B encodes each RHS and emits the linking
     //    equality `target == linearize(expr)`. This matches the fixed-point
     //    semantics enforced by `validate_bindings` and `EnumerationSolver`.
+    //
+    //    Duplicate-target handling: when multiple bindings share the same
+    //    target, `resolve_bindings_into` (yevice-core) uses a fixed-point
+    //    loop that skips already-resolved targets, which means the **first**
+    //    binding that successfully resolves wins.  In practice that is the
+    //    last resolvable binding encountered in order (earlier ones with
+    //    missing variables are skipped until a later one supplies the
+    //    value).  The encoder mirrors this by pre-computing, for each target
+    //    name, the index of the **last** binding that has not already been
+    //    shadowed by a decision variable or fixed param.  Only that binding
+    //    gets a real `VarId`; earlier duplicates are marked `None` (skipped
+    //    in Pass B) so the encoder never tries to linearize an unresolvable
+    //    RHS.
+    let last_binding_index_for_target: BTreeMap<&VariableName, usize> = problem
+        .bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !enc.var_index.contains_key(&b.target))
+        .fold(BTreeMap::new(), |mut m, (i, b)| {
+            m.insert(&b.target, i);
+            m
+        });
     let mut binding_target_ids: Vec<Option<VarId>> = Vec::with_capacity(problem.bindings.len());
-    for binding in &problem.bindings {
+    for (i, binding) in problem.bindings.iter().enumerate() {
         if enc.var_index.contains_key(&binding.target) {
             // Target shadowed by fixed_param or decision_var → skip.
+            binding_target_ids.push(None);
+            continue;
+        }
+        if last_binding_index_for_target.get(&binding.target) != Some(&i) {
+            // An earlier binding for this target: a later (last) binding will
+            // be the authoritative one. Skip here to avoid encoding an
+            // unresolvable RHS.
             binding_target_ids.push(None);
             continue;
         }
@@ -802,4 +831,113 @@ fn emit_constraint(backend: &mut dyn MilpBackend, lhs: &LinearTerms, c: &Optimiz
     };
     let terms: Vec<(VarId, f64)> = lhs.coeffs.iter().map(|(&id, &cc)| (id, cc)).collect();
     backend.add_constraint(&terms, sense, c.rhs - lhs.constant);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use yevice_core::cost::VariableBinding;
+    use yevice_core::expr::Expr;
+    use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
+    use yevice_core::types::VariableName;
+
+    use super::*;
+    use crate::error::SolverError;
+    use crate::milp::{ConstraintSense, MilpSolution, Sense};
+
+    fn var(name: &str) -> VariableName {
+        VariableName::new(name)
+    }
+
+    fn binding(target: &str, expr: Expr) -> VariableBinding {
+        VariableBinding {
+            target: var(target),
+            expr,
+            description: String::new(),
+            source: "test".into(),
+        }
+    }
+
+    /// A minimal no-op `MilpBackend` that just records variables added and
+    /// accepts constraints without solving.  Used to check that `encode`
+    /// succeeds (returns `Ok`) without a real solver.
+    struct CountingBackend {
+        var_count: u32,
+        constraint_count: u32,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                var_count: 0,
+                constraint_count: 0,
+            }
+        }
+    }
+
+    impl MilpBackend for CountingBackend {
+        fn add_var(&mut self, _lower: f64, _upper: f64, _obj: f64, _vtype: VarType) -> VarId {
+            let id = self.var_count;
+            self.var_count += 1;
+            id
+        }
+
+        fn add_constraint(
+            &mut self,
+            _terms: &[(VarId, f64)],
+            _sense: ConstraintSense,
+            _rhs: f64,
+        ) -> u32 {
+            let id = self.constraint_count;
+            self.constraint_count += 1;
+            id
+        }
+
+        fn set_sense(&mut self, _sense: Sense) {}
+
+        fn solve(self: Box<Self>) -> Result<MilpSolution, SolverError> {
+            Err(SolverError::MilpBackend {
+                message: "CountingBackend does not solve".into(),
+            })
+        }
+    }
+
+    /// Duplicate binding targets: `b = missing_var; b = x`.
+    ///
+    /// Before the fix, the encoder would attempt to encode the first (unresolvable)
+    /// binding and fail with `UnboundVariables`.  After the fix it picks only the
+    /// last binding for `b` and encodes `b = x` successfully.
+    #[test]
+    fn encode_last_binding_wins_for_duplicate_target() {
+        // objective = b, direction = Minimize, decision variable x in {1.0}
+        // binding[0]: b = missing_var  (unresolvable)
+        // binding[1]: b = x            (resolvable — last binding for `b`)
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![
+                binding("b", Expr::variable("missing_var")),
+                binding("b", Expr::variable("x")),
+            ],
+        };
+
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when the last binding for a target is resolvable; got: {:?}",
+            result.err()
+        );
+    }
 }
