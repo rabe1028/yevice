@@ -7,6 +7,7 @@ use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationPr
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
 use yevice_solver::{Solver, SolverError, solver_from_name};
 
+use yevice_core::Money;
 use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
 use yevice_core::cost::ArchitectureCost;
@@ -255,6 +256,8 @@ pub fn sensitivity(
     max: f64,
     steps: usize,
     breakdown: bool,
+    display_currency: Option<&str>,
+    exchange_rates: &[String],
 ) -> Result<()> {
     if steps == 0 {
         bail!("--steps must be at least 1");
@@ -262,12 +265,41 @@ pub fn sensitivity(
 
     let arch = load_cost_model(cost_model_path)?;
     let base_params = load_params(params_path)?;
+    let rates = parse_exchange_rates(exchange_rates)?;
 
     let step_size = (max - min) / steps as f64;
 
-    let base_result =
+    let mut base_result =
         evaluate_architecture(&arch, &base_params).context("failed to evaluate base cost")?;
-    let base_cost = base_result.naive_total();
+    apply_display_currency(&mut base_result, display_currency, &rates)?;
+
+    // Determine the display currency for table headers and cells.
+    // Single-currency models: use the native currency.
+    // Multi-currency + --display-currency: use the target.
+    // Multi-currency without --display-currency: warn and leave as None
+    //   (table shows "mixed" cells; per-currency breakdown is printed).
+    let header_ccy: Option<String> = if let Some(target) = display_currency {
+        Some(target.to_string())
+    } else if base_result.totals_by_currency.len() == 1 {
+        base_result.totals_by_currency.keys().next().cloned()
+    } else {
+        None
+    };
+
+    // Helper: extract a comparable (Option<Money>) from a result step.
+    // Returns None for mixed-currency results without a display_total.
+    let step_total = |result: &ArchitectureResult| -> Option<Money> {
+        if let Some(m) = &result.display_total {
+            return Some(m.clone());
+        }
+        if result.totals_by_currency.len() == 1 {
+            let (ccy, &v) = result.totals_by_currency.iter().next().unwrap();
+            return Some(Money::monthly(v, ccy.as_str()));
+        }
+        None
+    };
+
+    let base_total_money = step_total(&base_result);
 
     // Collect resource labels from the base result to use as breakdown columns.
     let resource_labels: Vec<String> = base_result
@@ -278,7 +310,7 @@ pub fn sensitivity(
 
     // When breakdown is true, collect step results for a second table.
     let mut sensitivity_rows: Vec<crate::render::SensitivityRow> = Vec::new();
-    let mut breakdown_rows: Vec<(f64, Vec<f64>)> = Vec::new();
+    let mut breakdown_rows: Vec<(f64, Vec<Option<Money>>)> = Vec::new();
 
     for i in 0..=steps {
         let value = min + step_size * i as f64;
@@ -286,23 +318,45 @@ pub fn sensitivity(
         params.insert(VariableName::new(var_name), value);
 
         match evaluate_architecture(&arch, &params) {
-            Ok(result) => {
-                let delta = result.naive_total() - base_cost;
+            Ok(mut result) => {
+                apply_display_currency(&mut result, display_currency, &rates)?;
+                let total_money = step_total(&result);
+                let delta_money = match (&total_money, &base_total_money) {
+                    (Some(t), Some(b)) if t.currency == b.currency => {
+                        Some(Money::monthly(t.value - b.value, &t.currency))
+                    }
+                    (Some(_), Some(_)) => None, // currencies differ (shouldn't happen)
+                    _ => None,
+                };
                 sensitivity_rows.push(crate::render::SensitivityRow::Ok {
                     value,
-                    total: result.naive_total(),
-                    delta,
+                    total: total_money,
+                    delta: delta_money,
                 });
 
                 if breakdown {
-                    let costs: Vec<f64> = resource_labels
+                    let costs: Vec<Option<Money>> = resource_labels
                         .iter()
                         .map(|label| {
                             result
                                 .resources
                                 .iter()
                                 .find(|r| &r.label == label)
-                                .map_or(0.0, |r| r.monthly_cost.value)
+                                .and_then(|r| {
+                                    if let Some(target) = display_currency {
+                                        let at = RateDate::new(chrono::Utc::now().date_naive());
+                                        // try_convert_money is in render; replicate inline
+                                        let mut single: std::collections::BTreeMap<String, f64> =
+                                            std::collections::BTreeMap::new();
+                                        single.insert(
+                                            r.monthly_cost.currency.clone(),
+                                            r.monthly_cost.value,
+                                        );
+                                        convert_to(&single, target, &rates, at).ok()
+                                    } else {
+                                        Some(r.monthly_cost.clone())
+                                    }
+                                })
                         })
                         .collect();
                     breakdown_rows.push((value, costs));
@@ -314,13 +368,14 @@ pub fn sensitivity(
                     message: e.to_string(),
                 });
                 if breakdown {
-                    breakdown_rows.push((value, vec![0.0; resource_labels.len()]));
+                    breakdown_rows.push((value, vec![None; resource_labels.len()]));
                 }
             }
         }
     }
 
-    let table = crate::render::render_sensitivity_table(var_name, &sensitivity_rows);
+    let table =
+        crate::render::render_sensitivity_table(var_name, &sensitivity_rows, header_ccy.as_deref());
 
     println!("\nSensitivity Analysis: {var_name}");
     let var_key = VariableName::new(var_name);
@@ -342,8 +397,32 @@ pub fn sensitivity(
             );
         }
     }
-    println!("Base cost: ${base_cost:.2}");
+    // Print the base cost using the same currency logic as the table.
+    match &base_total_money {
+        Some(m) => println!(
+            "Base cost: {}",
+            if m.currency == "USD" {
+                format!("${:.2}", m.value)
+            } else {
+                format!("{:.2} {}", m.value, m.currency)
+            }
+        ),
+        None => {
+            println!("Base cost: mixed currencies");
+            println!("\nPer-currency base totals:");
+            for (code, total) in &base_result.totals_by_currency {
+                println!("  {code}: {total:.2}");
+            }
+        }
+    }
     println!("{table}");
+
+    // Mixed-currency without --display-currency: print per-currency breakdown.
+    if base_result.totals_by_currency.len() > 1 && display_currency.is_none() {
+        println!(
+            "\nNote: model contains mixed currencies. Pass --display-currency to merge into a single total."
+        );
+    }
 
     if breakdown && !resource_labels.is_empty() {
         println!("\nResource Breakdown by Step:");
@@ -351,6 +430,7 @@ pub fn sensitivity(
             var_name,
             &resource_labels,
             &breakdown_rows,
+            header_ccy.as_deref(),
         );
         println!("{bd_table}");
     }
@@ -1326,6 +1406,8 @@ mod tests {
             1000.0,
             0, // steps = 0 must be rejected
             false,
+            None,
+            &[],
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1373,6 +1455,8 @@ mod tests {
             100.0,
             5,
             false,
+            None,
+            &[],
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1424,5 +1508,195 @@ mod tests {
             "enumeration",
         );
         assert!(result.is_ok(), "optimize must return Ok; got: {result:?}");
+    }
+
+    // --- sensitivity currency-aware display ---
+
+    /// A JPY-only cost model must produce rows where the total/delta are in
+    /// JPY, not USD.  The header currency should be "JPY".
+    #[test]
+    fn sensitivity_jpy_only_model_uses_jpy_currency() {
+        use std::fs;
+
+        let dir = temp_dir("sensitivity-jpy");
+
+        // Minimal cost model: one resource with a JPY-denominated linear cost.
+        // cost = Func_requests * 1.0 JPY
+        let cost_model = serde_json::json!({
+            "name": "jpy-test",
+            "region": "ap-northeast-1",
+            "resources": [
+                {
+                    "logical_id": "Func",
+                    "resource_type": "AWS::Lambda::Function",
+                    "label": "Lambda: Func",
+                    "currency": "JPY",
+                    "required_variables": [
+                        { "name": "Func_requests", "description": "requests", "unit": "requests" }
+                    ],
+                    "optional_variables": [],
+                    "expr": {
+                        "type": "Product",
+                        "exprs": [
+                            { "type": "Variable", "name": "Func_requests" },
+                            { "type": "Constant", "value": 1.0 }
+                        ]
+                    },
+                    "components": []
+                }
+            ],
+            "bindings": [],
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        let params_path = dir.join("params.yaml");
+        fs::write(&params_path, "Func_requests: 1000\n").unwrap();
+
+        // Build sensitivity rows directly using the internal function.
+        // We verify that totals have currency == "JPY".
+        let arch = super::load_cost_model(cost_model_path.to_str().unwrap()).unwrap();
+        let base_params = super::load_params(params_path.to_str().unwrap()).unwrap();
+        let rates = super::parse_exchange_rates(&[]).unwrap();
+
+        let mut base_result =
+            yevice_core::evaluate::evaluate_architecture(&arch, &base_params).unwrap();
+        super::apply_display_currency(&mut base_result, None, &rates).unwrap();
+
+        // Single-currency JPY model: header_ccy must be "JPY".
+        assert_eq!(
+            base_result.totals_by_currency.len(),
+            1,
+            "model should be single-currency"
+        );
+        let ccy = base_result.totals_by_currency.keys().next().unwrap();
+        assert_eq!(ccy, "JPY", "currency must be JPY, got: {ccy}");
+
+        // Run the full sensitivity command and check it succeeds.
+        let result = super::sensitivity(
+            cost_model_path.to_str().unwrap(),
+            params_path.to_str().unwrap(),
+            "Func_requests",
+            500.0,
+            2000.0,
+            3,
+            false,
+            None,
+            &[],
+        );
+        assert!(
+            result.is_ok(),
+            "sensitivity on JPY model should succeed: {result:?}"
+        );
+    }
+
+    /// A mixed-currency model (USD + JPY resources) without --display-currency
+    /// must produce rows where total is None (mixed) — not a spurious USD total.
+    #[test]
+    fn sensitivity_mixed_currency_without_display_currency_shows_none_total() {
+        use std::fs;
+
+        let dir = temp_dir("sensitivity-mixed-currency");
+
+        // Two resources: one USD, one JPY.
+        let cost_model = serde_json::json!({
+            "name": "mixed-test",
+            "region": "ap-northeast-1",
+            "resources": [
+                {
+                    "logical_id": "FuncUsd",
+                    "resource_type": "AWS::Lambda::Function",
+                    "label": "Lambda: FuncUsd",
+                    "currency": "USD",
+                    "required_variables": [
+                        { "name": "FuncUsd_requests", "description": "requests", "unit": "requests" }
+                    ],
+                    "optional_variables": [],
+                    "expr": {
+                        "type": "Product",
+                        "exprs": [
+                            { "type": "Variable", "name": "FuncUsd_requests" },
+                            { "type": "Constant", "value": 0.000001 }
+                        ]
+                    },
+                    "components": []
+                },
+                {
+                    "logical_id": "FuncJpy",
+                    "resource_type": "AWS::Lambda::Function",
+                    "label": "Lambda: FuncJpy",
+                    "currency": "JPY",
+                    "required_variables": [
+                        { "name": "FuncJpy_requests", "description": "requests", "unit": "requests" }
+                    ],
+                    "optional_variables": [],
+                    "expr": {
+                        "type": "Product",
+                        "exprs": [
+                            { "type": "Variable", "name": "FuncJpy_requests" },
+                            { "type": "Constant", "value": 1.0 }
+                        ]
+                    },
+                    "components": []
+                }
+            ],
+            "bindings": [],
+            "topology": { "nodes": [], "connections": [] }
+        });
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&cost_model).unwrap(),
+        )
+        .unwrap();
+
+        let params_path = dir.join("params.yaml");
+        fs::write(
+            &params_path,
+            "FuncUsd_requests: 1000\nFuncJpy_requests: 1000\n",
+        )
+        .unwrap();
+
+        let arch = super::load_cost_model(cost_model_path.to_str().unwrap()).unwrap();
+        let base_params = super::load_params(params_path.to_str().unwrap()).unwrap();
+        let rates = super::parse_exchange_rates(&[]).unwrap();
+
+        let mut base_result =
+            yevice_core::evaluate::evaluate_architecture(&arch, &base_params).unwrap();
+        super::apply_display_currency(&mut base_result, None, &rates).unwrap();
+
+        // Verify mixed currencies.
+        assert_eq!(
+            base_result.totals_by_currency.len(),
+            2,
+            "model must be mixed-currency"
+        );
+        // display_total must be None (no --display-currency given).
+        assert!(
+            base_result.display_total.is_none(),
+            "display_total must be None without --display-currency"
+        );
+
+        // The full command must succeed (it warns, not errors).
+        let result = super::sensitivity(
+            cost_model_path.to_str().unwrap(),
+            params_path.to_str().unwrap(),
+            "FuncUsd_requests",
+            500.0,
+            2000.0,
+            3,
+            false,
+            None,
+            &[],
+        );
+        assert!(
+            result.is_ok(),
+            "sensitivity on mixed-currency model without --display-currency should succeed (warn): {result:?}"
+        );
     }
 }

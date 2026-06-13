@@ -330,20 +330,46 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
 
 /// One row of data for the sensitivity sweep table.
 pub(crate) enum SensitivityRow {
-    Ok { value: f64, total: f64, delta: f64 },
-    Err { value: f64, message: String },
+    Ok {
+        value: f64,
+        /// Total monthly cost for this step.  When `--display-currency` was
+        /// applied, this is the FX-converted amount; otherwise it is the
+        /// native single-currency total (for mixed-currency models it is
+        /// `None` so the table can show `"mixed"` instead of a misleading
+        /// scalar).
+        total: Option<Money>,
+        /// Delta from the base cost in the same currency as `total`.
+        delta: Option<Money>,
+    },
+    Err {
+        value: f64,
+        message: String,
+    },
 }
 
 /// Build the main sensitivity sweep table for `sensitivity`.
 ///
 /// One row per step: the varied variable's value, total monthly cost, and
 /// coloured delta from the base cost.
-pub(crate) fn render_sensitivity_table(var_name: &str, rows: &[SensitivityRow]) -> Table {
+///
+/// `currency` is the display currency code (single-currency native or
+/// `--display-currency` target), used for the column header.  Pass `None`
+/// only when the model is mixed-currency and no `--display-currency` was
+/// supplied (header falls back to `"Cost"`).
+pub(crate) fn render_sensitivity_table(
+    var_name: &str,
+    rows: &[SensitivityRow],
+    currency: Option<&str>,
+) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
+    let cost_header = match currency {
+        Some(ccy) => format!("Total Monthly Cost ({ccy})"),
+        None => "Total Monthly Cost".to_string(),
+    };
     table.set_header(vec![
         Cell::new(var_name),
-        Cell::new("Total Monthly Cost"),
+        Cell::new(cost_header),
         Cell::new("Delta from Base"),
     ]);
 
@@ -354,21 +380,23 @@ pub(crate) fn render_sensitivity_table(var_name: &str, rows: &[SensitivityRow]) 
                 total,
                 delta,
             } => {
-                let delta_str = if *delta >= 0.0 {
-                    format!("+${delta:.2}")
-                } else {
-                    format!("-${:.2}", delta.abs())
+                let total_str = match total {
+                    Some(m) => fmt_money(m),
+                    None => "mixed (see breakdown)".to_string(),
                 };
-                let color = if *delta > 0.0 {
-                    Color::Red
-                } else if *delta < 0.0 {
-                    Color::Green
-                } else {
-                    Color::White
+                let (delta_str, color) = match delta {
+                    Some(m) if m.value > 0.0 => (format!("+{}", fmt_money(m)), Color::Red),
+                    Some(m) if m.value < 0.0 => {
+                        // negative delta: show absolute value with minus sign
+                        let abs_m = Money::monthly(m.value.abs(), &m.currency);
+                        (format!("-{}", fmt_money(&abs_m)), Color::Green)
+                    }
+                    Some(m) => (format!("+{}", fmt_money(m)), Color::White),
+                    None => ("mixed".to_string(), Color::Yellow),
                 };
                 table.add_row(vec![
                     Cell::new(format_number(*value)),
-                    Cell::new(format!("${total:.2}")),
+                    Cell::new(total_str),
                     Cell::new(delta_str).fg(color),
                 ]);
             }
@@ -386,24 +414,35 @@ pub(crate) fn render_sensitivity_table(var_name: &str, rows: &[SensitivityRow]) 
 }
 
 /// Build the per-resource breakdown table for `sensitivity --breakdown`.
+///
+/// `resource_costs` contains per-step, per-resource cost as `Option<Money>`;
+/// `None` means the cost could not be determined (evaluation error or
+/// mixed-currency without conversion).  `currency` is used for the column
+/// header suffix.
 pub(crate) fn render_sensitivity_breakdown_table(
     var_name: &str,
     resource_labels: &[String],
-    breakdown_rows: &[(f64, Vec<f64>)],
+    breakdown_rows: &[(f64, Vec<Option<Money>>)],
+    currency: Option<&str>,
 ) -> Table {
     let mut bd_table = Table::new();
     bd_table.load_preset(UTF8_FULL);
 
     let mut bd_header = vec![Cell::new(var_name)];
+    let ccy_suffix = currency.map(|c| format!(" ({c})")).unwrap_or_default();
     for label in resource_labels {
-        bd_header.push(Cell::new(label));
+        bd_header.push(Cell::new(format!("{label}{ccy_suffix}")));
     }
     bd_table.set_header(bd_header);
 
     for (value, costs) in breakdown_rows {
         let mut row = vec![Cell::new(format_number(*value))];
         for cost in costs {
-            row.push(Cell::new(format!("${cost:.2}")));
+            let cell = match cost {
+                Some(m) => fmt_money(m),
+                None => "n/a".to_string(),
+            };
+            row.push(Cell::new(cell));
         }
         bd_table.add_row(row);
     }

@@ -170,6 +170,14 @@ enum Commands {
         /// Show per-resource cost breakdown in addition to totals.
         #[arg(long)]
         breakdown: bool,
+
+        /// Optional display currency (e.g. `USD`, `JPY`). See `eval --display-currency`.
+        #[arg(long = "display-currency", value_name = "CODE")]
+        display_currency: Option<String>,
+
+        /// Static exchange rate. See `eval --exchange-rate`.
+        #[arg(long = "exchange-rate", value_name = "FROM=TO:RATE")]
+        exchange_rate: Vec<String>,
     },
 
     /// Validate capacity constraints and quota limits.
@@ -352,7 +360,19 @@ fn main() -> Result<()> {
             max,
             steps,
             breakdown,
-        } => commands::sensitivity(&cost_model, &params, &var, min, max, steps, breakdown),
+            display_currency,
+            exchange_rate,
+        } => commands::sensitivity(
+            &cost_model,
+            &params,
+            &var,
+            min,
+            max,
+            steps,
+            breakdown,
+            display_currency.as_deref(),
+            &exchange_rate,
+        ),
         Commands::Validate {
             template,
             parameters,
