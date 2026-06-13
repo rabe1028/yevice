@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use yevice_core::io::read_iac_file;
+use yevice_core::parse_policy::{ParseOutcome, ParsePolicy};
 use yevice_core::{
     resource::{Architecture, Connection, ConnectionType, Provider, Resource, ResourceShell},
     types::{LogicalId, Region, ResourceType},
@@ -91,6 +92,20 @@ struct RawDoBinding {
 }
 
 // ---- Public API ----
+
+/// Parse a Wrangler config file into an Architecture under the given
+/// [`ParsePolicy`].
+///
+/// Wrangler has no variable/reference layer (Ref ADR-0003: matrix shows zero
+/// policy-controllable variants), so the policy argument is accepted only for
+/// signature uniformity with the CFN / TF parsers. The returned
+/// [`ParseOutcome`] always has empty `diagnostics` and `had_errors = false`.
+pub fn parse_wrangler_with_policy(
+    path: &Path,
+    _policy: ParsePolicy,
+) -> Result<ParseOutcome<Architecture>, WranglerError> {
+    parse_wrangler(path).map(ParseOutcome::clean)
+}
 
 /// Parse a Wrangler config file into an Architecture.
 pub fn parse_wrangler(path: &Path) -> Result<Architecture, WranglerError> {
