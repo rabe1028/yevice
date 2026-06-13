@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 
 use yevice_core::expr::Expr;
-use yevice_core::expr_introspect::{VarRanges, expr_bounds};
+use yevice_core::expr_introspect::{VarRanges, expr_bounds, substitute_fixed_params};
 use yevice_core::optimize::{
     DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
 };
@@ -152,6 +152,39 @@ pub(crate) fn encode(
 ) -> Result<EncodedProblem, SolverError> {
     let mut enc = Encoder::new(backend, build_ranges(problem));
 
+    // Inline fixed parameters as constants into every expression we will
+    // encode below. This unblocks shapes like `price * x` where `price` is
+    // a fixed param and `x` is the decision variable — the surrounding
+    // Product would otherwise count both as variable-containing and the
+    // encoder would surface `SolverError::Nonlinear`. The `as_linear` /
+    // big-M code paths all benefit from the same simplification.
+    // Exclude any fixed_param whose name collides with a decision variable
+    // — decision wins per ADR-0002 / EnumerationSolver semantics, so we
+    // must NOT inline the fixed value at those names.
+    let decision_names: std::collections::BTreeSet<VariableName> = problem
+        .decision_variables
+        .iter()
+        .map(|dv| dv.name.clone())
+        .collect();
+    let fixed_param_map: BTreeMap<VariableName, f64> = problem
+        .fixed_params
+        .iter()
+        .filter(|(k, _)| !decision_names.contains(*k))
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+    let normalise = |e: &Expr| -> Expr { substitute_fixed_params(e, &fixed_param_map) };
+    let normalised_objective = normalise(&problem.objective);
+    let normalised_constraints: Vec<(Expr, &OptimizationConstraint)> = problem
+        .constraints
+        .iter()
+        .map(|c| (normalise(&c.lhs), c))
+        .collect();
+    let normalised_bindings: Vec<Expr> = problem
+        .bindings
+        .iter()
+        .map(|b| normalise(&b.expr))
+        .collect();
+
     // 1) Register decision variables as binary-indicator combinations.
     //
     // Duplicate names: `EnumerationSolver` documents "last-write-wins"
@@ -213,12 +246,17 @@ pub(crate) fn encode(
     let max_passes = problem.bindings.len() + 1;
     for _ in 0..max_passes {
         let mut progressed = false;
-        for (binding, target_opt) in problem.bindings.iter().zip(binding_target_ids.iter()) {
+        for ((binding, target_opt), rhs_expr) in problem
+            .bindings
+            .iter()
+            .zip(binding_target_ids.iter())
+            .zip(normalised_bindings.iter())
+        {
             if target_opt.is_none() {
                 continue;
             }
             let already_known = enc.ranges.decision_var_ranges.get(&binding.target).copied();
-            let bounds = expr_bounds(&binding.expr, &enc.ranges);
+            let bounds = expr_bounds(rhs_expr, &enc.ranges);
             if !bounds.is_finite() {
                 continue;
             }
@@ -234,24 +272,41 @@ pub(crate) fn encode(
             break;
         }
     }
-    // Pass B(.1): encode each RHS once ranges are stable.
-    for (binding, target_opt) in problem.bindings.iter().zip(binding_target_ids.iter()) {
+    // Pass B(.1): encode each RHS once ranges are stable. Bindings whose
+    // target is not transitively referenced from objective / constraint
+    // expressions are skipped — the enumerator silently ignores unused
+    // bindings, and we match that behaviour to avoid spurious Nonlinear /
+    // UnboundVariables errors on dead RHS expressions.
+    let reachable_targets = reachable_binding_targets(
+        &normalised_objective,
+        normalised_constraints.iter().map(|(lhs, _)| lhs),
+        &problem.bindings,
+        &normalised_bindings,
+    );
+    for ((binding, target_opt), rhs_expr) in problem
+        .bindings
+        .iter()
+        .zip(binding_target_ids.iter())
+        .zip(normalised_bindings.iter())
+    {
         let Some(target_id) = *target_opt else {
             continue;
         };
-        // Constrain: target == linearize(expr).
-        let lhs = encode_expr(&mut enc, &binding.expr)?;
+        if !reachable_targets.contains(&binding.target) {
+            continue;
+        }
+        let lhs = encode_expr(&mut enc, rhs_expr)?;
         let combined = LinearTerms::from_var(target_id, 1.0).sub(lhs);
         emit_linear_eq(enc.backend, &combined, 0.0);
     }
 
     // 4) Encode objective.
-    let obj_terms = encode_expr(&mut enc, &problem.objective)?;
+    let obj_terms = encode_expr(&mut enc, &normalised_objective)?;
     set_objective(enc.backend, &obj_terms);
 
     // 5) Encode constraints: `lhs <relation> rhs`.
-    for c in &problem.constraints {
-        let lhs = encode_expr(&mut enc, &c.lhs)?;
+    for (lhs_expr, c) in &normalised_constraints {
+        let lhs = encode_expr(&mut enc, lhs_expr)?;
         emit_constraint(enc.backend, &lhs, c);
     }
 
@@ -265,6 +320,44 @@ pub(crate) fn encode(
         var_index: enc.var_index,
         decision_indicators,
     })
+}
+
+/// Compute the set of binding-target names that the encoder actually needs
+/// to materialise, transitively through bindings.
+///
+/// The walk starts from variable references in the (normalised) objective
+/// and every constraint LHS. Whenever we hit a binding target, we expand
+/// it by walking the binding's RHS variables. Bindings whose target never
+/// surfaces in this closure can be dropped — they would otherwise force
+/// the encoder to emit a linking equality for an RHS whose value the
+/// solution never depends on.
+fn reachable_binding_targets<'a>(
+    objective: &Expr,
+    constraint_lhss: impl Iterator<Item = &'a Expr>,
+    bindings: &[yevice_core::cost::VariableBinding],
+    normalised_bindings: &[Expr],
+) -> std::collections::HashSet<VariableName> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<VariableName> = HashSet::new();
+    let mut frontier: Vec<VariableName> = objective.variables().into_iter().collect();
+    for lhs in constraint_lhss {
+        frontier.extend(lhs.variables());
+    }
+    while let Some(name) = frontier.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for (b, rhs) in bindings.iter().zip(normalised_bindings.iter()) {
+            if b.target == name {
+                for v in rhs.variables() {
+                    if !seen.contains(&v) {
+                        frontier.push(v);
+                    }
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Build the `VarRanges` used for big-M derivation.
@@ -551,6 +644,12 @@ fn encode_tiered(
     tiers: &[yevice_core::expr::Tier],
     inner: &Expr,
 ) -> Result<LinearTerms, SolverError> {
+    // The evaluator returns 0 for an empty tier list without constraining
+    // the input expression. Mirror that here so `tiered([], x)` does not
+    // silently force `x = 0` via the `Σ q_i = u` link below.
+    if tiers.is_empty() {
+        return Ok(LinearTerms::from_const(0.0));
+    }
     let raw_inner_terms = encode_expr(enc, inner)?;
     let b = expr_bounds(inner, &enc.ranges);
     let usage_upper = if b.upper.is_finite() {

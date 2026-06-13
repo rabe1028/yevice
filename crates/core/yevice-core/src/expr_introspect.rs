@@ -455,6 +455,68 @@ fn tiered_eval(tiers: &[crate::expr::Tier], usage: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// substitute_fixed_params: inline known constant values into an expression
+// ---------------------------------------------------------------------------
+
+/// Replace every `Variable { name }` whose name appears in `fixed_params`
+/// with the corresponding `Constant`. Used by the MILP encoder so that
+/// expressions like `price * x` — where `price` is a CLI-supplied fixed
+/// parameter and `x` is the only true decision variable — pass the
+/// linearizability check.
+#[must_use]
+pub fn substitute_fixed_params(expr: &Expr, fixed_params: &BTreeMap<VariableName, f64>) -> Expr {
+    match expr {
+        Expr::Constant { .. } => expr.clone(),
+        Expr::Variable { name } => {
+            if let Some(&v) = fixed_params.get(name) {
+                Expr::Constant { value: v }
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::Linear { coeff, var, offset } => Expr::Linear {
+            coeff: *coeff,
+            var: Box::new(substitute_fixed_params(var, fixed_params)),
+            offset: *offset,
+        },
+        Expr::Tiered { tiers, var } => Expr::Tiered {
+            tiers: tiers.clone(),
+            var: Box::new(substitute_fixed_params(var, fixed_params)),
+        },
+        Expr::Sum { exprs } => Expr::Sum {
+            exprs: exprs
+                .iter()
+                .map(|e| substitute_fixed_params(e, fixed_params))
+                .collect(),
+        },
+        Expr::Product { exprs } => Expr::Product {
+            exprs: exprs
+                .iter()
+                .map(|e| substitute_fixed_params(e, fixed_params))
+                .collect(),
+        },
+        Expr::Max { expr, floor } => Expr::Max {
+            expr: Box::new(substitute_fixed_params(expr, fixed_params)),
+            floor: *floor,
+        },
+        Expr::Min { expr, ceiling } => Expr::Min {
+            expr: Box::new(substitute_fixed_params(expr, fixed_params)),
+            ceiling: *ceiling,
+        },
+        Expr::Ceil { expr } => Expr::Ceil {
+            expr: Box::new(substitute_fixed_params(expr, fixed_params)),
+        },
+        Expr::Div {
+            numerator,
+            denominator,
+        } => Expr::Div {
+            numerator: Box::new(substitute_fixed_params(numerator, fixed_params)),
+            denominator: Box::new(substitute_fixed_params(denominator, fixed_params)),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // substitute_bindings: inline bindings into an expression
 // ---------------------------------------------------------------------------
 

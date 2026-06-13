@@ -389,6 +389,79 @@ fn tiered_clamps_negative_usage_to_zero() {
 }
 
 #[test]
+fn fixed_param_times_decision_var_is_linear() {
+    // Codex round-3 P2: price * x with price as a fixed param must be
+    // accepted (it linearises to a single-variable Product).
+    let mut fixed = HashMap::new();
+    fixed.insert(VariableName::new("price"), 10.0);
+    let problem = OptimizationProblem {
+        objective: Expr::product(vec![Expr::variable("price"), Expr::variable("x")]),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![1.0, 2.0, 3.0],
+        }],
+        constraints: vec![],
+        fixed_params: fixed,
+        bindings: vec![],
+    };
+    let e = EnumerationSolver.solve(&problem).unwrap();
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(e.feasible && h.feasible);
+    assert_close(e.objective_value, h.objective_value, "fixed * decision");
+    assert!((h.objective_value - 10.0).abs() < 1e-4);
+}
+
+#[test]
+fn empty_tiered_returns_zero() {
+    // Codex round-3 P2: tiered([], x) returns 0 — must not force x = 0.
+    let problem = OptimizationProblem {
+        objective: Expr::tiered(vec![], Expr::variable("x")),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![1.0, 2.0],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings: vec![],
+    };
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(h.feasible, "empty tiered must be feasible");
+    assert!(h.objective_value.abs() < 1e-4);
+}
+
+#[test]
+fn unused_binding_with_unknown_var_is_ignored() {
+    // Codex round-3 P2: an unused binding whose RHS references an
+    // undefined variable must not block the solver — the enumerator
+    // ignores unused bindings entirely.
+    use yevice_core::cost::VariableBinding;
+    let problem = OptimizationProblem {
+        objective: Expr::variable("x"),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![1.0, 2.0],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings: vec![VariableBinding {
+            target: VariableName::new("unused_target"),
+            expr: Expr::product(vec![
+                Expr::variable("missing_a"),
+                Expr::variable("missing_b"),
+            ]),
+            description: "unused".into(),
+            source: "test".into(),
+        }],
+    };
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(h.feasible, "unused binding must be ignored");
+    assert!((h.objective_value - 1.0).abs() < 1e-4);
+}
+
+#[test]
 fn infeasible_problem_consistent() {
     // x ∈ {1,2,3}, constraint x >= 100 → infeasible.
     let problem = OptimizationProblem {

@@ -9,12 +9,12 @@
 //! 3. `expr_bounds(..)` on every sub-expression that needs a big-M, surfacing
 //!    `SolverError::UnboundedExpression` if no finite bound can be derived.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use yevice_core::expr::Expr;
 use yevice_core::expr_introspect::{
     CeilContextResult, VarRanges, classify_ceil_context, expr_bounds, expr_is_linearizable,
-    substitute_bindings,
+    substitute_bindings, substitute_fixed_params,
 };
 use yevice_core::optimize::OptimizationProblem;
 use yevice_core::types::VariableName;
@@ -28,16 +28,29 @@ pub(crate) fn pre_check(problem: &OptimizationProblem) -> Result<(), SolverError
         .iter()
         .map(|dv| dv.name.clone())
         .collect();
+    // Decision-variable names override fixed_params on collision (matches
+    // the encoder's behaviour and EnumerationSolver's documented
+    // last-write-wins semantics).
+    let fixed_param_map: BTreeMap<VariableName, f64> = problem
+        .fixed_params
+        .iter()
+        .filter(|(k, _)| !decision_vars.contains(*k))
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+    let normalise = |e: &Expr| -> Expr {
+        let after_bindings = substitute_bindings(e, &problem.bindings);
+        substitute_fixed_params(&after_bindings, &fixed_param_map)
+    };
 
     // 1. Linearizability of objective + every constraint LHS (expanded).
-    let objective_expanded = substitute_bindings(&problem.objective, &problem.bindings);
+    let objective_expanded = normalise(&problem.objective);
     if !expr_is_linearizable(&objective_expanded, &decision_vars) {
         return Err(SolverError::Nonlinear {
             expr: format!("{objective_expanded:?}"),
         });
     }
     for c in &problem.constraints {
-        let lhs = substitute_bindings(&c.lhs, &problem.bindings);
+        let lhs = normalise(&c.lhs);
         if !expr_is_linearizable(&lhs, &decision_vars) {
             return Err(SolverError::Nonlinear {
                 expr: format!("{lhs:?}"),
@@ -62,7 +75,7 @@ pub(crate) fn pre_check(problem: &OptimizationProblem) -> Result<(), SolverError
     let ranges = build_ranges(problem);
     check_big_m_bounds(&objective_expanded, &ranges)?;
     for c in &problem.constraints {
-        let lhs = substitute_bindings(&c.lhs, &problem.bindings);
+        let lhs = normalise(&c.lhs);
         check_big_m_bounds(&lhs, &ranges)?;
     }
 
