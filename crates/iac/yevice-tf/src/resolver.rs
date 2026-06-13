@@ -20,7 +20,7 @@ pub struct ResolvedConfig {
 /// Unresolved `var.*` / `local.*` references are tolerated (the resolver
 /// leaves them as `VarRef` / `LocalRef`) and reported only via
 /// `tracing::warn!`. To collect them as structured
-/// [`IacParseDiagnostic`](yevice_core::parse_policy::IacParseDiagnostic) /
+/// [`IacParseDiagnostic`] /
 /// hard error, use [`resolve_config_with_policy`].
 #[allow(clippy::implicit_hasher)]
 pub fn resolve_config(
@@ -40,11 +40,11 @@ pub fn resolve_config(
 /// fixed-point iteration — are policy-controlled (ADR-0003 Phase 1):
 ///
 /// * [`ParsePolicy::Lenient`]: emit one
-///   [`IacParseDiagnostic`](yevice_core::parse_policy::IacParseDiagnostic) per
+///   [`IacParseDiagnostic`] per
 ///   distinct symbol, leave the reference as `VarRef` / `LocalRef`, and let
 ///   adapters fall back to defaults.
 /// * [`ParsePolicy::Strict`]: fail with
-///   [`TfError::UnresolvedSymbol`](crate::error::TfError::UnresolvedSymbol) on
+///   [`TfError::UnresolvedSymbol`] on
 ///   the first such symbol.
 ///
 /// `TfValue::ResourceRef` (cross-resource references) is **not** considered

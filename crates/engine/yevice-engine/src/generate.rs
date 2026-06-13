@@ -42,7 +42,7 @@ pub struct GenerateRequest<'a> {
 /// Provider support is injected through `plugins`; the engine itself is
 /// provider-agnostic. The returned [`ParseOutcome`] carries any
 /// IaC parse diagnostics collected under
-/// [`ParsePolicy::Lenient`](yevice_core::parse_policy::ParsePolicy::Lenient).
+/// [`ParsePolicy::Lenient`].
 pub fn generate_cost_model(
     plugins: &[Box<dyn ProviderPlugin>],
     request: &GenerateRequest<'_>,
