@@ -173,8 +173,7 @@ pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariab
     let before: u64 = pruned
         .iter()
         .map(|dv| dv.domain.len() as u64)
-        .product::<u64>()
-        .max(1);
+        .fold(1u64, u64::saturating_mul);
 
     for dv in &mut pruned {
         // Collect the constraints that target this specific decision variable.
@@ -187,16 +186,25 @@ pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariab
         }
 
         let original_len = dv.domain.len();
+        // Names whose slots in `scratch` are "protected" from being cleared
+        // between iterations:
+        //   - fixed_params (already in `base`)
+        //   - other decision variables (pre-seeded to 0.0 below)
+        //   - the variable we're filtering for (set per-iteration)
+        // Anything else is a binding-target whose stale value MUST be cleared
+        // before re-resolving for the next candidate value, otherwise
+        // `resolve_bindings_into`'s `contains_key` skip would reuse the
+        // previous iteration's result.
+        let other_decision_names: std::collections::HashSet<&VariableName> = problem
+            .decision_variables
+            .iter()
+            .map(|d| &d.name)
+            .filter(|n| **n != dv.name)
+            .collect();
+
         let mut scratch: Params = base.clone();
-        // Pre-seed *other* decision variables as 0.0 so binding resolution
-        // doesn't accidentally pick them up — single-variable constraints by
-        // definition don't transitively depend on those slots, but their
-        // presence keeps `resolve_bindings_into` from creating spurious
-        // bindings.
-        for other in &problem.decision_variables {
-            if other.name != dv.name {
-                scratch.entry(other.name.clone()).or_insert(0.0);
-            }
+        for &name in &other_decision_names {
+            scratch.entry(name.clone()).or_insert(0.0);
         }
 
         dv.domain.retain(|&value| {
@@ -214,12 +222,15 @@ pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariab
                     Relation::Eq => (lhs - c.rhs).abs() <= CONSTRAINT_TOLERANCE,
                 }
             });
-            // Clear binding targets from scratch so the next iteration's
-            // binding resolution sees a fresh slate (per resolve_bindings_into
-            // contains_key semantics, a stale binding result would otherwise
-            // shadow a re-resolve).
+            // Clear binding-derived values so the next iteration's binding
+            // resolution sees a fresh slate. Preserve fixed params, the
+            // current decision variable, and any other decision-variable
+            // slots.
             for b in &problem.bindings {
-                if !base.contains_key(&b.target) && b.target != dv.name {
+                if !base.contains_key(&b.target)
+                    && b.target != dv.name
+                    && !other_decision_names.contains(&b.target)
+                {
                     scratch.remove(&b.target);
                 }
             }
@@ -243,8 +254,7 @@ pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariab
     let after: u64 = pruned
         .iter()
         .map(|dv| dv.domain.len() as u64)
-        .product::<u64>()
-        .max(1);
+        .fold(1u64, u64::saturating_mul);
 
     if after < before {
         tracing::debug!(
@@ -2451,6 +2461,38 @@ mod tests {
         assert!(sol.feasible);
         assert_eq!(sol.assignments[&var("x")], 3.0);
         assert_eq!(sol.objective_value, 30.0);
+    }
+
+    /// Pruning must not panic for domain products that overflow `u64`. The
+    /// before/after diagnostic computes a saturating product so that an
+    /// 11-variable × 1024-value problem (above 2^64) still goes through
+    /// pruning cleanly.  This regression test exists to make sure the
+    /// debug-mode arithmetic overflow check stays satisfied.
+    #[test]
+    fn prune_domains_saturates_huge_combination_count() {
+        // 11 vars × domain size 1024 = 1024^11 ≈ 1.4e33 > 2^64.
+        let dvs: Vec<DecisionVariable> = (0..11_u32)
+            .map(|i| dv(&format!("x{i}"), (0..1024).map(f64::from).collect()))
+            .collect();
+        // Single-variable constraint on x0 so the pruning loop actually runs.
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x0"),
+            relation: Relation::Le,
+            rhs: 2.0_f64.powi(20),
+            label: None,
+        };
+
+        let problem = problem_with(
+            Expr::constant(0.0),
+            ObjectiveDirection::Minimize,
+            dvs,
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        // Must not panic even though product(domains) overflows u64.
+        let pruned = prune_domains(&problem).expect("expected pruning to succeed");
+        assert_eq!(pruned.len(), 11);
     }
 
     /// A constraint depending on a single decision variable through a binding
