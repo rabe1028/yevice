@@ -1,13 +1,57 @@
 //! Introspection layer for the `Expr` AST.
 //!
 //! Provides methods to extract variable sets and affine (linear) forms from a
-//! cost expression. This is the foundation for future LP/MILP solvers that need
-//! to query the structure of an expression without evaluating it.
+//! cost expression. This is the foundation for the MILP solver backend
+//! (`yevice-solver`), which needs to query the structure of an expression
+//! without evaluating it: linearizability, big-M bounds, ceil-context safety.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::cost::VariableBinding;
 use crate::expr::Expr;
+use crate::optimize::{ObjectiveDirection, OptimizationProblem, Relation};
 use crate::types::VariableName;
+
+/// Lower / upper bound pair for an expression value.
+///
+/// `f64::NEG_INFINITY` / `f64::INFINITY` are used when a side cannot be
+/// derived from the supplied parameters and variable ranges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bounds {
+    pub lower: f64,
+    pub upper: f64,
+}
+
+impl Bounds {
+    /// Single point bound (e.g. for a constant).
+    fn point(value: f64) -> Self {
+        Self {
+            lower: value,
+            upper: value,
+        }
+    }
+    /// Unbounded on both sides.
+    fn unbounded() -> Self {
+        Self {
+            lower: f64::NEG_INFINITY,
+            upper: f64::INFINITY,
+        }
+    }
+    /// True iff both bounds are finite.
+    pub fn is_finite(&self) -> bool {
+        self.lower.is_finite() && self.upper.is_finite()
+    }
+}
+
+/// Known ranges for the variables appearing in an expression.
+///
+/// `decision_var_ranges` maps each decision variable to its `(min, max)`
+/// domain extremes. Fixed parameters are passed via `fixed_params`.
+#[derive(Debug, Clone, Default)]
+pub struct VarRanges {
+    pub decision_var_ranges: BTreeMap<VariableName, (f64, f64)>,
+    pub fixed_params: BTreeMap<VariableName, f64>,
+}
 
 /// Affine form of an expression: `sum(coeff_i * var_i) + constant`.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +190,585 @@ impl Expr {
             // Non-linear or non-affine variants.
             Expr::Tiered { .. } | Expr::Max { .. } | Expr::Min { .. } | Expr::Ceil { .. } => None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// expr_is_linearizable / linearizable shape check
+// ---------------------------------------------------------------------------
+
+/// True iff every sub-expression is a shape the MILP encoder knows how to
+/// linearize (possibly by introducing auxiliary variables and constraints).
+///
+/// Supported shapes (recursively):
+/// - `Constant`, `Variable`, `Linear`
+/// - `Sum`, `Product` with at most one variable-containing factor
+/// - `Div` whose denominator is constant
+/// - `Tiered`, `Ceil` over linearizable inner expressions
+/// - `Max` / `Min` over linearizable inner expressions
+///
+/// Rejected: `var * var`, `var / var`, and any nesting of these.
+///
+/// `decision_vars` is the set of decision-variable names; it is not used by
+/// the structural check itself (linearizability is a syntactic property of
+/// `Expr`), but is accepted for forward-compatibility (e.g. if a future
+/// extension wants to treat fixed-only sub-expressions as "linearizable
+/// constants").
+#[must_use]
+#[allow(clippy::only_used_in_recursion)]
+pub fn expr_is_linearizable(expr: &Expr, decision_vars: &BTreeSet<VariableName>) -> bool {
+    match expr {
+        Expr::Constant { .. } | Expr::Variable { .. } => true,
+        Expr::Linear { var, .. } => expr_is_linearizable(var, decision_vars),
+        Expr::Sum { exprs } => exprs.iter().all(|e| expr_is_linearizable(e, decision_vars)),
+        Expr::Product { exprs } => {
+            // At most one factor may contain variables; every factor itself
+            // must also be linearizable.
+            if !exprs.iter().all(|e| expr_is_linearizable(e, decision_vars)) {
+                return false;
+            }
+            let var_count = exprs
+                .iter()
+                .filter(|e| match e.as_linear() {
+                    Some(lf) => lf.coefficients.values().any(|&c| c != 0.0),
+                    None => true, // non-linear factor — but if it's a Tiered/Ceil/Max/Min
+                                  // we still want to allow `constant * Ceil(x)` etc.
+                                  // The encoder evaluates each factor individually:
+                                  // any factor that is non-affine yields an aux var,
+                                  // and the surrounding Product needs at most one
+                                  // such "variable-containing" factor.
+                })
+                .count();
+            var_count <= 1
+        }
+        Expr::Div {
+            numerator,
+            denominator,
+        } => {
+            if !expr_is_linearizable(numerator, decision_vars) {
+                return false;
+            }
+            // Denominator must be a pure constant expression.
+            match denominator.as_linear() {
+                Some(lf) => {
+                    let has_var = lf.coefficients.values().any(|&c| c != 0.0);
+                    !has_var && lf.constant != 0.0
+                }
+                None => false,
+            }
+        }
+        Expr::Tiered { var, .. } | Expr::Ceil { expr: var } => {
+            expr_is_linearizable(var, decision_vars)
+        }
+        Expr::Max { expr, .. } | Expr::Min { expr, .. } => {
+            expr_is_linearizable(expr, decision_vars)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// expr_bounds: interval-arithmetic style big-M derivation
+// ---------------------------------------------------------------------------
+
+/// Compute conservative `(lower, upper)` bounds for the value of an expression
+/// under the given variable ranges and fixed parameters.
+///
+/// The bounds are derived by interval arithmetic on the AST. Unknown variables
+/// (not in `ranges.decision_var_ranges` and not in `ranges.fixed_params`)
+/// yield `(-inf, +inf)`. Division by an interval that contains zero yields
+/// `(-inf, +inf)`.
+///
+/// The result is conservative (a true upper bound on the value range), not
+/// necessarily tight. Callers use it to pick a finite big-M; a non-finite
+/// result indicates the encoder must reject the problem
+/// (`SolverError::UnboundedExpression`).
+#[must_use]
+pub fn expr_bounds(expr: &Expr, ranges: &VarRanges) -> Bounds {
+    match expr {
+        Expr::Constant { value } => Bounds::point(*value),
+
+        Expr::Variable { name } => {
+            if let Some(&v) = ranges.fixed_params.get(name) {
+                return Bounds::point(v);
+            }
+            if let Some(&(lo, hi)) = ranges.decision_var_ranges.get(name) {
+                return Bounds {
+                    lower: lo,
+                    upper: hi,
+                };
+            }
+            Bounds::unbounded()
+        }
+
+        Expr::Linear { coeff, var, offset } => {
+            let b = expr_bounds(var, ranges);
+            scale_then_shift(b, *coeff, *offset)
+        }
+
+        Expr::Sum { exprs } => {
+            exprs
+                .iter()
+                .map(|e| expr_bounds(e, ranges))
+                .fold(Bounds::point(0.0), |a, b| Bounds {
+                    lower: a.lower + b.lower,
+                    upper: a.upper + b.upper,
+                })
+        }
+
+        Expr::Product { exprs } => exprs
+            .iter()
+            .map(|e| expr_bounds(e, ranges))
+            .fold(Bounds::point(1.0), interval_mul),
+
+        Expr::Div {
+            numerator,
+            denominator,
+        } => {
+            let n = expr_bounds(numerator, ranges);
+            let d = expr_bounds(denominator, ranges);
+            interval_div(n, d)
+        }
+
+        Expr::Max { expr, floor } => {
+            let b = expr_bounds(expr, ranges);
+            Bounds {
+                lower: b.lower.max(*floor),
+                upper: b.upper.max(*floor),
+            }
+        }
+
+        Expr::Min { expr, ceiling } => {
+            let b = expr_bounds(expr, ranges);
+            Bounds {
+                lower: b.lower.min(*ceiling),
+                upper: b.upper.min(*ceiling),
+            }
+        }
+
+        Expr::Ceil { expr } => {
+            let b = expr_bounds(expr, ranges);
+            // ceil(x) ∈ [ceil(lo), ceil(hi)] for finite bounds; preserve infinities.
+            Bounds {
+                lower: if b.lower.is_finite() {
+                    b.lower.ceil()
+                } else {
+                    b.lower
+                },
+                upper: if b.upper.is_finite() {
+                    b.upper.ceil()
+                } else {
+                    b.upper
+                },
+            }
+        }
+
+        Expr::Tiered { tiers, var } => {
+            // Tiered cost over a variable with bounds [lo, hi] yields a cost
+            // bound of [tiered_eval(max(0, lo)), tiered_eval(max(0, hi))].
+            // We compute the eval explicitly using the tiered formula.
+            let b = expr_bounds(var, ranges);
+            let lo_val = if b.lower.is_finite() {
+                Some(tiered_eval(tiers, b.lower.max(0.0)))
+            } else {
+                None
+            };
+            let hi_val = if b.upper.is_finite() {
+                Some(tiered_eval(tiers, b.upper.max(0.0)))
+            } else {
+                None
+            };
+            Bounds {
+                lower: lo_val.unwrap_or(f64::NEG_INFINITY),
+                upper: hi_val.unwrap_or(f64::INFINITY),
+            }
+        }
+    }
+}
+
+fn scale_then_shift(b: Bounds, coeff: f64, offset: f64) -> Bounds {
+    let (lo, hi) = if coeff >= 0.0 {
+        (b.lower * coeff, b.upper * coeff)
+    } else {
+        (b.upper * coeff, b.lower * coeff)
+    };
+    Bounds {
+        lower: lo + offset,
+        upper: hi + offset,
+    }
+}
+
+fn interval_mul(a: Bounds, b: Bounds) -> Bounds {
+    let candidates = [
+        a.lower * b.lower,
+        a.lower * b.upper,
+        a.upper * b.lower,
+        a.upper * b.upper,
+    ];
+    let lower = candidates.iter().copied().fold(f64::INFINITY, f64::min);
+    let upper = candidates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Bounds { lower, upper }
+}
+
+fn interval_div(n: Bounds, d: Bounds) -> Bounds {
+    // If the denominator interval straddles zero, the result is unbounded.
+    if d.lower <= 0.0 && d.upper >= 0.0 {
+        return Bounds::unbounded();
+    }
+    let candidates = [
+        n.lower / d.lower,
+        n.lower / d.upper,
+        n.upper / d.lower,
+        n.upper / d.upper,
+    ];
+    let lower = candidates.iter().copied().fold(f64::INFINITY, f64::min);
+    let upper = candidates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Bounds { lower, upper }
+}
+
+fn tiered_eval(tiers: &[crate::expr::Tier], usage: f64) -> f64 {
+    let mut total = 0.0;
+    let mut remaining = usage;
+    let mut prev_limit = 0.0;
+    for tier in tiers {
+        if remaining <= 0.0 {
+            break;
+        }
+        let width = match tier.upper_limit {
+            Some(limit) => limit - prev_limit,
+            None => remaining,
+        };
+        let consumed = remaining.min(width);
+        total += consumed * tier.unit_price;
+        remaining -= consumed;
+        if let Some(limit) = tier.upper_limit {
+            prev_limit = limit;
+        }
+    }
+    total
+}
+
+// ---------------------------------------------------------------------------
+// substitute_bindings: inline bindings into an expression
+// ---------------------------------------------------------------------------
+
+/// Recursively inline every binding-target variable reference with the
+/// binding's expression, until no further substitution is possible.
+///
+/// Assumes the binding graph is acyclic (validated up-front by
+/// `validate_bindings`). A safety counter caps recursion at
+/// `MAX_SUBSTITUTION_PASSES` passes to guarantee termination even on
+/// adversarial input.
+const MAX_SUBSTITUTION_PASSES: usize = 64;
+
+#[must_use]
+pub fn substitute_bindings(expr: &Expr, bindings: &[VariableBinding]) -> Expr {
+    let mut current = expr.clone();
+    for _ in 0..MAX_SUBSTITUTION_PASSES {
+        let next = substitute_once(&current, bindings);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+    current
+}
+
+fn substitute_once(expr: &Expr, bindings: &[VariableBinding]) -> Expr {
+    match expr {
+        Expr::Constant { .. } => expr.clone(),
+        Expr::Variable { name } => {
+            for b in bindings {
+                if &b.target == name {
+                    return b.expr.clone();
+                }
+            }
+            expr.clone()
+        }
+        Expr::Linear { coeff, var, offset } => Expr::Linear {
+            coeff: *coeff,
+            var: Box::new(substitute_once(var, bindings)),
+            offset: *offset,
+        },
+        Expr::Tiered { tiers, var } => Expr::Tiered {
+            tiers: tiers.clone(),
+            var: Box::new(substitute_once(var, bindings)),
+        },
+        Expr::Sum { exprs } => Expr::Sum {
+            exprs: exprs.iter().map(|e| substitute_once(e, bindings)).collect(),
+        },
+        Expr::Product { exprs } => Expr::Product {
+            exprs: exprs.iter().map(|e| substitute_once(e, bindings)).collect(),
+        },
+        Expr::Max { expr, floor } => Expr::Max {
+            expr: Box::new(substitute_once(expr, bindings)),
+            floor: *floor,
+        },
+        Expr::Min { expr, ceiling } => Expr::Min {
+            expr: Box::new(substitute_once(expr, bindings)),
+            ceiling: *ceiling,
+        },
+        Expr::Ceil { expr } => Expr::Ceil {
+            expr: Box::new(substitute_once(expr, bindings)),
+        },
+        Expr::Div {
+            numerator,
+            denominator,
+        } => Expr::Div {
+            numerator: Box::new(substitute_once(numerator, bindings)),
+            denominator: Box::new(substitute_once(denominator, bindings)),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// classify_ceil_context: ADR-0002 Ceil safety classifier
+// ---------------------------------------------------------------------------
+
+/// Result of classifying a ceil expression's context.
+#[derive(Debug, Clone)]
+pub enum CeilContextResult {
+    /// All ceil occurrences appear in auto-tight contexts.
+    Ok,
+    /// At least one ceil occurrence appears in an anti-tight context.
+    /// Carries the offending expression snippet and a static reason.
+    Reject {
+        expr_repr: String,
+        reason: &'static str,
+    },
+}
+
+/// Classify every `Ceil(...)` occurrence in the problem (after bindings
+/// expansion) and decide whether the lower-bound-only formulation
+/// (`expr <= y`, `y integer`) is safe.
+///
+/// See ADR-0002 "Ceil 定式化の選択" for the full classification:
+///
+/// - **Allowed**: minimization objective with positive coefficient, Le-LHS
+///   with positive coefficient, Ge-LHS with negative coefficient, or
+///   appearance in a constant-only sub-expression (handled by `evaluate`
+///   before reaching the MILP encoder).
+/// - **Rejected**: maximize objective containing ceil, negative coefficient
+///   in objective, any appearance in `Eq` constraint LHS, positive coefficient
+///   in Ge-LHS, negative coefficient in Le-LHS.
+///
+/// The classifier walks the expanded objective and each expanded constraint
+/// LHS, finding ceil nodes and probing their coefficient in the surrounding
+/// affine context.
+#[must_use]
+pub fn classify_ceil_context(problem: &OptimizationProblem) -> CeilContextResult {
+    let objective = substitute_bindings(&problem.objective, &problem.bindings);
+    let direction = problem.direction;
+
+    // Objective check.
+    let obj_ceils = find_ceils_with_coeff_sign(&objective);
+    for (expr_snippet, sign) in obj_ceils {
+        match (direction, sign) {
+            (ObjectiveDirection::Minimize, CoeffSign::Positive) => {} // ok
+            (ObjectiveDirection::Minimize, CoeffSign::Negative) => {
+                return CeilContextResult::Reject {
+                    expr_repr: expr_snippet,
+                    reason: "ceil appears with negative coefficient in minimization objective",
+                };
+            }
+            (ObjectiveDirection::Maximize, _) => {
+                return CeilContextResult::Reject {
+                    expr_repr: expr_snippet,
+                    reason: "ceil cannot appear in a maximization objective",
+                };
+            }
+            (_, CoeffSign::Unknown) => {
+                return CeilContextResult::Reject {
+                    expr_repr: expr_snippet,
+                    reason: "ceil coefficient sign in objective is undetermined",
+                };
+            }
+        }
+    }
+
+    // Constraint checks.
+    for c in &problem.constraints {
+        let lhs = substitute_bindings(&c.lhs, &problem.bindings);
+        let ceils = find_ceils_with_coeff_sign(&lhs);
+        for (expr_snippet, sign) in ceils {
+            let allowed = match (c.relation, sign) {
+                (Relation::Le, CoeffSign::Positive) => true,
+                (Relation::Ge, CoeffSign::Negative) => true,
+                (Relation::Eq, _) => false,
+                (Relation::Le, CoeffSign::Negative) => false,
+                (Relation::Ge, CoeffSign::Positive) => false,
+                (_, CoeffSign::Unknown) => false,
+            };
+            if !allowed {
+                let reason: &'static str = match (c.relation, sign) {
+                    (Relation::Eq, _) => "ceil cannot appear in an Eq constraint",
+                    (Relation::Le, CoeffSign::Negative) => {
+                        "ceil appears with negative coefficient in Le constraint LHS"
+                    }
+                    (Relation::Ge, CoeffSign::Positive) => {
+                        "ceil appears with positive coefficient in Ge constraint LHS"
+                    }
+                    _ => "ceil coefficient sign in constraint is undetermined",
+                };
+                return CeilContextResult::Reject {
+                    expr_repr: expr_snippet,
+                    reason,
+                };
+            }
+        }
+    }
+
+    CeilContextResult::Ok
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoeffSign {
+    Positive,
+    Negative,
+    Unknown,
+}
+
+/// Find every `Ceil(...)` node in `expr` and report the sign of its effective
+/// coefficient in the surrounding affine context.
+///
+/// We walk the expression tree once, tracking a multiplicative "outer
+/// coefficient sign" as we descend through `Sum` / `Linear` / `Product`
+/// (by constant factor) / `Div` (by constant denominator). When we hit a
+/// ceil, we record the sign at that point.
+///
+/// Sums propagate the parent sign unchanged; `Linear(coeff, var, _)`
+/// multiplies the sign by `sign(coeff)`; `Product` multiplies the sign by
+/// the product of all sibling constant factors (variable-containing sibling
+/// factors yield `Unknown`). `Min`/`Max`/`Tiered`/inner `Ceil` are not
+/// classified — their inner ceils would themselves need analysis, but the
+/// current ADR scope only reaches ceils through linear contexts.
+fn find_ceils_with_coeff_sign(expr: &Expr) -> Vec<(String, CoeffSign)> {
+    let mut out = Vec::new();
+    walk(expr, CoeffSign::Positive, &mut out);
+    out
+}
+
+fn multiply_sign(a: CoeffSign, factor: f64) -> CoeffSign {
+    if factor == 0.0 {
+        // A zero-coefficient ceil disappears; mark Unknown rather than risking
+        // a false "positive" classification.
+        return CoeffSign::Unknown;
+    }
+    let f_sign = if factor > 0.0 {
+        CoeffSign::Positive
+    } else {
+        CoeffSign::Negative
+    };
+    match (a, f_sign) {
+        (CoeffSign::Positive, CoeffSign::Positive) => CoeffSign::Positive,
+        (CoeffSign::Negative, CoeffSign::Negative) => CoeffSign::Positive,
+        (CoeffSign::Positive, CoeffSign::Negative) | (CoeffSign::Negative, CoeffSign::Positive) => {
+            CoeffSign::Negative
+        }
+        _ => CoeffSign::Unknown,
+    }
+}
+
+fn walk(expr: &Expr, outer: CoeffSign, out: &mut Vec<(String, CoeffSign)>) {
+    match expr {
+        Expr::Constant { .. } | Expr::Variable { .. } => {}
+        Expr::Linear {
+            coeff,
+            var,
+            offset: _,
+        } => {
+            walk(var, multiply_sign(outer, *coeff), out);
+        }
+        Expr::Sum { exprs } => {
+            for e in exprs {
+                walk(e, outer, out);
+            }
+        }
+        Expr::Product { exprs } => {
+            // Compute the product of all constant factors; if any factor is
+            // non-constant, we cannot determine the sign for any ceil inside
+            // a sibling factor, but the ceil itself may not appear under it.
+            // Conservative pass: walk each child with sign = outer * (product
+            // of sibling constants); when a sibling is non-constant, mark
+            // Unknown.
+            let mut all_const_product = 1.0;
+            let mut has_non_constant_sibling = false;
+            for e in exprs {
+                match e.as_linear() {
+                    Some(lf) if lf.coefficients.values().all(|&c| c == 0.0) => {
+                        all_const_product *= lf.constant;
+                    }
+                    _ => {
+                        has_non_constant_sibling = true;
+                    }
+                }
+            }
+            for e in exprs {
+                // If this child is itself a constant factor, no ceil hides
+                // inside it (constants have no ceil).
+                let is_const = matches!(
+                    e.as_linear(),
+                    Some(ref lf) if lf.coefficients.values().all(|&c| c == 0.0)
+                );
+                if is_const {
+                    continue;
+                }
+                // Sibling constant product (excluding this child).
+                // Since at most one variable-containing factor is supported
+                // for linearizability, sibling constants ARE the full
+                // `all_const_product` here.
+                let sibling_product = all_const_product;
+                let child_outer = if has_non_constant_sibling {
+                    // Two non-constant factors: any ceil under one is hard to
+                    // classify. Mark Unknown.
+                    CoeffSign::Unknown
+                } else {
+                    multiply_sign(outer, sibling_product)
+                };
+                walk(e, child_outer, out);
+            }
+        }
+        Expr::Div {
+            numerator,
+            denominator,
+        } => {
+            // Denominator must be constant for linearizability; the sign is
+            // the sign of 1 / denom_const.
+            match denominator.as_linear() {
+                Some(lf) if lf.coefficients.values().all(|&c| c == 0.0) && lf.constant != 0.0 => {
+                    let sign = multiply_sign(outer, 1.0 / lf.constant);
+                    walk(numerator, sign, out);
+                }
+                _ => {
+                    walk(numerator, CoeffSign::Unknown, out);
+                }
+            }
+        }
+        Expr::Ceil { expr: inner } => {
+            // Record this ceil's effective sign.
+            out.push((format!("ceil({:?})", flatten_for_debug(inner)), outer));
+            // Walk inside for nested ceils, with sign Unknown.
+            walk(inner, CoeffSign::Unknown, out);
+        }
+        Expr::Max { expr, .. } | Expr::Min { expr, .. } => {
+            // Ceils inside Max/Min defy the simple sign analysis; mark Unknown.
+            walk(expr, CoeffSign::Unknown, out);
+        }
+        Expr::Tiered { var, .. } => {
+            walk(var, CoeffSign::Unknown, out);
+        }
+    }
+}
+
+/// Minimal debug-style rendering for `expr_repr` strings (avoids leaking the
+/// full Debug output of large subtrees while still naming the relevant variable).
+fn flatten_for_debug(expr: &Expr) -> String {
+    match expr {
+        Expr::Constant { value } => format!("{value}"),
+        Expr::Variable { name } => name.to_string(),
+        Expr::Linear { coeff, var, offset } => {
+            format!("{coeff}*{var} + {offset}", var = flatten_for_debug(var))
+        }
+        _ => format!("{expr:?}"),
     }
 }
 
