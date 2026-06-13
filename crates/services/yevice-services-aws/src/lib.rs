@@ -5,6 +5,7 @@ pub mod common;
 pub mod connection_rules;
 pub mod plugin;
 pub mod pricing_adapter;
+pub mod pricing_provider;
 pub mod quotas;
 pub mod services;
 pub mod tf;

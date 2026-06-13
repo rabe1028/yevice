@@ -1,7 +1,25 @@
-//! Trait abstracting pricing data access.
+//! AWS-specific pricing trait used by [`crate::pricing_adapter::AwsPricingCatalog`].
+//!
+//! Returns AWS-typed price structs (`Ec2Price`, `RdsPrice`, ...) and is therefore
+//! **AWS-only**. Provider-neutral access goes through [`yevice_pricing::PriceCatalog`].
+//!
+//! Two registries implement this trait:
+//! - [`PricingRegistry`] – hardcoded fallback prices
+//! - [`FilePricingRegistry`] – AWS Bulk Pricing API JSON files
+//!
+//! Keeping the trait inside `yevice-services-aws` (instead of the shared
+//! `yevice-pricing` crate) ensures the common pricing crate stays
+//! provider-neutral. See ADR-0004 for the rationale.
 
-use crate::error::PricingError;
-use crate::model::*;
+use yevice_pricing::error::PricingError;
+use yevice_pricing::file_registry::FilePricingRegistry;
+use yevice_pricing::model::{
+    ApiGatewayPrice, BatchPrice, CloudFrontPrice, CloudWatchLogsPrice, DataTransferPrice,
+    DynamoDbPrice, Ec2Price, ElastiCachePrice, EventBridgeSchedulerPrice, FargatePrice,
+    KinesisPrice, LambdaPrice, NatGatewayPrice, OpenSearchServerlessPrice, RdsPrice, S3Price,
+    SqsPrice, StepFunctionsPrice,
+};
+use yevice_pricing::registry::PricingRegistry;
 
 /// Provides pricing data for AWS resources.
 pub trait PricingProvider {
@@ -90,5 +108,5 @@ macro_rules! impl_pricing_provider {
     };
 }
 
-impl_pricing_provider!(crate::registry::PricingRegistry);
-impl_pricing_provider!(crate::file_registry::FilePricingRegistry);
+impl_pricing_provider!(PricingRegistry);
+impl_pricing_provider!(FilePricingRegistry);
