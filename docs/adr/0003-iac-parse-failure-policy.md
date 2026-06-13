@@ -1,6 +1,6 @@
 # ADR 0003: IaC Parse Failure Policy
 
-**Status:** Proposed
+**Status:** Accepted (2026-06-13). Refs #38.
 
 ## Context
 
@@ -40,6 +40,75 @@ to the Architecture so CI can fail on diagnostics even under Lenient.
 
 Lenient by default keeps today's TF UX intact (largest current user base);
 `--strict` reinstates CFN's hard-failure for users who relied on it.
+
+## Decision — API shape
+
+採用案は Recommendation 通り Option C / default Lenient。確定した API
+形状を以下に固定する。
+
+### Core types (`yevice-core::io`)
+
+```rust
+pub enum ParsePolicy { Lenient, Strict }   // default: Lenient
+
+pub enum Severity { Error, Warning, Info }
+
+pub enum DiagnosticSource { Cfn, Tf, Wrangler }
+
+pub struct SourceLocation {
+    pub file: String,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+pub struct IacParseDiagnostic {
+    pub severity: Severity,
+    pub source: DiagnosticSource,
+    pub location: Option<SourceLocation>,
+    pub code: &'static str,        // e.g. "cfn.missing_parameter"
+    pub message: String,
+}
+
+pub struct ParseOutcome<T> {
+    pub value: T,
+    pub diagnostics: Vec<IacParseDiagnostic>,
+    pub had_errors: bool,           // any Severity::Error present
+}
+```
+
+### Parser signatures
+
+3 パーサとも返り値を `Result<ParseOutcome<T>, *Error>` に揃える。
+構文/IO 等の **「✕ 行に該当する case-by-case error」は引き続き
+`Err(*Error)` で返す**。policy で握り潰し可能な失敗のみ
+`ParseOutcome.diagnostics` に積む。
+
+### Engine 配管
+
+```rust
+pub struct GenerateRequest {
+    /* existing fields */
+    pub policy: ParsePolicy,        // default Lenient
+}
+pub fn generate_cost_model(req: &GenerateRequest)
+    -> Result<ParseOutcome<ArchitectureCost>, EngineError>;
+```
+
+戻り値型を `ArchitectureCost` 単体から `ParseOutcome<ArchitectureCost>`
+に変更 (破壊変更)。
+
+### CLI
+
+- トップレベル global flag `--strict` (boolean) のみ追加
+- `--lenient` は **追加しない** (未指定は Lenient なので冗長)
+- 終了コード:
+  - Strict + error 級 diagnostic 1 件以上 → exit code 1
+  - Lenient → exit code 0 + diagnostics は stderr に `tracing::warn!` で表示
+
+### JSON 出力
+
+`cost_model.json` のトップレベルに `diagnostics: []` 配列を追加。
+スキーマの破壊変更としてメジャー扱い、CHANGELOG に明記する。
 
 ## Migration
 
@@ -88,10 +157,10 @@ future adapter work）であり、policy 設計より先にアダプタ層の責
 | `ParseError(String)` | HCL 構文エラー (`hcl::Error` from 経由含む) | ✕ | remain hard error | remain hard error |
 | `Io(std::io::Error)` | ファイル IO 失敗 | ✕ | remain hard error | remain hard error |
 
-TF の本命である「未解決 `var.*` / `local.*` / cross-resource ref」は **そもそも
-`TfError` に届かず `tracing::warn!` で握り潰されている** (parser/adapter 層)。
-Strict 化はこれらを `TfError` の新バリアント (例: `UnresolvedReference`) に昇格
-させる作業を伴う。Phase 1 のスコープに含めるかは Migration 節で別途検討。
+TF の本命である「未解決 `var.*` / `local.*` / cross-resource ref」は現状
+`TfError` に届かず `tracing::warn!` で握り潰されている (parser/adapter 層)。
+**Phase 1 でこれらを `TfError::UnresolvedReference { reference, location }`
+として型化し、policy 制御下に置く。** Phase スコープ節を参照。
 
 ### Wrangler — `WranglerError` (2 variants)
 
@@ -106,14 +175,20 @@ Wrangler は変数層を持たず構造体に直接 deserialize するため、p
 
 ### Phase スコープ
 
-- **Phase 1 (〇 のみ実装):** CFN の 4 バリアント
-  (`MissingParameters` / `ParameterNotFound` / `ImportValueNotFound` /
-  `MappingNotFound`) を `IacParseDiagnostic` 化。TF/Wrangler は policy
-  引数受け取りのみで挙動は据え置き。
+- **Phase 1 (〇 + TF 型化):**
+  - CFN の 4 バリアント (`MissingParameters` / `ParameterNotFound` /
+    `ImportValueNotFound` / `MappingNotFound`) を `IacParseDiagnostic` 化。
+  - **TF: `TfError::UnresolvedReference { reference: String, location: Option<SourceLocation> }`
+    バリアントを新設**し、現状 `tracing::warn!` で握り潰している
+    `var.*` / `local.*` / cross-resource ref を型化。policy 制御下に置く。
+    type system 拡張として `TfError` に新バリアントを追加する作業を含む
+    (詳細は次節)。
+  - Wrangler は policy 引数受け取りのみで挙動は据え置き (現状で
+    policy 対象バリアントなし)。
 - **Phase 2 (△ の取り込み):** CFN の `ConditionNotFound` /
-  `UnsupportedResourceType` / `MissingProperty` を診断化。同時に TF の
-  warn! 経路を `TfError::UnresolvedReference` (新規) に置き換え、
-  `MissingAttribute` と合わせて policy 制御下に置く。
+  `UnsupportedResourceType` / `MissingProperty` を診断化。TF の
+  `MissingAttribute` も合わせて policy 制御下に置く
+  (Phase 1 で `UnresolvedReference` が片付いているため、ここは残務)。
 - **Phase 範囲外（恒久 hard error）:** すべての ✕ 行 — 構文エラー・IO・
   programmer error。これらは lenient でスキップすると下流で必ず破綻する。
 
