@@ -1,4 +1,11 @@
 //! Adapts `GcpPricing` from `yevice-pricing` to the generic `PriceCatalog` trait.
+//!
+//! GCP currently has no file-backed pricing registry (the AWS Bulk-Pricing
+//! equivalent); all prices are sourced from the hardcoded `GcpPricing` table.
+//! Following the standard provider pattern documented in
+//! `docs/adr/0004-provider-implementation-pattern.md`, a file registry would
+//! be an additive optional component; the `PriceCatalog` impl is the
+//! mandatory boundary, so callers continue to work either way.
 
 use yevice_core::resource::Provider;
 use yevice_pricing::{GcpPricing, PriceCatalog, PriceRecord, Sku, error::PricingError};

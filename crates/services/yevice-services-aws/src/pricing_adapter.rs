@@ -14,10 +14,11 @@ use yevice_pricing::{
     catalog::{PriceCatalog, PriceRecord, Sku},
     error::PricingError,
     file_registry::FilePricingRegistry,
-    provider::PricingProvider,
     registry::PricingRegistry,
 };
 use yevice_service_api::PriceCatalogResolver;
+
+use crate::pricing_provider::PricingProvider;
 
 pub struct AwsPricingCatalog {
     /// Always populated; used as the fallback or as the sole source.
