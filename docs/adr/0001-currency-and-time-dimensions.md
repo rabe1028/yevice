@@ -75,8 +75,11 @@ reporting raw values.
 ### Phantom type の適用範囲
 
 - **Layer 1 (SKU lookup → CostComponent):** `Currency<f64, C: CurrencyCode>`
-  を保持。`PricingMetadata.currency` を実際に読んで型パラメータとして引き
-  回し、SKU の通貨ミスマッチをコンパイル時に検出する。
+  を保持。`C` は **provider が静的に決定** する (例: `AwsPricingRegistry` は
+  `type Currency = USD`)。Bulk API の `PricingMetadata.currency: String` は
+  `Self::Currency::CODE` との **照合専用** に使い、不一致は
+  `PricingError::CurrencyMismatch` で reject する。詳細は後段の
+  「Provider-Level Currency Binding」セクションを参照。
 - **Layer 2 (CostComponent → ResourceCost):** 境界で
   `Money { value: f64, currency: String, period: BillingPeriod }`
   に erase。複数 SKU を集約する時点で型レベルの通貨情報は失われるが、
@@ -299,9 +302,14 @@ pub enum CostBuildError {
 
 ### 主要な配線変更
 
-- `PricingMetadata.currency` を Layer 1 の SKU lookup 側で実際に読み取り、
-  `Currency<f64, C>` の型パラメータ決定に使う。現状は metadata に存在する
-  が読まれていない。
+- `Currency<f64, C>` の `C` は **provider が静的に決定** する (例:
+  `impl TypedPricingProvider<USD> for AwsPricingRegistry`)。metadata から `C` を
+  導出する設計は採らない (それは Phantom type の compile-time 保証を崩す
+  runtime dispatch になるため)。`PricingMetadata.currency: String` は Layer 1
+  の SKU lookup 時に `Self::Currency::CODE` と **照合** し、不一致なら
+  `PricingError::CurrencyMismatch` で reject する。現状は metadata が存在する
+  が照合に使われていない、この欠落を埋めるのが本 ADR の配線変更点。詳細は
+  後段の「Provider-Level Currency Binding」セクションを参照。
 
 ### Provider-Level Currency Binding
 
