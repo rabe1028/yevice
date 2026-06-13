@@ -563,11 +563,17 @@ fn encode_expr(enc: &mut Encoder<'_>, expr: &Expr) -> Result<LinearTerms, Solver
         Expr::Product { exprs } => {
             // At most one variable-containing factor; everything else is
             // collapsed into a constant multiplier.
+            //
+            // A factor is "variable-containing" only if at least one coefficient
+            // in `lt.coeffs` is non-zero (|c| > EPS).  Coefficients that
+            // cancelled to zero during summation must not trigger Nonlinear.
+            const EPS: f64 = 1e-12;
             let mut const_factor = 1.0;
             let mut var_factor: Option<LinearTerms> = None;
             for e in exprs {
                 let lt = encode_expr(enc, e)?;
-                if lt.coeffs.is_empty() {
+                let has_variable = lt.coeffs.values().any(|&c| c.abs() > EPS);
+                if !has_variable {
                     const_factor *= lt.constant;
                 } else if var_factor.is_some() {
                     return Err(SolverError::Nonlinear {
@@ -587,8 +593,10 @@ fn encode_expr(enc: &mut Encoder<'_>, expr: &Expr) -> Result<LinearTerms, Solver
             numerator,
             denominator,
         } => {
+            const EPS: f64 = 1e-12;
             let d = encode_expr(enc, denominator)?;
-            if !d.coeffs.is_empty() || d.constant == 0.0 {
+            let denominator_has_variable = d.coeffs.values().any(|&c| c.abs() > EPS);
+            if denominator_has_variable || d.constant == 0.0 {
                 return Err(SolverError::Nonlinear {
                     expr: format!("{expr:?}"),
                 });
@@ -1080,6 +1088,109 @@ mod tests {
         assert!(
             result.is_ok(),
             "encode must succeed when a constant binding is used as a product factor; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Regression: a product factor whose variable coefficients cancel to zero
+    /// during summation must be treated as a constant, not as a variable-
+    /// containing factor.
+    ///
+    /// `(x + (-1*x + 5)) * y` simplifies to `5 * y` at the expression level,
+    /// but the encoder encodes the inner sum inline and ends up with
+    /// `lt.coeffs = {x: 0}` after the two `x` terms cancel.  Without the
+    /// zero-coefficient guard the encoder would see a non-empty `coeffs` map
+    /// and raise `SolverError::Nonlinear` — even though the factor is purely
+    /// constant.
+    #[test]
+    fn encode_product_with_zero_coefficient_after_cancellation() {
+        // objective = (x + (-1*x + 5)) * y
+        // This encodes to 5 * y, which is linear.
+        // decision variables: x in {1.0}, y in {2.0}
+        let inner_sum = Expr::Sum {
+            exprs: vec![
+                Expr::variable("x"),
+                Expr::Sum {
+                    exprs: vec![
+                        Expr::Product {
+                            exprs: vec![Expr::Constant { value: -1.0 }, Expr::variable("x")],
+                        },
+                        Expr::Constant { value: 5.0 },
+                    ],
+                },
+            ],
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::Product {
+                exprs: vec![inner_sum, Expr::variable("y")],
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![2.0],
+                },
+            ],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when a product factor's variable coefficients cancel to zero; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Regression: a Div denominator whose variable coefficients cancel to zero
+    /// must be treated as a constant denominator, not rejected as nonlinear.
+    ///
+    /// `10 / (x + (-1*x + 2))` simplifies to `10 / 2 = 5`.  Without the
+    /// zero-coefficient guard the encoder raises `SolverError::Nonlinear`.
+    #[test]
+    fn encode_div_denominator_with_zero_coefficient_after_cancellation() {
+        // objective = 10 / (x + (-1*x + 2))
+        // decision variable: x in {1.0}
+        let denom_sum = Expr::Sum {
+            exprs: vec![
+                Expr::variable("x"),
+                Expr::Sum {
+                    exprs: vec![
+                        Expr::Product {
+                            exprs: vec![Expr::Constant { value: -1.0 }, Expr::variable("x")],
+                        },
+                        Expr::Constant { value: 2.0 },
+                    ],
+                },
+            ],
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::Constant { value: 10.0 }),
+                denominator: Box::new(denom_sum),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when a Div denominator's variable coefficients cancel to zero; got: {:?}",
             result.err()
         );
     }
