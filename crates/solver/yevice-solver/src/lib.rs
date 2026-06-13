@@ -135,6 +135,32 @@ pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariab
         return Ok(pruned);
     }
 
+    // Detect duplicate decision-variable names.  When the same name appears
+    // more than once in `decision_variables`, the enumerator uses last-write-wins
+    // semantics (the last slot's domain value is always written last into the
+    // scratch map).  Pruning each slot independently could wrongly empty an
+    // earlier slot's domain even when the later slot contains feasible values,
+    // producing a spurious Infeasible result.  Guard against this by collecting
+    // all names that appear more than once and skipping pruning for them.
+    let mut name_count: std::collections::HashMap<VariableName, usize> =
+        std::collections::HashMap::new();
+    for dv in &pruned {
+        *name_count.entry(dv.name.clone()).or_insert(0) += 1;
+    }
+    let duplicate_names: std::collections::HashSet<VariableName> = name_count
+        .into_iter()
+        .filter_map(|(name, count)| if count > 1 { Some(name) } else { None })
+        .collect();
+    if !duplicate_names.is_empty() {
+        for name in &duplicate_names {
+            tracing::warn!(
+                variable = %name,
+                "duplicate decision-variable name detected; skipping domain pruning \
+                 for this variable to preserve enumerator last-write-wins semantics",
+            );
+        }
+    }
+
     // Decision-variable name set, used to detect "this constraint references
     // exactly one decision variable" robustly even when bindings introduce
     // other variable names.
@@ -176,6 +202,13 @@ pub fn prune_domains(problem: &OptimizationProblem) -> Result<Vec<DecisionVariab
         .fold(1u64, u64::saturating_mul);
 
     for dv in &mut pruned {
+        // Skip pruning for variables whose name appears more than once:
+        // the enumerator's last-write-wins semantics would make pruning an
+        // earlier slot incorrect (see duplicate_names detection above).
+        if duplicate_names.contains(&dv.name) {
+            continue;
+        }
+
         // Collect the constraints that target this specific decision variable.
         let relevant: Vec<&OptimizationConstraint> = single_var_constraints
             .iter()
@@ -2535,6 +2568,54 @@ mod tests {
         let pruned = prune_domains(&problem).expect("expected feasible pruning");
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0].domain, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// Regression (codex comment 3407403956): when `decision_variables` contains
+    /// two entries with the **same name** (`x={0}` and `x={10}`), the enumerator
+    /// uses last-write-wins (the last slot's value wins each iteration), so
+    /// `x=10` is the effective value.  A constraint `x >= 5` is therefore
+    /// satisfiable.  The pruner must NOT apply the constraint to the first slot
+    /// (`{0}`) in isolation, which would empty it and return `Infeasible` before
+    /// the enumerator ever runs.
+    ///
+    /// Expected: `EnumerationSolver` finds a feasible solution (x=10).
+    #[test]
+    fn prune_domains_skips_duplicate_named_variables() {
+        // Two decision-variable entries with the same name: x={0} and x={10}.
+        // The enumerator last-write-wins → effective value is always from the
+        // second slot (x=10).
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Ge,
+            rhs: 5.0,
+            label: None,
+        };
+
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Maximize,
+            vec![dv("x", vec![0.0]), dv("x", vec![10.0])],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        // prune_domains must not empty the first slot and return Infeasible.
+        let pruned =
+            prune_domains(&problem).expect("expected feasible: duplicate name must be skipped");
+        assert_eq!(pruned.len(), 2, "both slots must be preserved");
+
+        // The full solver must also find a feasible solution via x=10.
+        let sol = EnumerationSolver.solve(&problem).unwrap();
+        assert!(
+            sol.feasible,
+            "expected feasible solution with duplicate x names and x>=5; \
+             enumerator last-write-wins so x=10 satisfies the constraint"
+        );
+        assert_eq!(
+            sol.assignments[&var("x")],
+            10.0,
+            "expected x=10 (last-write-wins from second slot)"
+        );
     }
 
     // -----------------------------------------------------------------------
