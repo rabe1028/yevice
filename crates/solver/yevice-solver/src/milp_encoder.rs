@@ -1,0 +1,625 @@
+//! Translate an `OptimizationProblem` into a stream of `MilpBackend` calls.
+//!
+//! This module is backend-agnostic: it takes any `&mut dyn MilpBackend` and
+//! emits `add_var` / `add_constraint` / `set_sense` calls. The HiGHS adapter
+//! plugs in via [`crate::highs_backend`]. Other backends (CBC, GLOP, ...)
+//! can reuse this encoder unchanged.
+//!
+//! ## Encoded shapes
+//!
+//! - **Decision variables**: each discrete decision variable becomes a set of
+//!   binary indicators with a `Σ z_i = 1` constraint; the variable's value is
+//!   the inner product `Σ value_i · z_i`. The shadow continuous variable lets
+//!   us re-use the same `VarId` everywhere `Variable { name }` is referenced.
+//! - **Linear (`as_linear()` returns `Some`)**: inlined directly.
+//! - **`Tiered`**: Incremental (fill) formulation with binary activators.
+//! - **`Max(expr, k)`**: big-M with `m ≥ expr`, `m ≥ k`, `m ≤ expr + M(1-z)`,
+//!   `m ≤ k + M z`.
+//! - **`Min(expr, k)`**: dual of Max (reverse signs).
+//! - **`Ceil(expr)`**: integer aux var `y` with `expr ≤ y`. ADR-0002 case (Z)
+//!   — only safe under contexts checked by `classify_ceil_context` (called by
+//!   `crate::highs_backend::solve` before encoding).
+//! - **`Product`**: at most one variable-containing factor; the factor's
+//!   linearization is scaled by the constant product of the other factors.
+//! - **`Div`**: denominator must be constant.
+
+use std::collections::BTreeMap;
+
+use yevice_core::expr::Expr;
+use yevice_core::expr_introspect::{Bounds, VarRanges, expr_bounds};
+use yevice_core::optimize::{
+    DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
+};
+use yevice_core::types::VariableName;
+
+use crate::error::SolverError;
+use crate::milp::{ConstraintSense, MilpBackend, Sense, VarId, VarType};
+
+/// Encoder state: maps every `VariableName` referenced anywhere in the
+/// problem (after bindings expansion) to a backend `VarId`. Aux variables
+/// (binary indicators, Max/Min/Ceil shadows, tiered fill vars) are tracked
+/// here too — they get synthetic names like `__aux_max_3` to keep the
+/// mapping uniform.
+struct Encoder<'a> {
+    backend: &'a mut dyn MilpBackend,
+    /// VariableName → backend handle.
+    var_index: BTreeMap<VariableName, VarId>,
+    /// Ranges used for big-M derivation.
+    ranges: VarRanges,
+    /// Counter for synthetic aux variable names.
+    aux_counter: u32,
+}
+
+/// Linear combination over backend `VarId`s plus a constant.
+#[derive(Debug, Clone, Default)]
+struct LinearTerms {
+    coeffs: BTreeMap<VarId, f64>,
+    constant: f64,
+}
+
+impl LinearTerms {
+    fn from_const(value: f64) -> Self {
+        Self {
+            coeffs: BTreeMap::new(),
+            constant: value,
+        }
+    }
+    fn from_var(id: VarId, coeff: f64) -> Self {
+        let mut coeffs = BTreeMap::new();
+        coeffs.insert(id, coeff);
+        Self {
+            coeffs,
+            constant: 0.0,
+        }
+    }
+    fn scale(mut self, factor: f64) -> Self {
+        if factor == 0.0 {
+            return Self::default();
+        }
+        for v in self.coeffs.values_mut() {
+            *v *= factor;
+        }
+        self.constant *= factor;
+        self
+    }
+    fn add(mut self, other: Self) -> Self {
+        for (id, c) in other.coeffs {
+            *self.coeffs.entry(id).or_insert(0.0) += c;
+        }
+        self.constant += other.constant;
+        self
+    }
+    fn sub(self, other: Self) -> Self {
+        self.add(other.scale(-1.0))
+    }
+}
+
+impl<'a> Encoder<'a> {
+    fn new(backend: &'a mut dyn MilpBackend, ranges: VarRanges) -> Self {
+        Self {
+            backend,
+            var_index: BTreeMap::new(),
+            ranges,
+            aux_counter: 0,
+        }
+    }
+
+    /// Register a "real" variable name and return its handle.
+    /// `lower` / `upper` describe the variable's natural domain.
+    fn register_var(
+        &mut self,
+        name: VariableName,
+        lower: f64,
+        upper: f64,
+        var_type: VarType,
+    ) -> VarId {
+        if let Some(&id) = self.var_index.get(&name) {
+            return id;
+        }
+        let id = self.backend.add_var(lower, upper, 0.0, var_type);
+        self.var_index.insert(name, id);
+        id
+    }
+
+    /// Allocate an anonymous auxiliary variable.
+    fn alloc_aux(&mut self, lower: f64, upper: f64, var_type: VarType) -> VarId {
+        self.aux_counter += 1;
+        self.backend.add_var(lower, upper, 0.0, var_type)
+    }
+}
+
+/// Encode the whole problem onto `backend`, then run `solve`.
+///
+/// The caller is responsible for:
+/// - `validate_bindings(problem)` before encoding (we expect every var
+///   referenced in the objective / constraints to be resolvable).
+/// - `expr_is_linearizable` pre-check on every expression.
+/// - `classify_ceil_context(problem)` pre-check.
+///
+/// Returns the mapping `VariableName → VarId` together with the backend's
+/// solution, so callers can read out decision-variable values.
+pub(crate) struct EncodedProblem {
+    /// Reverse mapping `VariableName → VarId`. Kept for diagnostics; not
+    /// consumed by the default `HighsSolver` decoding path.
+    #[allow(dead_code)]
+    pub var_index: BTreeMap<VariableName, VarId>,
+    pub decision_indicators: BTreeMap<VariableName, Vec<(VarId, f64)>>,
+}
+
+pub(crate) fn encode(
+    backend: &mut dyn MilpBackend,
+    problem: &OptimizationProblem,
+) -> Result<EncodedProblem, SolverError> {
+    let mut enc = Encoder::new(backend, build_ranges(problem));
+
+    // 1) Register decision variables as binary-indicator combinations.
+    let mut decision_indicators: BTreeMap<VariableName, Vec<(VarId, f64)>> = BTreeMap::new();
+    for dv in &problem.decision_variables {
+        let indicators = register_decision_var(&mut enc, dv)?;
+        decision_indicators.insert(dv.name.clone(), indicators);
+    }
+
+    // 2) Register fixed parameters as fixed (lower == upper) continuous vars.
+    //    This keeps the encoder uniform: every Expr::Variable lookup goes
+    //    through `var_index`.
+    for (name, &val) in &problem.fixed_params {
+        if enc.var_index.contains_key(name) {
+            // Decision-variable / fixed-param collision: decision wins per
+            // EnumerationSolver's documented semantics (see bug-1 regression
+            // test). The encoder follows the same rule.
+            continue;
+        }
+        enc.register_var(name.clone(), val, val, VarType::Continuous);
+    }
+
+    // 3) Encode bindings: for every binding `target = expr`, allocate a
+    //    continuous aux var for `target` and constrain it to equal the
+    //    linearization of `expr`. Fixed-param / decision-var collisions
+    //    are already handled by `register_var` (skip if present).
+    for binding in &problem.bindings {
+        if enc.var_index.contains_key(&binding.target) {
+            // Target shadowed by fixed_param or decision_var → skip.
+            continue;
+        }
+        // Allocate the target. Bounds come from interval arithmetic on the
+        // RHS expression so the backend has tight bounds for big-M usage.
+        let bounds = expr_bounds(&binding.expr, &enc.ranges);
+        let (lo, hi) = finite_or_default(bounds, -1e30, 1e30);
+        let target_id = enc.backend.add_var(lo, hi, 0.0, VarType::Continuous);
+        enc.var_index.insert(binding.target.clone(), target_id);
+        // Update ranges so subsequent expressions see this var's bounds.
+        enc.ranges
+            .decision_var_ranges
+            .insert(binding.target.clone(), (lo, hi));
+        // Constrain: target == linearize(expr).
+        let lhs = encode_expr(&mut enc, &binding.expr)?;
+        // (target - lhs) == 0
+        let combined = LinearTerms::from_var(target_id, 1.0).sub(lhs);
+        emit_linear_eq(enc.backend, &combined, 0.0);
+    }
+
+    // 4) Encode objective.
+    let obj_terms = encode_expr(&mut enc, &problem.objective)?;
+    set_objective(enc.backend, &obj_terms);
+
+    // 5) Encode constraints: `lhs <relation> rhs`.
+    for c in &problem.constraints {
+        let lhs = encode_expr(&mut enc, &c.lhs)?;
+        emit_constraint(enc.backend, &lhs, c);
+    }
+
+    // 6) Sense.
+    enc.backend.set_sense(match problem.direction {
+        ObjectiveDirection::Minimize => Sense::Minimize,
+        ObjectiveDirection::Maximize => Sense::Maximize,
+    });
+
+    Ok(EncodedProblem {
+        var_index: enc.var_index,
+        decision_indicators,
+    })
+}
+
+/// Build the `VarRanges` used for big-M derivation.
+fn build_ranges(problem: &OptimizationProblem) -> VarRanges {
+    let mut ranges = VarRanges::default();
+    for dv in &problem.decision_variables {
+        if dv.domain.is_empty() {
+            continue;
+        }
+        let lo = dv.domain.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = dv.domain.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        ranges.decision_var_ranges.insert(dv.name.clone(), (lo, hi));
+    }
+    for (name, &v) in &problem.fixed_params {
+        ranges.fixed_params.insert(name.clone(), v);
+    }
+    ranges
+}
+
+fn finite_or_default(b: Bounds, default_lo: f64, default_hi: f64) -> (f64, f64) {
+    let lo = if b.lower.is_finite() {
+        b.lower
+    } else {
+        default_lo
+    };
+    let hi = if b.upper.is_finite() {
+        b.upper
+    } else {
+        default_hi
+    };
+    (lo, hi)
+}
+
+/// Encode a single decision variable as a 1-of-N binary indicator set.
+///
+/// Adds:
+/// - one continuous "value" variable (lower = min domain, upper = max domain)
+/// - one binary indicator per domain value
+/// - a `Σ z_i = 1` constraint
+/// - a `value = Σ v_i z_i` linking constraint
+///
+/// Returns the indicator handles paired with their domain values so the
+/// caller can decode the solution.
+fn register_decision_var(
+    enc: &mut Encoder<'_>,
+    dv: &DecisionVariable,
+) -> Result<Vec<(VarId, f64)>, SolverError> {
+    if dv.domain.is_empty() {
+        // Treat as infeasible — caller handles this by checking the solver
+        // result. We still add a single 0 variable to keep the encoder
+        // moving; the constraint `0 = 1` from the indicator sum below will
+        // make the problem infeasible at solve time.
+    }
+    let lo = dv.domain.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = dv.domain.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (lo, hi) = if dv.domain.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (lo, hi)
+    };
+    let value_id = enc.register_var(dv.name.clone(), lo, hi, VarType::Continuous);
+
+    let mut indicators: Vec<(VarId, f64)> = Vec::with_capacity(dv.domain.len());
+    for &v in &dv.domain {
+        let z = enc.backend.add_var(0.0, 1.0, 0.0, VarType::Binary);
+        indicators.push((z, v));
+    }
+
+    // Σ z_i = 1
+    let terms: Vec<(VarId, f64)> = indicators.iter().map(|&(z, _)| (z, 1.0)).collect();
+    enc.backend.add_constraint(&terms, ConstraintSense::Eq, 1.0);
+
+    // value - Σ v_i z_i = 0
+    let mut link: Vec<(VarId, f64)> = vec![(value_id, 1.0)];
+    for &(z, v) in &indicators {
+        link.push((z, -v));
+    }
+    enc.backend.add_constraint(&link, ConstraintSense::Eq, 0.0);
+
+    Ok(indicators)
+}
+
+/// Lower an `Expr` into a `LinearTerms` over backend `VarId`s, allocating
+/// auxiliary variables as needed for Tiered / Ceil / Max / Min.
+fn encode_expr(enc: &mut Encoder<'_>, expr: &Expr) -> Result<LinearTerms, SolverError> {
+    match expr {
+        Expr::Constant { value } => Ok(LinearTerms::from_const(*value)),
+
+        Expr::Variable { name } => match enc.var_index.get(name) {
+            Some(&id) => Ok(LinearTerms::from_var(id, 1.0)),
+            None => Err(SolverError::UnboundVariables {
+                variables: vec![name.to_string()],
+            }),
+        },
+
+        Expr::Linear { coeff, var, offset } => {
+            let inner = encode_expr(enc, var)?;
+            let mut out = inner.scale(*coeff);
+            out.constant += offset;
+            Ok(out)
+        }
+
+        Expr::Sum { exprs } => {
+            let mut acc = LinearTerms::default();
+            for e in exprs {
+                acc = acc.add(encode_expr(enc, e)?);
+            }
+            Ok(acc)
+        }
+
+        Expr::Product { exprs } => {
+            // At most one variable-containing factor; everything else is
+            // collapsed into a constant multiplier.
+            let mut const_factor = 1.0;
+            let mut var_factor: Option<LinearTerms> = None;
+            for e in exprs {
+                let lt = encode_expr(enc, e)?;
+                if lt.coeffs.is_empty() {
+                    const_factor *= lt.constant;
+                } else if var_factor.is_some() {
+                    return Err(SolverError::Nonlinear {
+                        expr: format!("{expr:?}"),
+                    });
+                } else {
+                    var_factor = Some(lt);
+                }
+            }
+            Ok(match var_factor {
+                None => LinearTerms::from_const(const_factor),
+                Some(lt) => lt.scale(const_factor),
+            })
+        }
+
+        Expr::Div {
+            numerator,
+            denominator,
+        } => {
+            let d = encode_expr(enc, denominator)?;
+            if !d.coeffs.is_empty() || d.constant == 0.0 {
+                return Err(SolverError::Nonlinear {
+                    expr: format!("{expr:?}"),
+                });
+            }
+            let n = encode_expr(enc, numerator)?;
+            Ok(n.scale(1.0 / d.constant))
+        }
+
+        Expr::Ceil { expr: inner } => encode_ceil(enc, inner),
+
+        Expr::Max { expr: inner, floor } => encode_max(enc, inner, *floor),
+
+        Expr::Min {
+            expr: inner,
+            ceiling,
+        } => encode_min(enc, inner, *ceiling),
+
+        Expr::Tiered { tiers, var } => encode_tiered(enc, tiers, var),
+
+        // Expr is #[non_exhaustive]; reject any future variant explicitly.
+        _ => Err(SolverError::Nonlinear {
+            expr: format!("{expr:?}"),
+        }),
+    }
+}
+
+/// Ceil: introduce integer aux `y`, constrain `expr <= y`. ADR-0002 case (Z).
+/// Caller has already invoked `classify_ceil_context` so this is safe.
+fn encode_ceil(enc: &mut Encoder<'_>, inner: &Expr) -> Result<LinearTerms, SolverError> {
+    let inner_terms = encode_expr(enc, inner)?;
+    // Bound y by the inner expression's interval (rounded up on the high side).
+    let b = expr_bounds(inner, &enc.ranges);
+    let lo = if b.lower.is_finite() {
+        b.lower.ceil()
+    } else {
+        -1e30
+    };
+    let hi = if b.upper.is_finite() {
+        b.upper.ceil()
+    } else {
+        1e30
+    };
+    let y = enc.alloc_aux(lo, hi, VarType::Integer);
+    // inner - y <= 0   (i.e. inner <= y)
+    let constraint_terms = inner_terms.sub(LinearTerms::from_var(y, 1.0));
+    emit_linear_le(enc.backend, &constraint_terms, 0.0);
+    Ok(LinearTerms::from_var(y, 1.0))
+}
+
+/// Max(expr, floor): big-M with binary selector z.
+/// We add `m`, the auxiliary, with `m ≥ expr`, `m ≥ floor`,
+/// `m ≤ expr + M·(1 - z)`, `m ≤ floor + M·z`.
+fn encode_max(enc: &mut Encoder<'_>, inner: &Expr, floor: f64) -> Result<LinearTerms, SolverError> {
+    let inner_terms = encode_expr(enc, inner)?;
+    let b = expr_bounds(inner, &enc.ranges);
+    if !b.is_finite() {
+        return Err(SolverError::UnboundedExpression {
+            expr: format!("{inner:?}"),
+        });
+    }
+    let m_lo = b.lower.max(floor);
+    let m_hi = b.upper.max(floor);
+    let m = enc.alloc_aux(m_lo, m_hi, VarType::Continuous);
+    let z = enc.alloc_aux(0.0, 1.0, VarType::Binary);
+
+    // big-M sized to span both sides comfortably.
+    let big_m = (b.upper - b.lower)
+        .abs()
+        .max((b.upper - floor).abs())
+        .max(1.0)
+        + 1.0;
+
+    // m - inner >= 0
+    let t1 = LinearTerms::from_var(m, 1.0).sub(inner_terms.clone());
+    emit_linear_ge(enc.backend, &t1, 0.0);
+    // m >= floor
+    emit_linear_ge(enc.backend, &LinearTerms::from_var(m, 1.0), floor);
+
+    // m - inner - M*(1 - z) <= 0   ⇔   m - inner + M z <= M
+    let t3 = LinearTerms::from_var(m, 1.0)
+        .sub(inner_terms.clone())
+        .add(LinearTerms::from_var(z, big_m));
+    emit_linear_le(enc.backend, &t3, big_m);
+    // m - floor - M z <= 0
+    let t4 = LinearTerms::from_var(m, 1.0).add(LinearTerms::from_var(z, -big_m));
+    emit_linear_le(enc.backend, &t4, floor);
+
+    Ok(LinearTerms::from_var(m, 1.0))
+}
+
+/// Min(expr, ceiling): dual of Max with reversed signs.
+fn encode_min(
+    enc: &mut Encoder<'_>,
+    inner: &Expr,
+    ceiling: f64,
+) -> Result<LinearTerms, SolverError> {
+    let inner_terms = encode_expr(enc, inner)?;
+    let b = expr_bounds(inner, &enc.ranges);
+    if !b.is_finite() {
+        return Err(SolverError::UnboundedExpression {
+            expr: format!("{inner:?}"),
+        });
+    }
+    let m_lo = b.lower.min(ceiling);
+    let m_hi = b.upper.min(ceiling);
+    let m = enc.alloc_aux(m_lo, m_hi, VarType::Continuous);
+    let z = enc.alloc_aux(0.0, 1.0, VarType::Binary);
+
+    let big_m = (b.upper - b.lower)
+        .abs()
+        .max((ceiling - b.lower).abs())
+        .max(1.0)
+        + 1.0;
+
+    // m - inner <= 0
+    let t1 = LinearTerms::from_var(m, 1.0).sub(inner_terms.clone());
+    emit_linear_le(enc.backend, &t1, 0.0);
+    // m - ceiling <= 0
+    emit_linear_le(enc.backend, &LinearTerms::from_var(m, 1.0), ceiling);
+
+    // m - inner + M(1 - z) >= 0  ⇔  m - inner - M z >= -M
+    let t3 = LinearTerms::from_var(m, 1.0)
+        .sub(inner_terms.clone())
+        .add(LinearTerms::from_var(z, -big_m));
+    emit_linear_ge(enc.backend, &t3, -big_m);
+    // m - ceiling + M z >= 0
+    let t4 = LinearTerms::from_var(m, 1.0).add(LinearTerms::from_var(z, big_m));
+    emit_linear_ge(enc.backend, &t4, ceiling);
+
+    Ok(LinearTerms::from_var(m, 1.0))
+}
+
+/// Tiered: Incremental (fill) formulation.
+///
+/// For an input expression `u` (already a `LinearTerms` after encoding) and
+/// tiers `t_1, …, t_n`, we introduce:
+/// - `q_i ∈ [0, width_i]` continuous fill per tier (width_i = upper_i - upper_{i-1};
+///   for the unbounded tail tier we use a generous big-M-style upper bound).
+/// - `z_i ∈ {0,1}` activator per tier with the chain `z_i ≥ z_{i+1}`,
+///   `q_i ≤ width_i · z_i`, `q_i ≥ width_i · z_{i+1}` (the second forces a
+///   lower tier to be "full" before the next can be entered).
+/// - link: `u = Σ q_i` (encoded as `inner_terms - Σ q_i = 0`).
+///
+/// The encoded value (Tiered's cost) is `Σ price_i · q_i`.
+fn encode_tiered(
+    enc: &mut Encoder<'_>,
+    tiers: &[yevice_core::expr::Tier],
+    inner: &Expr,
+) -> Result<LinearTerms, SolverError> {
+    let inner_terms = encode_expr(enc, inner)?;
+    let b = expr_bounds(inner, &enc.ranges);
+    let usage_upper = if b.upper.is_finite() {
+        b.upper.max(0.0)
+    } else {
+        return Err(SolverError::UnboundedExpression {
+            expr: format!("{inner:?}"),
+        });
+    };
+
+    // Determine each tier's width.
+    let mut prev_limit = 0.0;
+    let mut widths: Vec<f64> = Vec::with_capacity(tiers.len());
+    for tier in tiers {
+        let width = match tier.upper_limit {
+            Some(limit) => (limit - prev_limit).max(0.0),
+            None => (usage_upper - prev_limit).max(0.0),
+        };
+        widths.push(width);
+        if let Some(limit) = tier.upper_limit {
+            prev_limit = limit;
+        }
+    }
+
+    // Allocate q_i continuous, z_i binary.
+    let mut qs: Vec<VarId> = Vec::with_capacity(tiers.len());
+    let mut zs: Vec<VarId> = Vec::with_capacity(tiers.len());
+    for &w in &widths {
+        let q = enc.alloc_aux(0.0, w.max(0.0), VarType::Continuous);
+        let z = enc.alloc_aux(0.0, 1.0, VarType::Binary);
+        qs.push(q);
+        zs.push(z);
+    }
+
+    // q_i ≤ width_i · z_i   ⇔   q_i - width_i z_i ≤ 0
+    // q_i ≥ width_i · z_{i+1}  ⇔  q_i - width_i z_{i+1} ≥ 0
+    // z_i ≥ z_{i+1}  ⇔  z_i - z_{i+1} ≥ 0
+    for i in 0..tiers.len() {
+        let q_i = qs[i];
+        let z_i = zs[i];
+        let w_i = widths[i];
+        let terms_upper: Vec<(VarId, f64)> = vec![(q_i, 1.0), (z_i, -w_i)];
+        enc.backend
+            .add_constraint(&terms_upper, ConstraintSense::Le, 0.0);
+        if i + 1 < tiers.len() {
+            let z_next = zs[i + 1];
+            let terms_lower: Vec<(VarId, f64)> = vec![(q_i, 1.0), (z_next, -w_i)];
+            enc.backend
+                .add_constraint(&terms_lower, ConstraintSense::Ge, 0.0);
+            let terms_chain: Vec<(VarId, f64)> = vec![(z_i, 1.0), (z_next, -1.0)];
+            enc.backend
+                .add_constraint(&terms_chain, ConstraintSense::Ge, 0.0);
+        }
+    }
+
+    // u = Σ q_i  ⇔  inner_terms - Σ q_i = 0
+    let mut sum_q = LinearTerms::default();
+    for &q in &qs {
+        sum_q = sum_q.add(LinearTerms::from_var(q, 1.0));
+    }
+    let link = inner_terms.sub(sum_q);
+    emit_linear_eq(enc.backend, &link, 0.0);
+
+    // Returned linear combination: Σ price_i · q_i.
+    let mut cost = LinearTerms::default();
+    for (i, tier) in tiers.iter().enumerate() {
+        cost = cost.add(LinearTerms::from_var(qs[i], tier.unit_price));
+    }
+    Ok(cost)
+}
+
+// ---------------------------------------------------------------------------
+// Constraint / objective emission
+// ---------------------------------------------------------------------------
+
+fn set_objective(backend: &mut dyn MilpBackend, lt: &LinearTerms) {
+    // The MilpBackend trait sets the objective by passing per-variable
+    // coefficients on `add_var`. Since the encoder allocates vars before it
+    // knows the final objective coefficients, we model the objective as a
+    // free continuous variable `obj_value` with coefficient 1, plus an
+    // equality constraint `obj_value = Σ c_i x_i + constant`.
+    //
+    // This costs one extra variable + one extra constraint but keeps
+    // `add_var(.., objective_coeff, ..)` honest. The objective constant is
+    // absorbed into the bound of `obj_value`.
+    let obj_var = backend.add_var(-1e30, 1e30, 1.0, VarType::Continuous);
+    let mut terms: Vec<(VarId, f64)> = vec![(obj_var, 1.0)];
+    for (&id, &c) in &lt.coeffs {
+        terms.push((id, -c));
+    }
+    backend.add_constraint(&terms, ConstraintSense::Eq, lt.constant);
+}
+
+fn emit_linear_le(backend: &mut dyn MilpBackend, lt: &LinearTerms, rhs_addition: f64) {
+    let terms: Vec<(VarId, f64)> = lt.coeffs.iter().map(|(&id, &c)| (id, c)).collect();
+    backend.add_constraint(&terms, ConstraintSense::Le, rhs_addition - lt.constant);
+}
+
+fn emit_linear_ge(backend: &mut dyn MilpBackend, lt: &LinearTerms, rhs_addition: f64) {
+    let terms: Vec<(VarId, f64)> = lt.coeffs.iter().map(|(&id, &c)| (id, c)).collect();
+    backend.add_constraint(&terms, ConstraintSense::Ge, rhs_addition - lt.constant);
+}
+
+fn emit_linear_eq(backend: &mut dyn MilpBackend, lt: &LinearTerms, rhs_addition: f64) {
+    let terms: Vec<(VarId, f64)> = lt.coeffs.iter().map(|(&id, &c)| (id, c)).collect();
+    backend.add_constraint(&terms, ConstraintSense::Eq, rhs_addition - lt.constant);
+}
+
+fn emit_constraint(backend: &mut dyn MilpBackend, lhs: &LinearTerms, c: &OptimizationConstraint) {
+    let sense = match c.relation {
+        Relation::Le => ConstraintSense::Le,
+        Relation::Ge => ConstraintSense::Ge,
+        Relation::Eq => ConstraintSense::Eq,
+    };
+    let terms: Vec<(VarId, f64)> = lhs.coeffs.iter().map(|(&id, &cc)| (id, cc)).collect();
+    backend.add_constraint(&terms, sense, c.rhs - lhs.constant);
+}

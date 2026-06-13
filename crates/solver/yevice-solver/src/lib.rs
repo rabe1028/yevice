@@ -1,11 +1,23 @@
 //! Solver backends for yevice cost-optimization problems.
 //!
 //! The primary entry point is the [`Solver`] trait, which takes an
-//! [`OptimizationProblem`] and returns a [`Solution`].  The only solver
-//! provided here is [`EnumerationSolver`], which tries every element of the
-//! Cartesian product of all decision-variable domains.
+//! [`OptimizationProblem`] and returns a [`Solution`]. Two implementations
+//! are provided:
+//!
+//! - [`EnumerationSolver`]: dependency-free Cartesian-product enumeration.
+//! - HiGHS-backed MILP (`HighsSolver`, behind the `highs` Cargo feature) —
+//!   self-hosted via the [`milp::MilpBackend`] trait so future backends
+//!   (CBC, GLOP, ...) plug in without rewriting the encoder. See ADR-0002.
 
 pub mod error;
+pub mod milp;
+
+#[cfg(feature = "highs")]
+pub(crate) mod expr_pre_checks;
+#[cfg(feature = "highs")]
+pub mod highs_backend;
+#[cfg(feature = "highs")]
+pub(crate) mod milp_encoder;
 
 use std::collections::HashMap;
 
@@ -337,20 +349,51 @@ fn constraint_decision_dependencies(
         .collect()
 }
 
-/// Construct a solver instance by name.
+/// Construct a solver instance by name with default tuning options.
 ///
-/// This is the public factory used by the CLI's `--solver` option. New
-/// backends (LP/MIP) will plug in here behind feature gates.
-///
-/// Returns a descriptive error naming the allowed values when `name` is
-/// unknown.
+/// Equivalent to [`solver_from_name_with_options`] passing
+/// [`milp::MilpOptions::default()`] for the HiGHS backend.
 pub fn solver_from_name(name: &str) -> Result<Box<dyn Solver>, SolverError> {
+    solver_from_name_with_options(name, milp::MilpOptions::default())
+}
+
+/// Construct a solver instance by name and forward MILP tuning options to
+/// backends that consume them.
+///
+/// This is the public factory used by the CLI's `--solver` option. Returns
+/// a descriptive error naming the allowed values when `name` is unknown
+/// or when the requested backend was not compiled in (e.g. `--solver highs`
+/// on a binary built without `--features highs`).
+#[allow(clippy::needless_pass_by_value)] // options is consumed by HighsSolver when feature is on.
+pub fn solver_from_name_with_options(
+    name: &str,
+    #[allow(unused)] options: milp::MilpOptions,
+) -> Result<Box<dyn Solver>, SolverError> {
     match name {
         "enumeration" => Ok(Box::new(EnumerationSolver)),
+        #[cfg(feature = "highs")]
+        "highs" => Ok(Box::new(crate::highs_backend::HighsSolver { options })),
+        #[cfg(not(feature = "highs"))]
+        "highs" => Err(SolverError::MilpBackend {
+            message: "this binary was built without the 'highs' feature; rebuild yevice-solver \
+                      with --features highs or use --solver enumeration"
+                .into(),
+        }),
         other => Err(SolverError::UnknownSolver {
             requested: other.to_string(),
-            allowed: vec!["enumeration".to_string()],
+            allowed: allowed_solver_names(),
         }),
+    }
+}
+
+fn allowed_solver_names() -> Vec<String> {
+    #[cfg(feature = "highs")]
+    {
+        vec!["enumeration".to_string(), "highs".to_string()]
+    }
+    #[cfg(not(feature = "highs"))]
+    {
+        vec!["enumeration".to_string()]
     }
 }
 
