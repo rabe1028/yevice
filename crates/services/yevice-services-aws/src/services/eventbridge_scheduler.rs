@@ -60,6 +60,8 @@ impl Service for EventBridgeSchedulerService {
                 "Invocations per month",
                 "invocations",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

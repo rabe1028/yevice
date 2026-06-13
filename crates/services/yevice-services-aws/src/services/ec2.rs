@@ -69,13 +69,19 @@ impl Service for Ec2Service {
                 CostComponent {
                     name: format!("Instance ({}, {os_label})", spec.instance_type),
                     expr: instance_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Data Transfer Out".into(),
                     expr: egress_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![egress_var],
+
+            currency: Some("USD".into()),
         })
     }
 }

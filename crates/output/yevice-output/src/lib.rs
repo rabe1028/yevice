@@ -107,6 +107,8 @@ mod tests {
                 expr: Expr::constant(0.0),
                 components: vec![],
                 required_variables: vec![],
+
+                currency: Some("USD".into()),
             }],
             bindings: vec![],
             region: Region::new("ap-northeast-1"),

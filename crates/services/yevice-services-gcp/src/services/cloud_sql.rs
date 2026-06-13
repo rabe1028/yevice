@@ -79,10 +79,14 @@ impl Service for GcpCloudSqlService {
                 CostComponent {
                     name: format!("Instance ({}{})", spec.tier, ha_label),
                     expr: instance_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Storage (SSD)".into(),
                     expr: storage_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![VariableInfo {
@@ -91,6 +95,8 @@ impl Service for GcpCloudSqlService {
                 unit: "GB".into(),
                 kind: VariableKind::Usage,
             }],
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -66,16 +66,22 @@ impl Service for CloudFrontService {
                 CostComponent {
                     name: "Requests".into(),
                     expr: cf_requests,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Data Transfer".into(),
                     expr: cf_transfer,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
                 VariableInfo::new(id, "http_requests", "HTTP requests per month", "requests"),
                 VariableInfo::new(id, "data_transfer_gb", "Data transfer per month", "GB"),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

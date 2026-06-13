@@ -47,6 +47,8 @@ impl Service for AthenaService {
             components: vec![CostComponent {
                 name: "Data Scanned".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -54,6 +56,8 @@ impl Service for AthenaService {
                 "Data scanned per month",
                 "GB",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

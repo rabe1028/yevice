@@ -52,10 +52,14 @@ impl Service for SecretsManagerService {
                 CostComponent {
                     name: "Secret storage".into(),
                     expr: secret_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "API calls".into(),
                     expr: api_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![VariableInfo::new(
@@ -64,6 +68,8 @@ impl Service for SecretsManagerService {
                 "API calls per month",
                 "calls",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

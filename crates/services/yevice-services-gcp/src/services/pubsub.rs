@@ -58,6 +58,8 @@ impl Service for GcpPubSubService {
             components: vec![CostComponent {
                 name: "Data Volume".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo {
                 name: id.var("data_gb"),
@@ -65,6 +67,8 @@ impl Service for GcpPubSubService {
                 unit: "GB".into(),
                 kind: VariableKind::Usage,
             }],
+
+            currency: Some("USD".into()),
         })
     }
 }

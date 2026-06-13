@@ -66,6 +66,8 @@ impl Service for BackupService {
             components: vec![CostComponent {
                 name: format!("Warm Storage ({})", spec.backup_type),
                 expr: storage,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -73,6 +75,8 @@ impl Service for BackupService {
                 "Warm backup storage",
                 "GB",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

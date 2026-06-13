@@ -44,6 +44,8 @@ impl Service for TranscribeService {
             components: vec![CostComponent {
                 name: "Standard Batch Transcription".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -51,6 +53,8 @@ impl Service for TranscribeService {
                 "Audio transcribed per month",
                 "minutes",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

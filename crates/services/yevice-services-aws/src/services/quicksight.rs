@@ -56,6 +56,8 @@ impl Service for QuickSightService {
                 expr: Expr::constant(0.0),
                 components: vec![],
                 required_variables: vec![],
+
+                currency: Some("USD".into()),
             });
         }
 
@@ -165,17 +167,25 @@ impl Service for QuickSightService {
                 CostComponent {
                     name: "Creators".into(),
                     expr: creator_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Viewer Sessions (capped $5/user)".into(),
                     expr: viewer_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "SPICE Capacity".into(),
                     expr: spice_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vars,
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -39,8 +39,7 @@ impl Service for S3Service {
         let storage_tiers = pricing
             .lookup(&Sku::new("aws.s3.storage_tiers"))?
             .as_tiered()
-            .map_err(CostError::Pricing)?
-            .to_vec();
+            .map_err(CostError::Pricing)?;
 
         let storage = Expr::tiered(storage_tiers, Expr::variable(id.var(var::STORAGE_GB)));
         let put = Expr::linear(
@@ -63,14 +62,20 @@ impl Service for S3Service {
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "PUT requests".into(),
                     expr: put,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "GET requests".into(),
                     expr: get,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -83,6 +88,8 @@ impl Service for S3Service {
                 ),
                 VariableInfo::new(id, "get_requests", "GET requests per month", "requests"),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

@@ -114,14 +114,20 @@ impl Service for LambdaService {
                 CostComponent {
                     name: "Requests".into(),
                     expr: request_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: format!("Compute ({}MB)", spec.memory_mb),
                     expr: compute_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Data Transfer Out".into(),
                     expr: egress_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -139,6 +145,8 @@ impl Service for LambdaService {
                 ),
                 egress_var,
             ],
+
+            currency: Some("USD".into()),
         })
     }
 

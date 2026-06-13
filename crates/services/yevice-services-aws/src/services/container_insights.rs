@@ -47,6 +47,8 @@ impl Service for ContainerInsightsService {
                 expr: Expr::constant(0.0),
                 components: vec![],
                 required_variables: vec![],
+
+                currency: Some("USD".into()),
             });
         }
 
@@ -77,14 +79,20 @@ impl Service for ContainerInsightsService {
                 CostComponent {
                     name: "Custom Metrics".into(),
                     expr: metrics,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Logs Ingestion".into(),
                     expr: ingestion,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Logs Storage".into(),
                     expr: storage,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -101,6 +109,8 @@ impl Service for ContainerInsightsService {
                     "GB",
                 ),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

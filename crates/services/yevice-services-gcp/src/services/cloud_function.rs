@@ -101,10 +101,14 @@ impl Service for GcpCloudFunctionService {
                 CostComponent {
                     name: "Invocations".into(),
                     expr: invocation_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Compute (GB-seconds)".into(),
                     expr: compute_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -121,6 +125,8 @@ impl Service for GcpCloudFunctionService {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

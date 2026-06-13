@@ -66,8 +66,12 @@ impl Service for LightsailService {
                 components: vec![CostComponent {
                     name: "Disk".into(),
                     expr: disk_cost,
+
+                    currency: None,
                 }],
                 required_variables: vars,
+
+                currency: Some("USD".into()),
             });
         }
 
@@ -86,8 +90,12 @@ impl Service for LightsailService {
             components: vec![CostComponent {
                 name: "Instance (Bundle)".into(),
                 expr: instance_cost,
+
+                currency: None,
             }],
             required_variables: vec![],
+
+            currency: Some("USD".into()),
         })
     }
 }

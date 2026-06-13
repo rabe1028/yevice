@@ -46,8 +46,12 @@ impl Service for VpnService {
             components: vec![CostComponent {
                 name: "Connection Hours".into(),
                 expr: connection,
+
+                currency: None,
             }],
             required_variables: vec![],
+
+            currency: Some("USD".into()),
         })
     }
 }

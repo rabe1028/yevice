@@ -113,10 +113,14 @@ impl Service for RdsService {
                     CostComponent {
                         name: "Instance".into(),
                         expr: aurora_instance,
+
+                        currency: None,
                     },
                     CostComponent {
                         name: "Storage".into(),
                         expr: aurora_storage,
+
+                        currency: None,
                     },
                 ],
                 required_variables: vec![VariableInfo::new(
@@ -125,6 +129,8 @@ impl Service for RdsService {
                     "Aurora storage amount",
                     "GB",
                 )],
+
+                currency: Some("USD".into()),
             })
         } else {
             let storage_per_az = match spec.storage_type.as_str() {
@@ -163,13 +169,19 @@ impl Service for RdsService {
                     CostComponent {
                         name: "Instance".into(),
                         expr: Expr::constant(instance_cost),
+
+                        currency: None,
                     },
                     CostComponent {
                         name: "Storage".into(),
                         expr: Expr::constant(storage_cost),
+
+                        currency: None,
                     },
                 ],
                 required_variables: vec![],
+
+                currency: Some("USD".into()),
             })
         }
     }

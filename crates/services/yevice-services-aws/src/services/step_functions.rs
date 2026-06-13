@@ -67,10 +67,14 @@ impl Service for StepFunctionsService {
                         CostComponent {
                             name: "Requests".into(),
                             expr: sfn_requests,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Duration".into(),
                             expr: sfn_duration,
+
+                            currency: None,
                         },
                     ],
                     required_variables: vec![
@@ -82,6 +86,8 @@ impl Service for StepFunctionsService {
                             "GB-seconds",
                         ),
                     ],
+
+                    currency: Some("USD".into()),
                 })
             }
             StepFunctionsType::Standard => Ok(ResourceCost {
@@ -108,6 +114,8 @@ impl Service for StepFunctionsService {
                     "State transitions per month",
                     "transitions",
                 )],
+
+                currency: Some("USD".into()),
             }),
         }
     }

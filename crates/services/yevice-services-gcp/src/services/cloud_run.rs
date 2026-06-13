@@ -143,14 +143,20 @@ impl Service for GcpCloudRunService {
             CostComponent {
                 name: "Requests".into(),
                 expr: request_cost.clone(),
+
+                currency: None,
             },
             CostComponent {
                 name: format!("vCPU ({} core)", spec.cpu),
                 expr: vcpu_cost.clone(),
+
+                currency: None,
             },
             CostComponent {
                 name: format!("Memory ({}MB)", spec.memory_mb as u32),
                 expr: mem_cost.clone(),
+
+                currency: None,
             },
         ];
         let mut expr_parts = vec![request_cost, vcpu_cost, mem_cost];
@@ -158,6 +164,8 @@ impl Service for GcpCloudRunService {
             components.push(CostComponent {
                 name: format!("Min Instances ({min_instances} warm)"),
                 expr: min_instance_cost.clone(),
+
+                currency: None,
             });
             expr_parts.push(min_instance_cost);
         }
@@ -185,6 +193,8 @@ impl Service for GcpCloudRunService {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

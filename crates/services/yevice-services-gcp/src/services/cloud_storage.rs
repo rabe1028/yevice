@@ -54,6 +54,8 @@ impl Service for GcpCloudStorageService {
             components: vec![CostComponent {
                 name: format!("Storage ({label})"),
                 expr: storage_cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo {
                 name: id.var("storage_gb"),
@@ -61,6 +63,8 @@ impl Service for GcpCloudStorageService {
                 unit: "GB".into(),
                 kind: VariableKind::Usage,
             }],
+
+            currency: Some("USD".into()),
         })
     }
 }

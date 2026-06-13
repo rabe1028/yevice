@@ -56,6 +56,8 @@ impl Service for AppSyncService {
             components: vec![CostComponent {
                 name: "Operations".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -63,6 +65,8 @@ impl Service for AppSyncService {
                 "Query/mutation operations per month",
                 "operations",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

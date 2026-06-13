@@ -10,7 +10,7 @@ use yevice_core::{
     types::{LogicalId, ResourceType, VariableName},
 };
 use yevice_pricing::{
-    catalog::{PriceCatalog, PriceRecord, Sku},
+    catalog::{PriceCatalog, PricedValue, Sku},
     error::PricingError,
 };
 use yevice_service_api::Service;
@@ -31,24 +31,24 @@ impl PriceCatalog for TestCatalog {
         "test"
     }
 
-    fn lookup(&self, sku: &Sku) -> Result<PriceRecord, PricingError> {
+    fn lookup(&self, sku: &Sku) -> Result<PricedValue, PricingError> {
         let price = match sku.as_str() {
-            "gcp.bigquery.active_storage_gb_month" => PriceRecord::flat(2.0),
-            "gcp.bigquery.query_per_tb" => PriceRecord::flat(1_000.0),
-            "gcp.cloud_function.invocation_per_million" => PriceRecord::flat(1_000_000.0),
-            "gcp.cloud_function.gb_second" => PriceRecord::flat(2.0),
-            "gcp.cloud_run.request_per_million" => PriceRecord::flat(1_000_000.0),
-            "gcp.cloud_run.vcpu_second" => PriceRecord::flat(2.0),
-            "gcp.cloud_run.memory_gb_second" => PriceRecord::flat(3.0),
-            "gcp.cloud_run.idle_vcpu_second" => PriceRecord::flat(0.2),
-            "gcp.cloud_sql.vcpu_hour" => PriceRecord::flat(1.0),
-            "gcp.cloud_sql.ram_gb_hour" => PriceRecord::flat(2.0),
-            "gcp.cloud_sql.ssd_gb_month" => PriceRecord::flat(3.0),
-            "gcp.cloud_storage.standard_gb_month" => PriceRecord::flat(1.0),
-            "gcp.cloud_storage.nearline_gb_month" => PriceRecord::flat(2.0),
-            "gcp.cloud_storage.coldline_gb_month" => PriceRecord::flat(3.0),
-            "gcp.cloud_storage.archive_gb_month" => PriceRecord::flat(4.0),
-            "gcp.pubsub.data_gb" => PriceRecord::flat(2.0),
+            "gcp.bigquery.active_storage_gb_month" => PricedValue::scalar(2.0, "USD"),
+            "gcp.bigquery.query_per_tb" => PricedValue::scalar(1_000.0, "USD"),
+            "gcp.cloud_function.invocation_per_million" => PricedValue::scalar(1_000_000.0, "USD"),
+            "gcp.cloud_function.gb_second" => PricedValue::scalar(2.0, "USD"),
+            "gcp.cloud_run.request_per_million" => PricedValue::scalar(1_000_000.0, "USD"),
+            "gcp.cloud_run.vcpu_second" => PricedValue::scalar(2.0, "USD"),
+            "gcp.cloud_run.memory_gb_second" => PricedValue::scalar(3.0, "USD"),
+            "gcp.cloud_run.idle_vcpu_second" => PricedValue::scalar(0.2, "USD"),
+            "gcp.cloud_sql.vcpu_hour" => PricedValue::scalar(1.0, "USD"),
+            "gcp.cloud_sql.ram_gb_hour" => PricedValue::scalar(2.0, "USD"),
+            "gcp.cloud_sql.ssd_gb_month" => PricedValue::scalar(3.0, "USD"),
+            "gcp.cloud_storage.standard_gb_month" => PricedValue::scalar(1.0, "USD"),
+            "gcp.cloud_storage.nearline_gb_month" => PricedValue::scalar(2.0, "USD"),
+            "gcp.cloud_storage.coldline_gb_month" => PricedValue::scalar(3.0, "USD"),
+            "gcp.cloud_storage.archive_gb_month" => PricedValue::scalar(4.0, "USD"),
+            "gcp.pubsub.data_gb" => PricedValue::scalar(2.0, "USD"),
             other => {
                 return Err(PricingError::NotFound {
                     service: other.to_string(),

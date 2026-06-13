@@ -54,8 +54,12 @@ impl Service for CloudWatchService {
             components: vec![CostComponent {
                 name: "Alarms".into(),
                 expr: alarm,
+
+                currency: None,
             }],
             required_variables: vec![],
+
+            currency: Some("USD".into()),
         })
     }
 }
