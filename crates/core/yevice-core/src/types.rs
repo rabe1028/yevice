@@ -111,7 +111,7 @@ define_id!(
 ///
 /// Services derive cost-expression variable names from a logical id plus a
 /// suffix (e.g. `IngestFunction.var("requests")` → `IngestFunction_requests`).
-/// The suffix is a plain string, so a typo (`"requets"`) or a service-to-service
+/// The suffix is a plain string, so a typo (e.g. a misspelled `"requests"`) or a service-to-service
 /// drift (`"requests"` vs `"monthly_requests"`) silently produces a distinct
 /// variable that no test, no schema, and no quota would link back.
 ///
