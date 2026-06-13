@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use yevice_core::expr::Expr;
 use yevice_core::expr_introspect::{
     CeilContextResult, VarRanges, classify_ceil_context, expr_bounds, expr_is_linearizable,
-    substitute_bindings, substitute_fixed_params,
+    first_resolvable_bindings, substitute_bindings, substitute_fixed_params,
 };
 use yevice_core::optimize::OptimizationProblem;
 use yevice_core::types::VariableName;
@@ -37,8 +37,25 @@ pub(crate) fn pre_check(problem: &OptimizationProblem) -> Result<(), SolverError
         .filter(|(k, _)| !decision_vars.contains(*k))
         .map(|(k, &v)| (k.clone(), v))
         .collect();
+    // Seed the "known" set with both decision variables and fixed parameters.
+    // This mirrors the encoder's `resolved` seed which starts from
+    // `enc.var_index` (all decision vars + fixed params registered together).
+    let known_names: BTreeSet<VariableName> = decision_vars
+        .iter()
+        .cloned()
+        .chain(fixed_param_map.keys().cloned())
+        .collect();
+    // Filter bindings to first-resolvable semantics before expansion, matching
+    // EnumerationSolver and the MILP encoder: for each target the *first*
+    // binding whose RHS can be fully resolved (given decision vars + fixed
+    // params + already-selected binding targets) is adopted; later bindings
+    // for the same target — including unresolvable ones that appear earlier —
+    // are discarded.  Without this filter `substitute_bindings` uses
+    // first-textual-match, which can expand an unresolvable binding (e.g.
+    // `b = missing * other`) before a valid later binding (`b = x`) is seen.
+    let resolvable_bindings = first_resolvable_bindings(&problem.bindings, &known_names);
     let normalise = |e: &Expr| -> Expr {
-        let after_bindings = substitute_bindings(e, &problem.bindings);
+        let after_bindings = substitute_bindings(e, &resolvable_bindings);
         substitute_fixed_params(&after_bindings, &fixed_param_map)
     };
 
@@ -136,4 +153,77 @@ fn check_big_m_bounds(expr: &Expr, ranges: &VarRanges) -> Result<(), SolverError
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use yevice_core::cost::VariableBinding;
+    use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
+    use yevice_core::types::VariableName;
+
+    use super::*;
+
+    fn var(name: &str) -> VariableName {
+        VariableName::new(name)
+    }
+
+    fn binding(target: &str, expr: Expr) -> VariableBinding {
+        VariableBinding {
+            target: var(target),
+            expr,
+            description: String::new(),
+            source: "test".into(),
+        }
+    }
+
+    /// Regression for the first-resolvable binding semantics in pre-check.
+    ///
+    /// `b = missing * other` is unresolvable (both `missing` and `other` are
+    /// never defined).  The valid binding `b = x` appears second and is the
+    /// *first-resolvable* one.  Before the fix `substitute_bindings` would
+    /// expand `b` to `missing * other` (first textual match), yielding a
+    /// `Product` with two variable-containing factors, which the
+    /// linearizability check correctly rejects as `SolverError::Nonlinear`.
+    /// After the fix only the resolvable binding `b = x` is used and the
+    /// pre-check must return `Ok`.
+    #[test]
+    fn pre_check_first_resolvable_binding_skips_nonlinear_unreachable() {
+        // objective = b
+        // binding[0]: b = missing * other  (unresolvable — never defined)
+        // binding[1]: b = x                (first-resolvable)
+        // decision variable x in {1.0, 2.0}
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![
+                binding(
+                    "b",
+                    Expr::Product {
+                        exprs: vec![Expr::variable("missing"), Expr::variable("other")],
+                    },
+                ),
+                binding("b", Expr::variable("x")),
+            ],
+        };
+
+        let result = pre_check(&problem);
+        assert!(
+            result.is_ok(),
+            "pre_check must pass when the first-resolvable binding for `b` is linear; \
+             got: {:?}",
+            result.err()
+        );
+    }
 }

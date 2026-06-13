@@ -590,6 +590,86 @@ fn substitute_once(expr: &Expr, bindings: &[VariableBinding]) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
+// first_resolvable_bindings: first-resolvable semantics binding filter
+// ---------------------------------------------------------------------------
+
+/// Filter `bindings` to retain only the **first resolvable** binding for each
+/// target, mirroring the semantics used by `EnumerationSolver`'s
+/// `resolve_bindings_into` and the MILP encoder.
+///
+/// A binding is *resolvable* when every variable referenced in its RHS is
+/// either already in `known_names` (decision variables, fixed parameters) or
+/// has already been selected as the first-resolvable binding for an earlier
+/// target.  The function runs a fixed-point loop so that a binding whose RHS
+/// references another binding target (a chain) resolves correctly regardless
+/// of declaration order.
+///
+/// Bindings whose target is already in `known_names` (shadowed by a decision
+/// variable or fixed parameter) are dropped entirely, consistent with the
+/// encoder and enumerator "decision wins" rule.
+///
+/// The returned `Vec` preserves the relative order of the selected bindings
+/// within the original slice.
+#[must_use]
+pub fn first_resolvable_bindings(
+    bindings: &[VariableBinding],
+    known_names: &BTreeSet<VariableName>,
+) -> Vec<VariableBinding> {
+    // `resolved` tracks all names we consider "defined": starts with the
+    // caller-supplied set (decision vars + fixed params), grows as we select
+    // each binding.
+    let mut resolved: BTreeSet<VariableName> = known_names.clone();
+    // `selected_index` records the index into `bindings` of the chosen
+    // binding for each target.  BTreeMap gives us stable key ordering, but
+    // we re-sort by value (original index) before collecting.
+    let mut selected_index: BTreeMap<&VariableName, usize> = BTreeMap::new();
+    // Targets that are shadowed by known_names (decision vars / fixed params)
+    // must never be selected; track them explicitly so we can skip duplicates.
+    let shadowed: BTreeSet<&VariableName> = bindings
+        .iter()
+        .map(|b| &b.target)
+        .filter(|t| known_names.contains(*t))
+        .collect();
+
+    let max_passes = bindings.len() + 1;
+    for _ in 0..max_passes {
+        let mut progressed = false;
+        for (i, binding) in bindings.iter().enumerate() {
+            // Skip targets shadowed by decision vars / fixed params.
+            if shadowed.contains(&binding.target) {
+                continue;
+            }
+            // Skip if we already picked a binding for this target.
+            if selected_index.contains_key(&binding.target) {
+                continue;
+            }
+            // A binding is resolvable if every variable in its RHS is known.
+            let all_known = binding
+                .expr
+                .variables()
+                .iter()
+                .all(|v| resolved.contains(v));
+            if all_known {
+                selected_index.insert(&binding.target, i);
+                resolved.insert(binding.target.clone());
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // Collect selected bindings in original slice order.
+    let mut result: Vec<(usize, &VariableBinding)> = selected_index
+        .values()
+        .map(|&i| (i, &bindings[i]))
+        .collect();
+    result.sort_by_key(|(i, _)| *i);
+    result.into_iter().map(|(_, b)| b.clone()).collect()
+}
+
+// ---------------------------------------------------------------------------
 // classify_ceil_context: ADR-0002 Ceil safety classifier
 // ---------------------------------------------------------------------------
 
@@ -638,12 +718,19 @@ pub fn classify_ceil_context(problem: &OptimizationProblem) -> CeilContextResult
         .filter(|(k, _)| !decision_names.contains(*k))
         .map(|(k, &v)| (k.clone(), v))
         .collect();
-    // Normalise: expand bindings first, then inline fixed params as constants.
-    // This mirrors what `pre_check::normalise` does so that shapes like
-    // `price * ceil(x)` (where `price` is a fixed param) are correctly
-    // classified as `Positive` coefficient rather than `Unknown`.
+    // Normalise: expand bindings first (using first-resolvable semantics to
+    // match EnumerationSolver and the MILP encoder), then inline fixed params
+    // as constants.  Using `substitute_bindings` directly would pick the first
+    // *textual* binding for each target, which can expand an unresolvable RHS
+    // (`b = missing * other`) before a valid later binding (`b = x`) is seen.
+    let known_names: BTreeSet<VariableName> = decision_names
+        .iter()
+        .cloned()
+        .chain(fixed_param_map.keys().cloned())
+        .collect();
+    let resolvable = first_resolvable_bindings(&problem.bindings, &known_names);
     let normalise = |e: &Expr| -> Expr {
-        let after_bindings = substitute_bindings(e, &problem.bindings);
+        let after_bindings = substitute_bindings(e, &resolvable);
         substitute_fixed_params(&after_bindings, &fixed_param_map)
     };
 
