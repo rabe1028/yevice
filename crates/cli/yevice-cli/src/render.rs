@@ -4,10 +4,13 @@
 //! returns it ready for printing.  The calling command function calls
 //! `println!("{table}")` — no formatting logic lives outside this module.
 
+use std::collections::BTreeMap;
+
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 use yevice_core::Money;
 use yevice_core::capacity::{Severity, Violation};
 use yevice_core::evaluate::ArchitectureResult;
+use yevice_core::fx::{RateDate, StaticRates, convert_to};
 use yevice_core::simulate::ArchSimulation;
 
 /// Render a [`Money`] amount with its declared currency code suffix.
@@ -58,11 +61,32 @@ fn header_currency(result: &ArchitectureResult) -> &str {
 // eval
 // ---------------------------------------------------------------------------
 
+/// Convert a single [`Money`] value to `target_currency` using `rates`.
+///
+/// Returns `None` when the rate is missing so callers can fall back to a
+/// placeholder rather than mixing currencies silently.
+fn try_convert_money(
+    money: &Money,
+    target: &str,
+    rates: &StaticRates,
+    at: RateDate,
+) -> Option<Money> {
+    let mut single: BTreeMap<String, f64> = BTreeMap::new();
+    single.insert(money.currency.clone(), money.value);
+    convert_to(&single, target, rates, at).ok()
+}
+
 /// Build the per-resource cost table for `eval --breakdown`.
 ///
 /// Each resource appears as a coloured row followed by indented component rows.
 /// A green TOTAL row is appended at the bottom.
-pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table {
+///
+/// When `display_currency` is `Some((rates, target, at))`, per-resource costs
+/// are converted to `target`; rows that cannot be converted show `"n/a"`.
+pub(crate) fn render_eval_breakdown_table(
+    result: &ArchitectureResult,
+    display_currency: Option<(&StaticRates, &str, RateDate)>,
+) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     let header_ccy = header_currency(result).to_string();
@@ -72,15 +96,28 @@ pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table 
     ]);
 
     for r in &result.resources {
+        let cost_str = if let Some((rates, target, at)) = display_currency {
+            match try_convert_money(&r.monthly_cost, target, rates, at) {
+                Some(m) => fmt_money(&m),
+                None => "n/a".to_string(),
+            }
+        } else {
+            fmt_money(&r.monthly_cost)
+        };
         table.add_row(vec![
             Cell::new(&r.label).fg(Color::Cyan),
-            Cell::new(fmt_money(&r.monthly_cost)).fg(Color::Cyan),
+            Cell::new(cost_str).fg(Color::Cyan),
         ]);
         for (name, cost) in &r.component_costs {
-            table.add_row(vec![
-                Cell::new(format!("  └─ {name}")),
-                Cell::new(fmt_money_4(cost)),
-            ]);
+            let comp_str = if let Some((rates, target, at)) = display_currency {
+                match try_convert_money(cost, target, rates, at) {
+                    Some(m) => fmt_money_4(&m),
+                    None => "n/a".to_string(),
+                }
+            } else {
+                fmt_money_4(cost)
+            };
+            table.add_row(vec![Cell::new(format!("  └─ {name}")), Cell::new(comp_str)]);
         }
     }
 
@@ -108,7 +145,13 @@ pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table 
 ///
 /// Each resource appears on one row with label, type, and monthly cost.
 /// A green TOTAL row is appended at the bottom.
-pub(crate) fn render_eval_table(result: &ArchitectureResult) -> Table {
+///
+/// When `display_currency` is `Some((rates, target, at))`, per-resource costs
+/// are converted to `target`; rows that cannot be converted show `"n/a"`.
+pub(crate) fn render_eval_table(
+    result: &ArchitectureResult,
+    display_currency: Option<(&StaticRates, &str, RateDate)>,
+) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     let header_ccy = header_currency(result).to_string();
@@ -119,10 +162,18 @@ pub(crate) fn render_eval_table(result: &ArchitectureResult) -> Table {
     ]);
 
     for r in &result.resources {
+        let cost_str = if let Some((rates, target, at)) = display_currency {
+            match try_convert_money(&r.monthly_cost, target, rates, at) {
+                Some(m) => fmt_money(&m),
+                None => "n/a".to_string(),
+            }
+        } else {
+            fmt_money(&r.monthly_cost)
+        };
         table.add_row(vec![
             Cell::new(&r.label),
             Cell::new(&r.resource_type),
-            Cell::new(fmt_money(&r.monthly_cost)),
+            Cell::new(cost_str),
         ]);
     }
 

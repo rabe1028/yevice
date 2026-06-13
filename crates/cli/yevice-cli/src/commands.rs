@@ -161,11 +161,15 @@ pub fn evaluate(
 
     println!("\n{}: Monthly Cost Estimate", result.name);
 
+    let disp = display_currency.map(|target| {
+        let at = RateDate::new(Utc::now().date_naive());
+        (&rates, target, at)
+    });
     if breakdown {
-        let table = crate::render::render_eval_breakdown_table(&result);
+        let table = crate::render::render_eval_breakdown_table(&result, disp);
         println!("{table}");
     } else {
-        let table = crate::render::render_eval_table(&result);
+        let table = crate::render::render_eval_table(&result, disp);
         println!("{table}");
     }
 
