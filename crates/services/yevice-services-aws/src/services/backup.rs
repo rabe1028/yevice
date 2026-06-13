@@ -3,7 +3,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -56,7 +56,7 @@ impl Service for BackupService {
         )))?;
 
         // Warm (backup) storage is usage-driven: GB-month of stored backup data.
-        let storage = Expr::linear(gb_price, Expr::variable(id.var("backup_gb")), 0.0);
+        let storage = Expr::linear(gb_price, Expr::variable(id.var(var::BACKUP_GB)), 0.0);
 
         Ok(ResourceCost {
             logical_id: id.clone(),
@@ -69,7 +69,7 @@ impl Service for BackupService {
             }],
             required_variables: vec![VariableInfo::new(
                 id,
-                "backup_gb",
+                var::BACKUP_GB,
                 "Warm backup storage",
                 "GB",
             )],

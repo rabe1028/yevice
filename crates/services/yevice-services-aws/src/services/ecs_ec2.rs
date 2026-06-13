@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -41,7 +41,7 @@ impl Service for EcsEc2Service {
         let hourly_price = pricing.lookup_f64(&sku)?;
         let instance_expr = match spec.instance_count {
             Some(n) => Expr::constant(n),
-            None => Expr::variable(id.var("instance_count")),
+            None => Expr::variable(id.var(var::INSTANCE_COUNT)),
         };
         let instance_cost = Expr::linear(hourly_price * HOURS_PER_MONTH, instance_expr, 0.0);
         let (egress_cost, egress_var) = egress_cost_expr(id, pricing)?;
@@ -50,7 +50,7 @@ impl Service for EcsEc2Service {
         if spec.instance_count.is_none() {
             vars.push(VariableInfo::new(
                 id,
-                "instance_count",
+                var::INSTANCE_COUNT,
                 "Number of EC2 instances in the ECS cluster",
                 "instances",
             ));

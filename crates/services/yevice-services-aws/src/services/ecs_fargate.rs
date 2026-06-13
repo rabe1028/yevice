@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -46,12 +46,12 @@ impl Service for EcsFargateService {
 
         let vcpu_cost_per_task = Expr::linear(
             vcpu_hour * HOURS_PER_MONTH,
-            Expr::variable(id.var("vcpu")),
+            Expr::variable(id.var(var::VCPU)),
             0.0,
         );
         let memory_cost_per_task = Expr::linear(
             mem_hour * HOURS_PER_MONTH,
-            Expr::variable(id.var("memory_gb")),
+            Expr::variable(id.var(var::MEMORY_GB)),
             0.0,
         );
         let per_task = Expr::sum(vec![
@@ -67,8 +67,8 @@ impl Service for EcsFargateService {
         let memory_cost_total = Expr::product(vec![tasks_expr.clone(), memory_cost_per_task]);
 
         let mut vars = vec![
-            VariableInfo::new(id, "vcpu", "vCPU per task", "vCPU"),
-            VariableInfo::new(id, "memory_gb", "Memory per task", "GB"),
+            VariableInfo::new(id, var::VCPU, "vCPU per task", "vCPU"),
+            VariableInfo::new(id, var::MEMORY_GB, "Memory per task", "GB"),
         ];
         if spec.desired_count.is_none() {
             vars.insert(
@@ -156,8 +156,8 @@ mod tests {
             .expect("build cost");
 
         let mut params = yevice_core::evaluate::Params::default();
-        params.insert(id.var("vcpu"), 0.5);
-        params.insert(id.var("memory_gb"), 1.0);
+        params.insert(id.var(var::VCPU), 0.5);
+        params.insert(id.var(var::MEMORY_GB), 1.0);
         params.insert(id.var("data_transfer_out_gb"), 0.0);
 
         let total = evaluate(&cost.expr, &params).expect("evaluate total");

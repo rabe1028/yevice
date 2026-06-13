@@ -3,7 +3,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -42,7 +42,7 @@ impl Service for S3Service {
             .map_err(CostError::Pricing)?
             .to_vec();
 
-        let storage = Expr::tiered(storage_tiers, Expr::variable(id.var("storage_gb")));
+        let storage = Expr::tiered(storage_tiers, Expr::variable(id.var(var::STORAGE_GB)));
         let put = Expr::linear(
             put_request_price,
             Expr::variable(id.var("put_requests")),
@@ -74,7 +74,7 @@ impl Service for S3Service {
                 },
             ],
             required_variables: vec![
-                VariableInfo::new(id, "storage_gb", "Storage amount", "GB"),
+                VariableInfo::new(id, var::STORAGE_GB, "Storage amount", "GB"),
                 VariableInfo::new(
                     id,
                     "put_requests",

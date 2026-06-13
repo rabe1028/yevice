@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -61,7 +61,7 @@ impl Service for OpenSearchServerlessService {
             },
             0.0,
         );
-        let storage = Expr::linear(storage_price, Expr::variable(id.var("storage_gb")), 0.0);
+        let storage = Expr::linear(storage_price, Expr::variable(id.var(var::STORAGE_GB)), 0.0);
 
         Ok(ResourceCost {
             logical_id: id.clone(),
@@ -85,7 +85,7 @@ impl Service for OpenSearchServerlessService {
             required_variables: vec![
                 VariableInfo::new(id, "indexing_ocu", "Indexing OCU count", "OCU"),
                 VariableInfo::new(id, "search_ocu", "Search/query OCU count", "OCU"),
-                VariableInfo::new(id, "storage_gb", "Managed storage", "GB"),
+                VariableInfo::new(id, var::STORAGE_GB, "Managed storage", "GB"),
             ],
         })
     }

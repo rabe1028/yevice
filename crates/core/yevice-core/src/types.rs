@@ -106,3 +106,58 @@ define_id!(
     /// Architecture name for cost comparison.
     ArchitectureName
 );
+
+/// Canonical variable-name suffixes for `LogicalId::var(...)`.
+///
+/// Services derive cost-expression variable names from a logical id plus a
+/// suffix (e.g. `IngestFunction.var("requests")` → `IngestFunction_requests`).
+/// The suffix is a plain string, so a typo (e.g. a misspelled `"requests"`) or a service-to-service
+/// drift (`"requests"` vs `"monthly_requests"`) silently produces a distinct
+/// variable that no test, no schema, and no quota would link back.
+///
+/// Defining the most common suffixes as `&'static str` constants makes typos
+/// a compile error and surfaces the canonical name in IDE auto-completion.
+///
+/// **Naming policy** — when more than one phrasing exists in the codebase,
+/// the canonical name is the shortest unambiguous form (`requests` over
+/// `monthly_requests`; `storage_gb` over `storage_size_gb`). Service-specific
+/// distinctions (`disk_size_gb` for an EBS root volume vs `storage_gb` for a
+/// database) are preserved — only synonyms are unified.
+///
+/// Adding a constant here is purely additive; existing string literals keep
+/// working until they are migrated row-by-row.
+pub mod var {
+    /// Request count over the billing period (most-common ~5 services).
+    pub const REQUESTS: &str = "requests";
+
+    /// Lambda invocation count (kept distinct from `requests`: invocations
+    /// include async / event-source triggers that are not HTTP requests).
+    pub const INVOCATIONS: &str = "invocations";
+
+    /// Storage volume in GB-month (most-common ~10 services: RDS, EFS,
+    /// CloudWatch Logs, OpenSearch, ElastiCache, etc.).
+    pub const STORAGE_GB: &str = "storage_gb";
+
+    /// Average per-request duration in milliseconds (used by Lambda; kept
+    /// distinct from `avg_duration_sec` because the unit changes the
+    /// downstream multiplier and mixing them silently doubles the cost).
+    pub const AVG_DURATION_MS: &str = "avg_duration_ms";
+
+    /// Average per-request duration in seconds.
+    pub const AVG_DURATION_SEC: &str = "avg_duration_sec";
+
+    /// Allocated memory in GB (Lambda function size, Fargate task memory).
+    pub const MEMORY_GB: &str = "memory_gb";
+
+    /// vCPU count (Fargate, Batch).
+    pub const VCPU: &str = "vcpu";
+
+    /// Instance / node count for capacity-priced services.
+    pub const INSTANCE_COUNT: &str = "instance_count";
+
+    /// Ingested data volume in GB (CloudWatch Logs, Firehose, GuardDuty).
+    pub const INGESTION_GB: &str = "ingestion_gb";
+
+    /// Backup storage volume in GB-month (RDS, FSx, AWS Backup).
+    pub const BACKUP_GB: &str = "backup_gb";
+}

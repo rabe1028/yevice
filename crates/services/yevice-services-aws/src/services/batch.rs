@@ -3,7 +3,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -69,7 +69,7 @@ impl Service for BatchService {
         let hours_per_month = 730.0;
 
         let var_executions = id.var("executions");
-        let var_duration_sec = id.var("avg_duration_sec");
+        let var_duration_sec = id.var(var::AVG_DURATION_SEC);
 
         let hours_per_exec = Expr::div(
             Expr::variable(var_duration_sec.clone()),
@@ -154,7 +154,7 @@ impl Service for BatchService {
                     "Number of job executions per month",
                     "executions",
                 ),
-                VariableInfo::new(id, "avg_duration_sec", "Average job duration", "seconds"),
+                VariableInfo::new(id, var::AVG_DURATION_SEC, "Average job duration", "seconds"),
             ],
         })
     }

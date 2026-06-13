@@ -3,7 +3,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -119,10 +119,10 @@ impl Service for FsxWindowsService {
         };
 
         // Backup storage is usage-driven (not a file-system property).
-        let backup = Expr::linear(backup_price, Expr::variable(id.var("backup_gb")), 0.0);
+        let backup = Expr::linear(backup_price, Expr::variable(id.var(var::BACKUP_GB)), 0.0);
         required.push(VariableInfo::new(
             id,
-            "backup_gb",
+            var::BACKUP_GB,
             "Backup storage per month",
             "GB",
         ));
