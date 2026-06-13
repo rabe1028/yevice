@@ -47,10 +47,8 @@ impl Service for DataTransferService {
         // the tier table (complements common::egress_cost_expr).
         let egress_record = pricing.lookup(&Sku::new("aws.data_transfer.egress_tiers"))?;
         let egress_tiers = egress_record.as_tiered().map_err(CostError::Pricing)?;
-        let internet_egress = Expr::tiered(
-            egress_tiers,
-            Expr::variable(id.var("internet_egress_gb")),
-        );
+        let internet_egress =
+            Expr::tiered(egress_tiers, Expr::variable(id.var("internet_egress_gb")));
 
         // Inter-region transfer out: flat per-GB rate (Tokyo -> another region).
         let inter_region_price =
