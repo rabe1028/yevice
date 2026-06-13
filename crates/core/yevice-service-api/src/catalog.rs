@@ -152,6 +152,7 @@ impl ServiceCatalog {
             bindings,
             region: arch.region.clone(),
             topology: arch.topology(),
+            diagnostics: Vec::new(),
         })
     }
 

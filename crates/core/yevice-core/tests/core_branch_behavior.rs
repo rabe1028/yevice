@@ -198,6 +198,7 @@ fn architecture(resources: Vec<ResourceCost>, bindings: Vec<VariableBinding>) ->
         bindings,
         region: Region::new("test"),
         topology: yevice_core::Topology::default(),
+        diagnostics: Vec::new(),
     }
 }
 
