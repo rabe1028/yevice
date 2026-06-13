@@ -601,9 +601,14 @@ pub(crate) fn render_simulate_table(
 }
 
 /// Build the resource breakdown table for `simulate --breakdown`.
+///
+/// When `display_currency` is `Some((rates, target, at))`, each
+/// `base_resource_costs` entry is converted to `target`; rows that cannot be
+/// converted show `"n/a"`.
 pub(crate) fn render_simulate_breakdown_table(
     arch_results: &[ArchSimulation],
     all_labels: &[String],
+    display_currency: Option<(&StaticRates, &str, RateDate)>,
 ) -> Table {
     let mut bd_table = Table::new();
     bd_table.load_preset(UTF8_FULL);
@@ -621,7 +626,19 @@ pub(crate) fn render_simulate_breakdown_table(
                 .base_resource_costs
                 .iter()
                 .find(|(l, _)| l == label)
-                .map_or_else(|| "-".to_string(), |(_, c)| fmt_money(c));
+                .map_or_else(
+                    || "-".to_string(),
+                    |(_, c)| {
+                        if let Some((rates, target, at)) = display_currency {
+                            match try_convert_money(c, target, rates, at) {
+                                Some(m) => fmt_money(&m),
+                                None => "n/a".to_string(),
+                            }
+                        } else {
+                            fmt_money(c)
+                        }
+                    },
+                );
             row.push(Cell::new(cost));
         }
         bd_table.add_row(row);
@@ -656,7 +673,9 @@ mod tests {
     use yevice_core::fx::{RateDate, StaticRates};
     use yevice_core::simulate::ArchSimulation;
 
-    use super::render_simulate_table;
+    use yevice_core::Money;
+
+    use super::{render_simulate_breakdown_table, render_simulate_table};
 
     /// Build a minimal [`ArchSimulation`] with a single currency.
     fn make_jpy_sim(name: &str, jpy_per_hour: f64) -> ArchSimulation {
@@ -792,6 +811,123 @@ mod tests {
         assert!(
             rendered.contains("mixed"),
             "without --display-currency, mixed rows should show 'mixed', got:\n{rendered}"
+        );
+    }
+
+    /// Build an [`ArchSimulation`] with `base_resource_costs` in USD.
+    fn make_sim_with_usd_resources(name: &str) -> ArchSimulation {
+        let mut totals_by_currency = BTreeMap::new();
+        totals_by_currency.insert("USD".to_string(), 10.0 * 24.0);
+
+        let mut hourly_costs = Vec::new();
+        for hour in 0..24_u32 {
+            let mut by_ccy = BTreeMap::new();
+            by_ccy.insert("USD".to_string(), 10.0);
+            hourly_costs.push((hour, by_ccy));
+        }
+
+        ArchSimulation {
+            name: name.to_string(),
+            totals_by_currency,
+            display_total: None,
+            hourly_costs,
+            base_resource_costs: vec![
+                ("resource-a".to_string(), Money::monthly(100.0, "USD")),
+                ("resource-b".to_string(), Money::monthly(50.0, "USD")),
+            ],
+        }
+    }
+
+    /// Build an [`ArchSimulation`] with `base_resource_costs` in JPY.
+    fn make_sim_with_jpy_resources(name: &str) -> ArchSimulation {
+        let mut totals_by_currency = BTreeMap::new();
+        totals_by_currency.insert("JPY".to_string(), 1000.0 * 24.0);
+
+        let mut hourly_costs = Vec::new();
+        for hour in 0..24_u32 {
+            let mut by_ccy = BTreeMap::new();
+            by_ccy.insert("JPY".to_string(), 1000.0);
+            hourly_costs.push((hour, by_ccy));
+        }
+
+        ArchSimulation {
+            name: name.to_string(),
+            totals_by_currency,
+            display_total: None,
+            hourly_costs,
+            base_resource_costs: vec![("resource-a".to_string(), Money::monthly(15000.0, "JPY"))],
+        }
+    }
+
+    /// Breakdown rows for a JPY model with `--display-currency JPY` must show
+    /// JPY values (identity conversion), not native USD.
+    #[test]
+    fn simulate_breakdown_jpy_only_rows_show_jpy() {
+        let sim = make_sim_with_jpy_resources("arch-jpy");
+        let all_labels = vec!["resource-a".to_string()];
+        // No conversion needed: JPY → JPY is identity, but we pass no rates.
+        let table = render_simulate_breakdown_table(&[sim], &all_labels, None);
+        let rendered = table.to_string();
+
+        assert!(
+            rendered.contains("15000.00 JPY"),
+            "breakdown row should show native JPY value, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains('$'),
+            "breakdown row must not show USD symbol when currency is JPY, got:\n{rendered}"
+        );
+    }
+
+    /// Breakdown rows for a USD model with `--display-currency JPY` must show
+    /// JPY-converted values, not the original `$` amounts.
+    #[test]
+    fn simulate_breakdown_usd_resources_converted_to_jpy() {
+        let sim = make_sim_with_usd_resources("arch-usd");
+        let all_labels = vec!["resource-a".to_string(), "resource-b".to_string()];
+
+        let mut rates = StaticRates::new();
+        // 1 USD = 150 JPY
+        rates.insert("USD", "JPY", 150.0);
+        let at = test_date();
+        let conversion = Some((&rates, "JPY", at));
+
+        let table = render_simulate_breakdown_table(&[sim], &all_labels, conversion);
+        let rendered = table.to_string();
+
+        // resource-a: $100 * 150 = 15000 JPY
+        assert!(
+            rendered.contains("15000.00 JPY"),
+            "resource-a should be 15000.00 JPY, got:\n{rendered}"
+        );
+        // resource-b: $50 * 150 = 7500 JPY
+        assert!(
+            rendered.contains("7500.00 JPY"),
+            "resource-b should be 7500.00 JPY, got:\n{rendered}"
+        );
+        // Must NOT contain raw USD amounts like "$100.00"
+        assert!(
+            !rendered.contains("$100.00"),
+            "breakdown must not show native USD after --display-currency JPY, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("$50.00"),
+            "breakdown must not show native USD after --display-currency JPY, got:\n{rendered}"
+        );
+    }
+
+    /// When `--display-currency` is not set, breakdown rows show native currency.
+    #[test]
+    fn simulate_breakdown_no_display_currency_shows_native() {
+        let sim = make_sim_with_usd_resources("arch-usd");
+        let all_labels = vec!["resource-a".to_string()];
+
+        let table = render_simulate_breakdown_table(&[sim], &all_labels, None);
+        let rendered = table.to_string();
+
+        assert!(
+            rendered.contains("$100.00"),
+            "without --display-currency, breakdown should show native USD, got:\n{rendered}"
         );
     }
 }

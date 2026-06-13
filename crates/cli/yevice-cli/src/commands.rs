@@ -919,8 +919,11 @@ pub fn simulate(
 
         if !all_labels.is_empty() {
             println!("\nResource Breakdown (base params estimate):");
-            let bd_table =
-                crate::render::render_simulate_breakdown_table(&arch_results, &all_labels);
+            let bd_table = crate::render::render_simulate_breakdown_table(
+                &arch_results,
+                &all_labels,
+                conversion,
+            );
             println!("{bd_table}");
         }
     }
