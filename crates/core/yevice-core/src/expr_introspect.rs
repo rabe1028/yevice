@@ -625,7 +625,29 @@ pub enum CeilContextResult {
 /// affine context.
 #[must_use]
 pub fn classify_ceil_context(problem: &OptimizationProblem) -> CeilContextResult {
-    let objective = substitute_bindings(&problem.objective, &problem.bindings);
+    // Decision-variable names override fixed_params on collision (matches the
+    // encoder's and `pre_check`'s behaviour).
+    let decision_names: BTreeSet<VariableName> = problem
+        .decision_variables
+        .iter()
+        .map(|dv| dv.name.clone())
+        .collect();
+    let fixed_param_map: BTreeMap<VariableName, f64> = problem
+        .fixed_params
+        .iter()
+        .filter(|(k, _)| !decision_names.contains(*k))
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+    // Normalise: expand bindings first, then inline fixed params as constants.
+    // This mirrors what `pre_check::normalise` does so that shapes like
+    // `price * ceil(x)` (where `price` is a fixed param) are correctly
+    // classified as `Positive` coefficient rather than `Unknown`.
+    let normalise = |e: &Expr| -> Expr {
+        let after_bindings = substitute_bindings(e, &problem.bindings);
+        substitute_fixed_params(&after_bindings, &fixed_param_map)
+    };
+
+    let objective = normalise(&problem.objective);
     let direction = problem.direction;
 
     // Objective check.
@@ -656,7 +678,7 @@ pub fn classify_ceil_context(problem: &OptimizationProblem) -> CeilContextResult
 
     // Constraint checks.
     for c in &problem.constraints {
-        let lhs = substitute_bindings(&c.lhs, &problem.bindings);
+        let lhs = normalise(&c.lhs);
         let ceils = find_ceils_with_coeff_sign(&lhs);
         for (expr_snippet, sign) in ceils {
             let allowed = match (c.relation, sign) {
@@ -1108,5 +1130,74 @@ mod tests {
         let non_linear = Expr::ceil(Expr::variable("x"));
         assert!(!non_linear.is_linear());
         assert_eq!(non_linear.is_linear(), non_linear.as_linear().is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_ceil_context — fixed_params folding (#37)
+    // -------------------------------------------------------------------------
+
+    /// `price * ceil(x)` where `price` is a fixed param and `x` is a decision
+    /// variable must be classified as `Ok` (positive coefficient, Minimize).
+    /// Before the fix, `price` was not inlined and the product counted as
+    /// having an unknown coefficient.
+    #[test]
+    fn classify_ceil_context_folds_fixed_params_before_classifying() {
+        use crate::optimize::{DecisionVariable, OptimizationProblem};
+        use std::collections::HashMap;
+
+        // objective = price * ceil(x),  direction = Minimize
+        // price is a fixed param (2.0),  x is a decision variable
+        let objective = Expr::product(vec![
+            Expr::variable("price"),
+            Expr::ceil(Expr::variable("x")),
+        ]);
+        let problem = OptimizationProblem {
+            objective,
+            direction: crate::optimize::ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::from([(var("price"), 2.0)]),
+            bindings: vec![],
+        };
+
+        assert!(
+            matches!(classify_ceil_context(&problem), CeilContextResult::Ok),
+            "price * ceil(x) with fixed_params[price]=2.0 must be Ok for Minimize"
+        );
+    }
+
+    /// Negative fixed param coefficient must still be rejected.
+    #[test]
+    fn classify_ceil_context_negative_fixed_param_rejects() {
+        use crate::optimize::{DecisionVariable, OptimizationProblem};
+        use std::collections::HashMap;
+
+        // objective = (-1.0) * ceil(x) via fixed param neg_price = -1.0
+        let objective = Expr::product(vec![
+            Expr::variable("neg_price"),
+            Expr::ceil(Expr::variable("x")),
+        ]);
+        let problem = OptimizationProblem {
+            objective,
+            direction: crate::optimize::ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::from([(var("neg_price"), -1.0)]),
+            bindings: vec![],
+        };
+
+        assert!(
+            matches!(
+                classify_ceil_context(&problem),
+                CeilContextResult::Reject { .. }
+            ),
+            "neg_price * ceil(x) with fixed_params[neg_price]=-1.0 must be Reject for Minimize"
+        );
     }
 }
