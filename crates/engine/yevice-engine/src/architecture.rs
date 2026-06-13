@@ -27,7 +27,11 @@ pub struct CfnInputs {
 /// Parse and resolve a CloudFormation template from a file path.
 ///
 /// Path-based convenience over [`resolve_cfn_template_str`]. Defaults to
-/// [`ParsePolicy::Strict`] for backward compatibility.
+/// [`ParsePolicy::Strict`] to preserve the historical CFN-side "hard
+/// failure on missing parameter / unresolved import value / unknown
+/// mapping key" semantics for callers that have not migrated to the
+/// policy-aware API yet. New callers should prefer
+/// [`resolve_cfn_template_with_policy`].
 pub fn resolve_cfn_template(
     template_path: &Path,
     inputs: &CfnInputs,
@@ -106,8 +110,15 @@ fn resolve_parsed_template(
 /// `None`. For Wrangler inputs the name embedded in the config wins unless an
 /// explicit non-default name is supplied.
 ///
-/// Defaults to [`ParsePolicy::Strict`] for backward compatibility. New
-/// callers should prefer [`build_architecture_from_input_with_policy`].
+/// The policy default is **per-format** and matches pre-#38 behaviour:
+///
+/// * CFN: [`ParsePolicy::Strict`] (historical hard-fail on
+///   `MissingParameters` / `ImportValueNotFound` / `MappingNotFound`).
+/// * TF: [`ParsePolicy::Lenient`] (unresolved `var.*` / `local.*` stay
+///   `VarRef` / `LocalRef`; adapters fall back to defaults).
+/// * Wrangler: no policy-controllable variants; policy is moot.
+///
+/// New callers should prefer [`build_architecture_from_input_with_policy`].
 pub fn build_architecture_from_input(
     format: InputFormat,
     template_path: &Path,
@@ -116,6 +127,10 @@ pub fn build_architecture_from_input(
     region: &str,
     registries: &Registries,
 ) -> Result<Architecture, EngineError> {
+    let policy = match format {
+        InputFormat::Cfn => ParsePolicy::Strict,
+        InputFormat::Tf | InputFormat::Wrangler => ParsePolicy::Lenient,
+    };
     let outcome = build_architecture_from_input_with_policy(
         format,
         template_path,
@@ -123,7 +138,7 @@ pub fn build_architecture_from_input(
         architecture_name,
         region,
         registries,
-        ParsePolicy::Strict,
+        policy,
     )?;
     Ok(outcome.value)
 }
@@ -212,9 +227,11 @@ pub fn build_architecture_from_input_with_policy(
 ///
 /// (HCL `.tfvars` only; the JSON variants are not parsed here.)
 pub fn resolve_tf_input(path: &Path) -> Result<yevice_tf::ResolvedConfig, EngineError> {
-    // Strict mirrors the historical CFN-shaped semantics; callers that want
-    // diagnostics should use `resolve_tf_input_with_policy`.
-    let outcome = resolve_tf_input_with_policy(path, ParsePolicy::Strict)?;
+    // Lenient (default policy) preserves the pre-#38 Terraform UX: variables
+    // without default + no tfvars value stay as `VarRef` and adapter
+    // defaults fill in. Callers that want structured diagnostics or strict
+    // failure should use `resolve_tf_input_with_policy`.
+    let outcome = resolve_tf_input_with_policy(path, ParsePolicy::Lenient)?;
     Ok(outcome.value)
 }
 
