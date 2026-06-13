@@ -283,22 +283,44 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
     // only when both totals are commensurate — i.e. both have a converted
     // `display_total` in the same currency, or both are single-currency in
     // the same native currency). Mixed currencies without `--display-currency`
-    // get an "n/a (mixed)" row instead of a misleading scalar diff.
+    // get an "n/a (currency mismatch)" row instead of a misleading scalar diff.
+    //
+    // A zero-resource model (empty `totals_by_currency`) is treated as "zero
+    // in the other model's currency" so that comparisons like `{USD: 12.0}` vs
+    // `{}` still produce a meaningful diff instead of "n/a (currency mismatch)".
     if results.len() == 2 {
         let comparable: Option<(f64, String)> =
             match (&results[0].display_total, &results[1].display_total) {
                 (Some(a), Some(b)) if a.currency == b.currency => {
                     Some((b.value - a.value, b.currency.clone()))
                 }
-                _ if results[0].totals_by_currency.len() == 1
-                    && results[1].totals_by_currency.len() == 1
-                    && results[0].totals_by_currency.keys().next()
-                        == results[1].totals_by_currency.keys().next() =>
-                {
-                    let ccy = header_currency(&results[1]).to_string();
-                    Some((results[1].naive_total() - results[0].naive_total(), ccy))
+                _ => {
+                    let a_empty = results[0].totals_by_currency.is_empty();
+                    let b_empty = results[1].totals_by_currency.is_empty();
+                    let a_single = results[0].totals_by_currency.len() == 1;
+                    let b_single = results[1].totals_by_currency.len() == 1;
+                    if a_empty && b_empty {
+                        // Both zero-resource: diff is 0 in a fallback currency.
+                        Some((0.0, "USD".to_string()))
+                    } else if a_empty && b_single {
+                        // a is zero; adopt b's currency.
+                        let ccy = header_currency(&results[1]).to_string();
+                        Some((results[1].naive_total(), ccy))
+                    } else if b_empty && a_single {
+                        // b is zero; adopt a's currency.
+                        let ccy = header_currency(&results[0]).to_string();
+                        Some((-results[0].naive_total(), ccy))
+                    } else if a_single
+                        && b_single
+                        && results[0].totals_by_currency.keys().next()
+                            == results[1].totals_by_currency.keys().next()
+                    {
+                        let ccy = header_currency(&results[1]).to_string();
+                        Some((results[1].naive_total() - results[0].naive_total(), ccy))
+                    } else {
+                        None
+                    }
                 }
-                _ => None,
             };
         if let Some((diff, ccy)) = comparable {
             let diff_str = if diff >= 0.0 {
@@ -675,7 +697,9 @@ mod tests {
 
     use yevice_core::Money;
 
-    use super::{render_simulate_breakdown_table, render_simulate_table};
+    use yevice_core::evaluate::ArchitectureResult;
+
+    use super::{render_compare_table, render_simulate_breakdown_table, render_simulate_table};
 
     /// Build a minimal [`ArchSimulation`] with a single currency.
     fn make_jpy_sim(name: &str, jpy_per_hour: f64) -> ArchSimulation {
@@ -928,6 +952,83 @@ mod tests {
         assert!(
             rendered.contains("$100.00"),
             "without --display-currency, breakdown should show native USD, got:\n{rendered}"
+        );
+    }
+
+    /// Build a minimal [`ArchitectureResult`] with a single USD total.
+    fn make_arch_result_usd(name: &str, usd_total: f64) -> ArchitectureResult {
+        let mut totals_by_currency = BTreeMap::new();
+        totals_by_currency.insert("USD".to_string(), usd_total);
+        ArchitectureResult {
+            name: name.to_string().into(),
+            resources: vec![],
+            totals_by_currency,
+            display_total: None,
+        }
+    }
+
+    /// Build an [`ArchitectureResult`] with no costs (zero-resource model).
+    fn make_arch_result_empty(name: &str) -> ArchitectureResult {
+        ArchitectureResult {
+            name: name.to_string().into(),
+            resources: vec![],
+            totals_by_currency: BTreeMap::new(),
+            display_total: None,
+        }
+    }
+
+    /// empty vs `{USD: 12.0}` → diff should show +12.0 USD (b is more expensive)
+    #[test]
+    fn compare_empty_vs_usd_shows_positive_diff() {
+        let a = make_arch_result_empty("arch-a");
+        let b = make_arch_result_usd("arch-b", 12.0);
+        let table = render_compare_table(&[a, b], false);
+        let rendered = table.to_string();
+
+        assert!(
+            rendered.contains("+$12.00"),
+            "empty vs {{USD: 12.0}} should show +$12.00, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("currency mismatch"),
+            "empty vs single-currency must not show 'currency mismatch', got:\n{rendered}"
+        );
+    }
+
+    /// `{USD: 12.0}` vs empty → diff should show -12.0 USD (a is more expensive)
+    #[test]
+    fn compare_usd_vs_empty_shows_negative_diff() {
+        let a = make_arch_result_usd("arch-a", 12.0);
+        let b = make_arch_result_empty("arch-b");
+        let table = render_compare_table(&[a, b], false);
+        let rendered = table.to_string();
+
+        assert!(
+            rendered.contains("-$12.00"),
+            "{{USD: 12.0}} vs empty should show -$12.00, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("currency mismatch"),
+            "single-currency vs empty must not show 'currency mismatch', got:\n{rendered}"
+        );
+    }
+
+    /// empty vs empty → diff should show 0 (not "currency mismatch")
+    #[test]
+    fn compare_empty_vs_empty_shows_zero_diff() {
+        let a = make_arch_result_empty("arch-a");
+        let b = make_arch_result_empty("arch-b");
+        let table = render_compare_table(&[a, b], false);
+        let rendered = table.to_string();
+
+        // Diff should be +$0.00 or -$0.00 or +0.00 USD — not "currency mismatch".
+        assert!(
+            !rendered.contains("currency mismatch"),
+            "empty vs empty must not show 'currency mismatch', got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("0.00"),
+            "empty vs empty should show a zero diff, got:\n{rendered}"
         );
     }
 }
