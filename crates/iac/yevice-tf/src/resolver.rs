@@ -67,41 +67,24 @@ pub fn resolve_config_with_policy(
 
     let mut diagnostics: Vec<IacParseDiagnostic> = Vec::new();
 
-    // Variables that have no default and no tfvars override — references to
-    // these stay as `TfValue::VarRef` after resolution and adapters fall back
-    // to defaults. Under Strict this is a hard error; under Lenient we keep
-    // the legacy warn + emit a structured diagnostic.
-    let mut unresolved_vars: Vec<String> = config
+    // Variables declared with no default and no tfvars override. We do **not**
+    // flag these eagerly: a module may legitimately declare an unused
+    // required variable (e.g. consumed by another module). The set is
+    // retained so the post-resolution scan below can attach the legacy
+    // "no default, no tfvars value" rendering when these names actually
+    // appear in a surviving `VarRef`.
+    let declared_defaultless_vars: BTreeSet<String> = config
         .variables
         .iter()
         .filter(|(name, variable)| variable.default.is_none() && !vars.contains_key(name.as_str()))
         .map(|(name, _)| name.clone())
         .collect();
-    unresolved_vars.sort();
-    for name in &unresolved_vars {
+    for name in &declared_defaultless_vars {
         tracing::warn!(
             variable = %name,
             "variable has no default and no tfvars value; \
              references to var.{name} will not resolve"
         );
-        match policy {
-            ParsePolicy::Strict => {
-                return Err(TfError::UnresolvedSymbol {
-                    kind: UnresolvedSymbolKind::Variable,
-                    name: name.clone(),
-                    location: None,
-                });
-            }
-            ParsePolicy::Lenient => {
-                diagnostics.push(IacParseDiagnostic::error(
-                    DiagnosticSource::Tf,
-                    "unresolved_var_ref",
-                    format!(
-                        "variable has no default and no tfvars value: var.{name} will not resolve"
-                    ),
-                ));
-            }
-        }
     }
 
     let vars: HashMap<String, TfValue> = vars
@@ -144,34 +127,15 @@ pub fn resolve_config_with_policy(
     }
 
     // Locals that never reached a concrete value — either due to a cycle or
-    // a reference to an unresolved var/local. Report each distinct local
-    // exactly once, sorted for determinism.
-    let unresolved_local_names: Vec<String> = {
-        let mut names: Vec<String> = remaining.into_keys().collect();
-        names.sort();
-        names
-    };
-    for name in &unresolved_local_names {
+    // a reference to an unresolved var/local. Likewise retained for use
+    // after the resource-level scan so we only fire diagnostics on locals
+    // that actually feed into a resource.
+    let unresolvable_locals: BTreeSet<String> = remaining.keys().cloned().collect();
+    for name in &unresolvable_locals {
         tracing::warn!(
             local = %name,
             "local could not be resolved; references to local.{name} will not resolve"
         );
-        match policy {
-            ParsePolicy::Strict => {
-                return Err(TfError::UnresolvedSymbol {
-                    kind: UnresolvedSymbolKind::Local,
-                    name: name.clone(),
-                    location: None,
-                });
-            }
-            ParsePolicy::Lenient => {
-                diagnostics.push(IacParseDiagnostic::error(
-                    DiagnosticSource::Tf,
-                    "unresolved_local_ref",
-                    format!("local could not be resolved: local.{name} will not resolve"),
-                ));
-            }
-        }
     }
 
     let mut resources = config.resources;
@@ -179,27 +143,35 @@ pub fn resolve_config_with_policy(
         resolve_resource(resource, &vars, &locals);
     }
 
-    // After resource-level resolve, scan for any *transitively* unresolved
-    // var/local references that survived because they pointed to symbols
-    // never declared in `variables` or `locals`. (Declared-but-unresolvable
-    // ones were already reported above; this catches typos and refs to
-    // symbols defined in other modules.)
-    let mut transitive_vars: BTreeSet<String> = BTreeSet::new();
-    let mut transitive_locals: BTreeSet<String> = BTreeSet::new();
+    // Surviving `VarRef` / `LocalRef` after resource-level resolution.
+    // These are the references that would *actually* feed a cost-model
+    // adapter as `None` and produce silently-wrong numbers — they are the
+    // only references worth surfacing as diagnostics. Declared-but-unused
+    // required variables are deliberately excluded.
+    let mut surviving_vars: BTreeSet<String> = BTreeSet::new();
+    let mut surviving_locals: BTreeSet<String> = BTreeSet::new();
     for resource in &resources {
         collect_unresolved_refs(
             &resource.attrs,
             &resource.blocks,
             &vars,
             &locals,
-            &unresolved_vars,
-            &unresolved_local_names,
-            &mut transitive_vars,
-            &mut transitive_locals,
+            &mut surviving_vars,
+            &mut surviving_locals,
         );
     }
 
-    for name in &transitive_vars {
+    for name in &surviving_vars {
+        // Render two flavors of message: the legacy "no default and no
+        // tfvars" wording when the variable is in fact declared without a
+        // default (this is the historical resolver warning); otherwise the
+        // generic "reference to undefined variable" wording for typos /
+        // cross-module refs.
+        let message = if declared_defaultless_vars.contains(name) {
+            format!("variable has no default and no tfvars value: var.{name} will not resolve")
+        } else {
+            format!("reference to undefined variable: var.{name}")
+        };
         match policy {
             ParsePolicy::Strict => {
                 return Err(TfError::UnresolvedSymbol {
@@ -212,12 +184,17 @@ pub fn resolve_config_with_policy(
                 diagnostics.push(IacParseDiagnostic::error(
                     DiagnosticSource::Tf,
                     "unresolved_var_ref",
-                    format!("reference to undefined variable: var.{name}"),
+                    message,
                 ));
             }
         }
     }
-    for name in &transitive_locals {
+    for name in &surviving_locals {
+        let message = if unresolvable_locals.contains(name) {
+            format!("local could not be resolved: local.{name} will not resolve")
+        } else {
+            format!("reference to undefined local: local.{name}")
+        };
         match policy {
             ParsePolicy::Strict => {
                 return Err(TfError::UnresolvedSymbol {
@@ -230,7 +207,7 @@ pub fn resolve_config_with_policy(
                 diagnostics.push(IacParseDiagnostic::error(
                     DiagnosticSource::Tf,
                     "unresolved_local_ref",
-                    format!("reference to undefined local: local.{name}"),
+                    message,
                 ));
             }
         }
@@ -251,34 +228,16 @@ fn collect_unresolved_refs(
     blocks: &HashMap<String, Vec<HashMap<String, TfValue>>>,
     vars: &HashMap<String, TfValue>,
     locals: &HashMap<String, TfValue>,
-    already_var: &[String],
-    already_local: &[String],
     out_vars: &mut BTreeSet<String>,
     out_locals: &mut BTreeSet<String>,
 ) {
     for v in attrs.values() {
-        scan_value(
-            v,
-            vars,
-            locals,
-            already_var,
-            already_local,
-            out_vars,
-            out_locals,
-        );
+        scan_value(v, vars, locals, out_vars, out_locals);
     }
     for block_list in blocks.values() {
         for attrs in block_list {
             for v in attrs.values() {
-                scan_value(
-                    v,
-                    vars,
-                    locals,
-                    already_var,
-                    already_local,
-                    out_vars,
-                    out_locals,
-                );
+                scan_value(v, vars, locals, out_vars, out_locals);
             }
         }
     }
@@ -288,46 +247,28 @@ fn scan_value(
     value: &TfValue,
     vars: &HashMap<String, TfValue>,
     locals: &HashMap<String, TfValue>,
-    already_var: &[String],
-    already_local: &[String],
     out_vars: &mut BTreeSet<String>,
     out_locals: &mut BTreeSet<String>,
 ) {
     match value {
         TfValue::VarRef(name) => {
-            if !vars.contains_key(name) && !already_var.iter().any(|n| n == name) {
+            if !vars.contains_key(name) {
                 out_vars.insert(name.clone());
             }
         }
         TfValue::LocalRef(name) => {
-            if !locals.contains_key(name) && !already_local.iter().any(|n| n == name) {
+            if !locals.contains_key(name) {
                 out_locals.insert(name.clone());
             }
         }
         TfValue::Object(map) => {
             for v in map.values() {
-                scan_value(
-                    v,
-                    vars,
-                    locals,
-                    already_var,
-                    already_local,
-                    out_vars,
-                    out_locals,
-                );
+                scan_value(v, vars, locals, out_vars, out_locals);
             }
         }
         TfValue::Array(items) => {
             for v in items {
-                scan_value(
-                    v,
-                    vars,
-                    locals,
-                    already_var,
-                    already_local,
-                    out_vars,
-                    out_locals,
-                );
+                scan_value(v, vars, locals, out_vars, out_locals);
             }
         }
         _ => {}
@@ -612,6 +553,37 @@ mod parse_policy_tests {
             .expect("ResourceRef must not be flagged as unresolved under Strict");
         assert!(!outcome.had_errors);
         assert!(outcome.diagnostics.is_empty());
+    }
+
+    /// A required (defaultless, no-tfvars) variable that is **declared but
+    /// never referenced** by any resource must NOT trip Strict mode or
+    /// produce a diagnostic. Pin this — the previous implementation
+    /// short-circuited on declaration alone and broke modules with unused
+    /// inputs.
+    #[test]
+    fn declared_but_unused_defaultless_var_does_not_trip_strict() {
+        let mut variables = HashMap::new();
+        variables.insert("unused_input".to_string(), TfVariable { default: None });
+        // Declared variable is never referenced by the resource.
+        let cfg = TfConfig {
+            variables,
+            locals: HashMap::new(),
+            resources: vec![TfResource {
+                resource_type: "aws_s3_bucket".to_string(),
+                name: "logs".to_string(),
+                attrs: HashMap::new(),
+                blocks: HashMap::new(),
+            }],
+        };
+        // Strict must succeed because no resource consumes the unset var.
+        let outcome = resolve_config_with_policy(cfg, None, ParsePolicy::Strict)
+            .expect("unused defaultless var must not abort Strict");
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "no diagnostics expected for unused declared var; got {:?}",
+            outcome.diagnostics
+        );
+        assert!(!outcome.had_errors);
     }
 
     /// A reference to a `var.*` symbol that was never declared (typo or
