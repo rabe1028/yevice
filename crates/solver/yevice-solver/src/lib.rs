@@ -2718,4 +2718,77 @@ mod tests {
             "expected UnboundVariables error, got {result:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Regression: unbound constraint variable — both backends must agree
+    // (codex comment 3408153408 / issue #37)
+    // -----------------------------------------------------------------------
+
+    /// When the objective is fully bound but a constraint LHS references an
+    /// unbound variable, no assignment can ever satisfy the constraint (the
+    /// EnumerationSolver's `is_feasible` returns false for every combination).
+    /// Both backends must return `Ok(Solution { feasible: false, .. })` rather
+    /// than an error.
+    ///
+    /// Setup:
+    ///   decision variable: x ∈ {1, 2, 3}
+    ///   objective:         x          (fully bound — passes validate_bindings)
+    ///   constraint:        ghost >= 0 (ghost is not bound by anything)
+    ///
+    /// EnumerationSolver: is_feasible → evaluate("ghost") fails → false → no
+    ///   combination is feasible → feasible=false.
+    /// HiGHS backend: must detect unbound constraint variable and return
+    ///   feasible=false (not UnboundVariables error).
+    #[test]
+    fn enumeration_returns_infeasible_when_constraint_has_unbound_variable() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("ghost"),
+            relation: Relation::Ge,
+            rhs: 0.0,
+            label: None,
+        };
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        let sol = EnumerationSolver
+            .solve(&problem)
+            .expect("EnumerationSolver must not error");
+        assert!(
+            !sol.feasible,
+            "EnumerationSolver: expected infeasible when constraint variable is unbound, \
+             got feasible=true"
+        );
+    }
+
+    #[cfg(feature = "highs")]
+    #[test]
+    fn highs_returns_infeasible_when_constraint_has_unbound_variable() {
+        use crate::highs_backend::HighsSolver;
+
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("ghost"),
+            relation: Relation::Ge,
+            rhs: 0.0,
+            label: None,
+        };
+        let problem = problem_with(
+            Expr::variable("x"),
+            ObjectiveDirection::Minimize,
+            vec![dv("x", vec![1.0, 2.0, 3.0])],
+            vec![constraint],
+            HashMap::new(),
+        );
+
+        let result = HighsSolver::default().solve(&problem);
+        assert!(
+            matches!(result, Ok(ref sol) if !sol.feasible),
+            "HiGHS: expected Ok(infeasible) when constraint variable is unbound, \
+             got {result:?}"
+        );
+    }
 }

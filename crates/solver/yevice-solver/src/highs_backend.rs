@@ -173,6 +173,42 @@ impl Solver for HighsSolver {
             return Ok(infeasible_solution());
         }
 
+        // Check that every variable referenced by a constraint LHS is bound
+        // (decision variable, fixed parameter, or transitively-bound binding
+        // target). Mirrors `EnumerationSolver`'s behaviour: `is_feasible`
+        // returns `false` when constraint evaluation fails due to an unbound
+        // variable, so no combination is ever feasible — the correct outcome
+        // is an infeasible solution, not an `UnboundVariables` error.
+        {
+            let mut bound: std::collections::HashSet<VariableName> =
+                problem.fixed_params.keys().cloned().collect();
+            for dv in &problem.decision_variables {
+                bound.insert(dv.name.clone());
+            }
+            loop {
+                let mut progressed = false;
+                for b in &problem.bindings {
+                    if bound.contains(&b.target) {
+                        continue;
+                    }
+                    if b.expr.variables().iter().all(|v| bound.contains(v)) {
+                        bound.insert(b.target.clone());
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            let has_unbound_constraint_var = problem
+                .constraints
+                .iter()
+                .any(|c| c.lhs.variables().iter().any(|v| !bound.contains(v)));
+            if has_unbound_constraint_var {
+                return Ok(infeasible_solution());
+            }
+        }
+
         let mut backend = Box::new(HighsBackend::new(self.options.clone()));
         let encoded = encode(backend.as_mut(), problem)?;
         let milp_sol = backend.solve()?;
