@@ -4,7 +4,7 @@
 //! strongly-typed spec as a `serde_json::Value` so that the core crate
 //! stays independent of any specific service implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -153,6 +153,107 @@ pub enum ConnectionType {
     DataFlow,
     /// Notification (S3 → SQS, S3 → Lambda).
     Notification,
+}
+
+// ---- Connection deduplication helper ----
+
+/// Stringified key used to dedupe connections: `(source, target, type)`.
+///
+/// `ConnectionType` is rendered via the same `&'static str` mapping used by
+/// both CFn and Terraform converters, so identical edges from different paths
+/// collide on the same key.
+pub type EdgeKey = (String, String, String);
+
+/// Render a [`ConnectionType`] as a stable string for use in [`EdgeKey`].
+pub fn connection_type_str(conn_type: &ConnectionType) -> &'static str {
+    match conn_type {
+        ConnectionType::EventSource => "EventSource",
+        ConnectionType::Invocation => "Invocation",
+        ConnectionType::DataFlow => "DataFlow",
+        ConnectionType::Notification => "Notification",
+    }
+}
+
+/// Accumulator that deduplicates [`Connection`] edges by
+/// `(source, target, connection_type)` while applying optional endpoint
+/// existence guards.
+///
+/// Used by IaC converters (CFn, Terraform) to avoid double-counting edges
+/// that can be produced from multiple template paths (e.g. both an
+/// `AWS::Lambda::EventSourceMapping` and a SAM `Events` block).
+///
+/// # Example
+///
+/// ```ignore
+/// let mut dedupe = ConnectionDeduper::new();
+/// dedupe.try_push(conn, |id| nodes.contains(id), |_| true);
+/// let (connections, _seen) = dedupe.into_parts();
+/// ```
+#[derive(Debug, Default)]
+pub struct ConnectionDeduper {
+    connections: Vec<Connection>,
+    seen: HashSet<EdgeKey>,
+}
+
+impl ConnectionDeduper {
+    /// Create an empty deduper.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempt to push `conn`.
+    ///
+    /// `source_exists` and `target_exists` are endpoint guards: when either
+    /// returns `false`, the connection is dropped silently. This lets each
+    /// caller decide whether the source endpoint must be a known node (CFn
+    /// ESM allows external ARNs; structured-property edges and Terraform
+    /// require both endpoints to exist).
+    ///
+    /// Returns `true` if the connection was newly inserted, `false` if it was
+    /// a duplicate or failed the endpoint guard.
+    pub fn try_push<S, T>(&mut self, conn: Connection, source_exists: S, target_exists: T) -> bool
+    where
+        S: FnOnce(&str) -> bool,
+        T: FnOnce(&str) -> bool,
+    {
+        if !source_exists(conn.source.as_str()) {
+            return false;
+        }
+        if !target_exists(conn.target.as_str()) {
+            return false;
+        }
+        let key = (
+            conn.source.as_str().to_string(),
+            conn.target.as_str().to_string(),
+            connection_type_str(&conn.connection_type).to_string(),
+        );
+        if self.seen.insert(key) {
+            self.connections.push(conn);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of unique connections accumulated so far.
+    pub fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Whether any connection has been accumulated.
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
+    }
+
+    /// Borrow the accumulated connections without consuming the deduper.
+    pub fn connections(&self) -> &[Connection] {
+        &self.connections
+    }
+
+    /// Consume the deduper and return the accumulated connections.
+    pub fn into_connections(self) -> Vec<Connection> {
+        self.connections
+    }
 }
 
 // ---- Architecture (top-level) ----
@@ -324,5 +425,82 @@ mod tests {
         let decoded_try: MySpec = via_try_new.decode().expect("decode try_new");
         let decoded_new: MySpec = via_new.decode().expect("decode new");
         assert_eq!(decoded_try, decoded_new);
+    }
+
+    fn conn(source: &str, target: &str, ty: ConnectionType) -> Connection {
+        Connection {
+            source: LogicalId::new(source),
+            target: LogicalId::new(target),
+            connection_type: ty,
+            batch_size: None,
+            parallelization_factor: None,
+            factor: None,
+            source_hint: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_collapses_identical_triples() {
+        let mut d = ConnectionDeduper::new();
+        assert!(d.try_push(conn("A", "B", ConnectionType::DataFlow), |_| true, |_| true));
+        // Same (source, target, type) — must collapse.
+        assert!(!d.try_push(conn("A", "B", ConnectionType::DataFlow), |_| true, |_| true));
+        // Different type — kept.
+        assert!(d.try_push(
+            conn("A", "B", ConnectionType::Invocation),
+            |_| true,
+            |_| true
+        ));
+        let edges = d.into_connections();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].connection_type, ConnectionType::DataFlow);
+        assert_eq!(edges[1].connection_type, ConnectionType::Invocation);
+    }
+
+    #[test]
+    fn dedupe_drops_unknown_source_when_guarded() {
+        let known: HashSet<String> = ["B"].iter().copied().map(String::from).collect();
+        let mut d = ConnectionDeduper::new();
+        // Source guard rejects — connection dropped.
+        assert!(!d.try_push(
+            conn("Missing", "B", ConnectionType::EventSource),
+            |id| known.contains(id),
+            |id| known.contains(id),
+        ));
+        // Source guard relaxed (ESM-style) — connection kept even though "Ext"
+        // is not in the node set.
+        assert!(d.try_push(
+            conn("Ext", "B", ConnectionType::EventSource),
+            |_| true,
+            |id| known.contains(id),
+        ));
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn dedupe_drops_unknown_target() {
+        let known: HashSet<String> = ["A"].iter().copied().map(String::from).collect();
+        let mut d = ConnectionDeduper::new();
+        assert!(!d.try_push(
+            conn("A", "Missing", ConnectionType::DataFlow),
+            |id| known.contains(id),
+            |id| known.contains(id),
+        ));
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn connection_type_str_matches_debug_repr() {
+        // Insurance against the historical CFn `format!("{:?}", ty)` key:
+        // the dedupe string must match the Debug representation so converters
+        // that previously used `{:?}` produce identical keys after migration.
+        for ty in [
+            ConnectionType::EventSource,
+            ConnectionType::Invocation,
+            ConnectionType::DataFlow,
+            ConnectionType::Notification,
+        ] {
+            assert_eq!(connection_type_str(&ty), format!("{ty:?}"));
+        }
     }
 }

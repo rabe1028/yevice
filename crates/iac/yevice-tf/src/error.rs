@@ -6,6 +6,11 @@ pub enum TfError {
     ParseError(String),
     #[error("IO error")]
     Io(#[from] std::io::Error),
+    /// File-read failure from the shared `yevice_core::io::read_iac_file`
+    /// helper. Retained alongside `Io` so the existing public surface
+    /// (`Io(std::io::Error)`) is not removed — non-breaking addition.
+    #[error(transparent)]
+    IoRead(#[from] yevice_core::io::IoReadError),
     #[error("missing required attribute {attr} for resource {resource}")]
     MissingAttribute { resource: String, attr: String },
 }

@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value as JsonValue;
 use yevice_core::{
-    resource::{Architecture, Connection, ConnectionType, Resource, ResourceShell},
+    resource::{
+        Architecture, Connection, ConnectionDeduper, ConnectionType, Resource, ResourceShell,
+    },
     types::{LogicalId, Region, ResourceType},
 };
 use yevice_service_api::{RawTfResource, TfAdapterRegistry};
@@ -211,45 +213,29 @@ fn node_set(resources: &[Resource]) -> HashSet<String> {
         .collect()
 }
 
-/// Deduplicated edge key: `(source, target, type)`.
-type EdgeKey = (String, String, String);
-
-fn edge_key(source: &str, target: &str, conn_type: &ConnectionType) -> EdgeKey {
-    let type_str = match conn_type {
-        ConnectionType::EventSource => "EventSource",
-        ConnectionType::Invocation => "Invocation",
-        ConnectionType::DataFlow => "DataFlow",
-        ConnectionType::Notification => "Notification",
-    };
-    (source.to_string(), target.to_string(), type_str.to_string())
-}
-
-/// Push a connection only if:
+/// Push a connection into `dedupe` only if:
 /// 1. Both endpoints exist in `nodes`.
 /// 2. The `(source, target, type)` triple has not been seen yet.
+///
+/// Delegates to [`ConnectionDeduper`] (in `yevice-core`) so CFn and Terraform
+/// share the same dedupe semantics.
 fn push_unique(
-    connections: &mut Vec<Connection>,
-    seen: &mut HashSet<EdgeKey>,
+    dedupe: &mut ConnectionDeduper,
     nodes: &HashSet<String>,
     source: &str,
     target: &str,
     conn_type: ConnectionType,
 ) {
-    if !nodes.contains(source) || !nodes.contains(target) {
-        return;
-    }
-    let key = edge_key(source, target, &conn_type);
-    if seen.insert(key) {
-        connections.push(Connection {
-            source: LogicalId::new(source),
-            target: LogicalId::new(target),
-            connection_type: conn_type,
-            batch_size: None,
-            parallelization_factor: None,
-            factor: None,
-            source_hint: None,
-        });
-    }
+    let conn = Connection {
+        source: LogicalId::new(source),
+        target: LogicalId::new(target),
+        connection_type: conn_type,
+        batch_size: None,
+        parallelization_factor: None,
+        factor: None,
+        source_hint: None,
+    };
+    dedupe.try_push(conn, |id| nodes.contains(id), |id| nodes.contains(id));
 }
 
 /// Returns `true` when a notification block's `events` attribute contains at
@@ -311,8 +297,7 @@ fn collect_resource_refs<'a>(value: &'a TfValue, out: &mut Vec<(&'a str, &'a str
 /// Object/Array values).
 fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec<Connection> {
     let nodes = node_set(resources);
-    let mut connections: Vec<Connection> = Vec::new();
-    let mut seen: HashSet<EdgeKey> = HashSet::new();
+    let mut dedupe = ConnectionDeduper::new();
 
     for src_resource in tf_resources {
         let src_type = src_resource.resource_type.as_str();
@@ -342,8 +327,7 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
                 let esrc_lid = logical_id_for(esrc_type, esrc_name);
                 let fn_lid = logical_id_for(fn_type, fn_name);
                 push_unique(
-                    &mut connections,
-                    &mut seen,
+                    &mut dedupe,
                     &nodes,
                     &esrc_lid,
                     &fn_lid,
@@ -394,8 +378,7 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
                 let topic_lid = logical_id_for(topic_type, topic_name);
                 let ep_lid = logical_id_for(ep_type, ep_name);
                 push_unique(
-                    &mut connections,
-                    &mut seen,
+                    &mut dedupe,
                     &nodes,
                     &topic_lid,
                     &ep_lid,
@@ -453,8 +436,7 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
             for (tgt_type, tgt_name, _attr) in target_refs {
                 let tgt_lid = logical_id_for(tgt_type, tgt_name);
                 push_unique(
-                    &mut connections,
-                    &mut seen,
+                    &mut dedupe,
                     &nodes,
                     &bucket_lid,
                     &tgt_lid,
@@ -492,19 +474,12 @@ fn build_connections(tf_resources: &[TfResource], resources: &[Resource]) -> Vec
         for (tgt_type, tgt_name, _attr) in refs {
             let tgt_lid = logical_id_for(tgt_type, tgt_name);
             if let Some(conn_type) = classify_connection(src_type, tgt_type) {
-                push_unique(
-                    &mut connections,
-                    &mut seen,
-                    &nodes,
-                    &src_lid,
-                    &tgt_lid,
-                    conn_type,
-                );
+                push_unique(&mut dedupe, &nodes, &src_lid, &tgt_lid, conn_type);
             }
         }
     }
 
-    connections
+    dedupe.into_connections()
 }
 
 /// Determine `ConnectionType` for a generic (non-ESM, non-notification) edge.

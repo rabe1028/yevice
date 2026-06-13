@@ -39,6 +39,12 @@ pub enum CfnError {
     #[error("IO error")]
     Io(#[from] std::io::Error),
 
+    /// File-read failure from the shared `yevice_core::io::read_iac_file`
+    /// helper. Retained alongside `Io` so the existing public surface
+    /// (`Io(std::io::Error)`) is not removed — non-breaking addition.
+    #[error(transparent)]
+    IoRead(#[from] yevice_core::io::IoReadError),
+
     #[error("YAML parse error")]
     Yaml(#[from] serde_yaml_ng::Error),
 }

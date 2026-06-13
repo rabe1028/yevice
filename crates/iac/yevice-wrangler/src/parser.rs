@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
-use yevice_core::io::read_to_string_capped;
+use yevice_core::io::read_iac_file;
 use yevice_core::{
     resource::{Architecture, Connection, ConnectionType, Provider, Resource, ResourceShell},
     types::{LogicalId, Region, ResourceType},
@@ -94,7 +94,7 @@ struct RawDoBinding {
 
 /// Parse a Wrangler config file into an Architecture.
 pub fn parse_wrangler(path: &Path) -> Result<Architecture, WranglerError> {
-    let content = read_to_string_capped(path)?;
+    let content = read_iac_file(path)?;
     let default_name = path
         .parent()
         .and_then(|p| p.file_name())
