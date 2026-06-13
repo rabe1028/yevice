@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
-use yevice_solver::{EnumerationSolver, Solver, SolverError};
+use yevice_solver::{Solver, SolverError, solver_from_name};
 
 use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
@@ -388,6 +388,7 @@ pub fn optimize(
     params_path: Option<&str>,
     decisions: &[String],
     direction: &str,
+    solver_name: &str,
 ) -> Result<()> {
     let arch = load_cost_model(cost_model_path)?;
     let objective = arch.total_expr();
@@ -433,10 +434,23 @@ pub fn optimize(
         bindings: arch.all_bindings().to_vec(),
     };
 
+    // Select the solver backend (default: enumeration). Unknown names map to
+    // a typed error so the CLI can show the allowed list.
+    let solver: Box<dyn Solver> = match solver_from_name(solver_name) {
+        Ok(s) => s,
+        Err(SolverError::UnknownSolver { requested, allowed }) => {
+            bail!(
+                "unknown --solver value '{requested}'. Allowed values: {}",
+                allowed.join(", ")
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     // The solver validates up-front that every variable in the objective is
     // bound — either fixed via --params, chosen as a --decision, or derivable
     // via a binding whose own inputs are themselves bound (transitively).
-    let sol = match EnumerationSolver.solve(&problem) {
+    let sol = match solver.solve(&problem) {
         Ok(s) => s,
         Err(SolverError::UnboundVariables { variables }) => {
             bail!(
@@ -850,6 +864,7 @@ mod tests {
             None,
             &["MyVar=".to_string()],
             "min",
+            "enumeration",
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -882,6 +897,7 @@ mod tests {
             None,
             &["MyVar=  ".to_string()],
             "min",
+            "enumeration",
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -916,8 +932,73 @@ mod tests {
         .unwrap();
 
         // No decisions needed for an empty objective.
-        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min");
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "min",
+            "enumeration",
+        );
         assert!(result.is_ok(), "min direction must be accepted: {result:?}");
+    }
+
+    // --- --solver smoke tests ---
+
+    /// `--solver enumeration` is the default and must keep working.
+    #[test]
+    fn solver_enumeration_smoke() {
+        use std::fs;
+        let dir = temp_dir("solver-enum");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("solver-enum")).unwrap(),
+        )
+        .unwrap();
+
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "min",
+            "enumeration",
+        );
+        assert!(
+            result.is_ok(),
+            "--solver enumeration must remain accepted: {result:?}"
+        );
+    }
+
+    /// Unknown `--solver` values must fail with an actionable message that
+    /// lists the supported solvers.
+    #[test]
+    fn solver_unknown_name_returns_error() {
+        use std::fs;
+        let dir = temp_dir("solver-unknown");
+        let cost_model_path = dir.join("cost.json");
+        fs::write(
+            &cost_model_path,
+            serde_json::to_string(&empty_cost_model_json("solver-unknown")).unwrap(),
+        )
+        .unwrap();
+
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "min",
+            "no-such-solver",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no-such-solver"),
+            "error must name the bad solver: {msg}"
+        );
+        assert!(
+            msg.contains("enumeration"),
+            "error must mention the allowed solver(s): {msg}"
+        );
     }
 
     #[test]
@@ -931,7 +1012,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "max");
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "max",
+            "enumeration",
+        );
         assert!(result.is_ok(), "max direction must be accepted: {result:?}");
     }
 
@@ -946,8 +1033,14 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            super::optimize(cost_model_path.to_str().unwrap(), None, &[], "sideways").unwrap_err();
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "sideways",
+            "enumeration",
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("sideways"),
@@ -1011,7 +1104,14 @@ mod tests {
         // No params, no decisions → Widget_source_input is missing.
         // Must get an unbound error mentioning Widget_source_input (the missing source),
         // not an INFEASIBLE result from the solver.
-        let err = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min").unwrap_err();
+        let err = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "min",
+            "enumeration",
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("unbound") || msg.contains("Widget_source_input"),
@@ -1069,6 +1169,7 @@ mod tests {
             None,
             &["Widget_source_input=100,200".to_string()],
             "min",
+            "enumeration",
         );
         assert!(
             result.is_ok(),
@@ -1201,7 +1302,13 @@ mod tests {
         // combination_count = 1 and the objective = 0 is always feasible).
         // Instead, verify the function doesn't panic and returns Ok for an
         // empty-objective problem (which yields feasible=true, objective=0).
-        let result = super::optimize(cost_model_path.to_str().unwrap(), None, &[], "min");
+        let result = super::optimize(
+            cost_model_path.to_str().unwrap(),
+            None,
+            &[],
+            "min",
+            "enumeration",
+        );
         assert!(result.is_ok(), "optimize must return Ok; got: {result:?}");
     }
 }

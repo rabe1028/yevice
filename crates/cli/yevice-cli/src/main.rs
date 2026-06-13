@@ -237,6 +237,11 @@ enum Commands {
         /// Optimization direction: `min` to minimize cost (default), `max` to maximize.
         #[arg(long = "direction", default_value = "min", value_name = "min|max")]
         direction: String,
+
+        /// Solver backend to use. Currently only `enumeration` is supported;
+        /// future backends (e.g. LP/MIP) will plug in here.
+        #[arg(long = "solver", default_value = "enumeration", value_name = "NAME")]
+        solver: String,
     },
 }
 
@@ -359,6 +364,13 @@ fn main() -> Result<()> {
             params,
             decision,
             direction,
-        } => commands::optimize(&cost_model, params.as_deref(), &decision, &direction),
+            solver,
+        } => commands::optimize(
+            &cost_model,
+            params.as_deref(),
+            &decision,
+            &direction,
+            &solver,
+        ),
     }
 }
