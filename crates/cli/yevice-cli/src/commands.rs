@@ -243,6 +243,9 @@ fn parse_exchange_rates(specs: &[String]) -> Result<StaticRates> {
         let rate: f64 = rate_str
             .parse()
             .with_context(|| format!("--exchange-rate '{spec}' rate must be a number"))?;
+        if !rate.is_finite() || rate <= 0.0 {
+            bail!("--exchange-rate '{spec}' rate must be a finite positive number, got {rate}");
+        }
         rates.insert(from, to, rate);
     }
     Ok(rates)
@@ -1126,6 +1129,56 @@ mod tests {
         assert!(
             err.to_string().contains("PROVIDER=REGION"),
             "error should describe expected format"
+        );
+    }
+
+    // --- parse_exchange_rates validation tests ---
+
+    #[test]
+    fn parse_exchange_rates_accepts_positive_rate() {
+        // A well-formed positive rate must be accepted without error.
+        parse_exchange_rates(&["USD=JPY:150".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn parse_exchange_rates_accepts_fractional_rate() {
+        // A small fractional positive rate must also be accepted.
+        parse_exchange_rates(&["USD=JPY:0.0067".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn parse_exchange_rates_rejects_negative_rate() {
+        let err = parse_exchange_rates(&["USD=JPY:-150".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("finite positive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_exchange_rates_rejects_zero_rate() {
+        let err = parse_exchange_rates(&["USD=JPY:0".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("finite positive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_exchange_rates_rejects_nan_rate() {
+        let err = parse_exchange_rates(&["USD=JPY:NaN".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("finite positive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_exchange_rates_rejects_inf_rate() {
+        let err = parse_exchange_rates(&["USD=JPY:inf".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("finite positive"),
+            "unexpected error: {err}"
         );
     }
 
