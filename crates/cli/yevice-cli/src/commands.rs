@@ -4,7 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use yevice_core::optimize::{DecisionVariable, ObjectiveDirection, OptimizationProblem};
 use yevice_output::{ArchitectureRenderer, DrawIoRenderer, JsonRenderer, MermaidRenderer};
-use yevice_solver::{Solver, SolverError, solver_from_name};
+use yevice_solver::milp::MilpOptions;
+use yevice_solver::{Solver, SolverError, solver_from_name_with_options};
 
 use yevice_core::bindings::derive_bindings;
 use yevice_core::capacity::{self, Quotas, Severity};
@@ -389,6 +390,9 @@ pub fn optimize(
     decisions: &[String],
     direction: &str,
     solver_name: &str,
+    time_limit: f64,
+    mip_gap: f64,
+    threads: i32,
 ) -> Result<()> {
     let arch = load_cost_model(cost_model_path)?;
     let objective = arch.total_expr();
@@ -436,13 +440,21 @@ pub fn optimize(
 
     // Select the solver backend (default: enumeration). Unknown names map to
     // a typed error so the CLI can show the allowed list.
-    let solver: Box<dyn Solver> = match solver_from_name(solver_name) {
+    let milp_options = MilpOptions {
+        time_limit_sec: Some(time_limit),
+        mip_gap: Some(mip_gap),
+        threads: Some(threads),
+    };
+    let solver: Box<dyn Solver> = match solver_from_name_with_options(solver_name, milp_options) {
         Ok(s) => s,
         Err(SolverError::UnknownSolver { requested, allowed }) => {
             bail!(
                 "unknown --solver value '{requested}'. Allowed values: {}",
                 allowed.join(", ")
             );
+        }
+        Err(SolverError::MilpBackend { message }) => {
+            bail!("MILP backend unavailable: {message}");
         }
         Err(e) => return Err(e.into()),
     };
@@ -865,6 +877,9 @@ mod tests {
             &["MyVar=".to_string()],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -898,6 +913,9 @@ mod tests {
             &["MyVar=  ".to_string()],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -938,6 +956,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(result.is_ok(), "min direction must be accepted: {result:?}");
     }
@@ -962,6 +983,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(
             result.is_ok(),
@@ -988,6 +1012,9 @@ mod tests {
             &[],
             "min",
             "no-such-solver",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1018,6 +1045,9 @@ mod tests {
             &[],
             "max",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(result.is_ok(), "max direction must be accepted: {result:?}");
     }
@@ -1039,6 +1069,9 @@ mod tests {
             &[],
             "sideways",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1110,6 +1143,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1170,6 +1206,9 @@ mod tests {
             &["Widget_source_input=100,200".to_string()],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(
             result.is_ok(),
@@ -1308,6 +1347,9 @@ mod tests {
             &[],
             "min",
             "enumeration",
+            300.0,
+            1e-4,
+            0,
         );
         assert!(result.is_ok(), "optimize must return Ok; got: {result:?}");
     }

@@ -411,5 +411,81 @@ fn bench_large(c: &mut Criterion) {
 // Criterion wiring
 // ---------------------------------------------------------------------------
 
+// HiGHS comparison benchmarks (only with the `highs` feature).
+#[cfg(feature = "highs")]
+fn bench_highs_small(c: &mut Criterion) {
+    use yevice_solver::highs_backend::HighsSolver;
+    use yevice_solver::milp::MilpOptions;
+
+    let problem = build_small();
+    let solver = HighsSolver {
+        options: MilpOptions {
+            time_limit_sec: Some(30.0),
+            mip_gap: Some(1e-6),
+            threads: Some(1),
+        },
+    };
+    let sol = solver.solve(&problem).unwrap();
+    assert!(sol.feasible, "highs bench_small problem must be feasible");
+
+    c.bench_function("highs_small (~100 combos)", |b| {
+        b.iter(|| solver.solve(black_box(&problem)).unwrap());
+    });
+}
+
+#[cfg(feature = "highs")]
+fn bench_highs_medium(c: &mut Criterion) {
+    use yevice_solver::highs_backend::HighsSolver;
+    use yevice_solver::milp::MilpOptions;
+
+    let problem = build_medium();
+    let solver = HighsSolver {
+        options: MilpOptions {
+            time_limit_sec: Some(30.0),
+            mip_gap: Some(1e-6),
+            threads: Some(1),
+        },
+    };
+    let sol = solver.solve(&problem).unwrap();
+    assert!(sol.feasible, "highs bench_medium problem must be feasible");
+
+    c.bench_function("highs_medium (~1 800 combos)", |b| {
+        b.iter(|| solver.solve(black_box(&problem)).unwrap());
+    });
+}
+
+#[cfg(feature = "highs")]
+fn bench_highs_large(c: &mut Criterion) {
+    use yevice_solver::highs_backend::HighsSolver;
+    use yevice_solver::milp::MilpOptions;
+
+    let problem = build_large();
+    let solver = HighsSolver {
+        options: MilpOptions {
+            time_limit_sec: Some(60.0),
+            mip_gap: Some(1e-6),
+            threads: Some(1),
+        },
+    };
+    let sol = solver.solve(&problem).unwrap();
+    assert!(sol.feasible, "highs bench_large problem must be feasible");
+
+    c.bench_function("highs_large (~15 000 combos)", |b| {
+        b.iter(|| solver.solve(black_box(&problem)).unwrap());
+    });
+}
+
+#[cfg(feature = "highs")]
+criterion_group!(
+    benches,
+    bench_small,
+    bench_medium,
+    bench_large,
+    bench_highs_small,
+    bench_highs_medium,
+    bench_highs_large
+);
+#[cfg(not(feature = "highs"))]
 criterion_group!(benches, bench_small, bench_medium, bench_large);
+
 criterion_main!(benches);
