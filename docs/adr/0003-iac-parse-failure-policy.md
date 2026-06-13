@@ -65,9 +65,19 @@ pub struct IacParseDiagnostic {
     pub severity: Severity,
     pub source: DiagnosticSource,
     pub location: Option<SourceLocation>,
-    pub code: &'static str,        // e.g. "cfn.missing_parameter"
+    pub code: String,              // stable ASCII snake_case identifier
+                                   // (e.g. "missing_parameter", "unresolved_var_ref")
     pub message: String,
 }
+```
+
+`code` は serde 経由で `cost_model.json` の `diagnostics: []` 配列から
+deserialize される値であり、JSON 中の任意文字列を `&'static str` に詰めることは
+できない (`'static` 寿命を満たすには `Box::leak` や intern が必要)。値は ASCII
+snake_case の安定識別子で表現し、`{source}.{code}` の組み合わせで一意化する
+(例: `source: Cfn` + `code: "missing_parameter"`)。
+
+```rust
 
 pub struct ParseOutcome<T> {
     pub value: T,
