@@ -4,7 +4,7 @@ use std::{
 };
 
 use hcl::{Body, Structure};
-use yevice_core::io::read_to_string_capped;
+use yevice_core::io::read_iac_file;
 
 use crate::error::TfError;
 
@@ -103,12 +103,10 @@ pub fn parse_tf_dir(dir: &Path) -> Result<TfConfig, TfError> {
     tf_files.sort();
 
     for path in tf_files {
-        let content = read_to_string_capped(&path).map_err(|e| {
-            TfError::Io(std::io::Error::new(
-                e.kind(),
-                format!("{}: {e}", path.display()),
-            ))
-        })?;
+        // `read_iac_file` already attaches the path to its error via
+        // `IoReadError`, so we no longer need the manual `path: io_error`
+        // wrap that this loop used to perform.
+        let content = read_iac_file(&path)?;
         let body: Body = hcl::parse(&content)
             .map_err(|e| TfError::ParseError(format!("{}: {e}", path.display())))?;
         parse_body_into(&body, &mut config);
@@ -118,7 +116,7 @@ pub fn parse_tf_dir(dir: &Path) -> Result<TfConfig, TfError> {
 }
 
 pub fn parse_tfvars(path: &Path) -> Result<HashMap<String, TfValue>, TfError> {
-    let content = read_to_string_capped(path)?;
+    let content = read_iac_file(path)?;
     let body: Body = hcl::parse(&content)?;
     let mut vars = HashMap::new();
 

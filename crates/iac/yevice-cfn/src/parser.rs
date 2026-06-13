@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_yaml_ng::Value;
-use yevice_core::io::read_to_string_capped;
+use yevice_core::io::read_iac_file;
 
 use crate::error::CfnError;
 use crate::intrinsic::{ResolveContext, resolve};
@@ -52,7 +52,7 @@ pub type ResolvedTemplate = CfnTemplate<ResolvedValue>;
 
 /// Parse a `CloudFormation` YAML template from a file.
 pub fn parse_template(path: &Path) -> Result<CfnTemplate, CfnError> {
-    let content = read_to_string_capped(path)?;
+    let content = read_iac_file(path)?;
     parse_template_str(&content)
 }
 

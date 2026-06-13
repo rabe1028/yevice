@@ -1,10 +1,12 @@
 //! CFn template → Architecture conversion using the adapter registry.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use serde_yaml_ng::Value as YamlValue;
 use yevice_core::{
-    resource::{Architecture, Connection, ConnectionType, Resource, ResourceShell},
+    resource::{
+        Architecture, Connection, ConnectionDeduper, ConnectionType, Resource, ResourceShell,
+    },
     types::{LogicalId, Region, ResourceType},
 };
 use yevice_service_api::{CfnAdapterRegistry, CfnPropertyValue, RawCfnResource};
@@ -62,79 +64,71 @@ pub fn build_architecture(
     }
 }
 
-/// Insert `conn` into `connections` if its key is not already in `seen`,
-/// after passing the endpoint guard determined by `require_source_in_resources`.
+/// Insert `conn` into `dedupe` after passing the endpoint guard.
 ///
-/// - ESM edges: `require_source_in_resources = false` (source may be external ARN)
-/// - All new structured-property edges: `require_source_in_resources = true`
+/// `require_source_in_resources` controls the source endpoint check:
+///
+/// - ESM edges: `false` (source may be an external ARN, not a template node)
+/// - All structured-property edges: `true` (both endpoints must be nodes)
+///
+/// Target existence is always enforced.
 fn try_push_connection(
     conn: Connection,
     resources: &BTreeMap<String, ResolvedResource>,
     require_source_in_resources: bool,
-    seen: &mut HashSet<(String, String, String)>,
-    connections: &mut Vec<Connection>,
+    dedupe: &mut ConnectionDeduper,
 ) {
-    if require_source_in_resources && !resources.contains_key(conn.source.as_str()) {
-        return;
-    }
-    if !resources.contains_key(conn.target.as_str()) {
-        return;
-    }
-    let key = (
-        conn.source.as_str().to_string(),
-        conn.target.as_str().to_string(),
-        format!("{:?}", conn.connection_type),
+    dedupe.try_push(
+        conn,
+        |src| !require_source_in_resources || resources.contains_key(src),
+        |tgt| resources.contains_key(tgt),
     );
-    if seen.insert(key) {
-        connections.push(conn);
-    }
 }
 
 fn build_connections(resources: &BTreeMap<String, ResolvedResource>) -> Vec<Connection> {
-    let mut connections = Vec::new();
     // Dedup key: (source, target, connection_type) — prevents double-counting
     // when both EventSourceMapping and SAM Events create the same edge.
-    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let mut dedupe = ConnectionDeduper::new();
 
     for (id, cfn) in resources {
         match cfn.resource_type.as_str() {
             // ESM: source may be an external ARN not in resources; only target must exist.
             "AWS::Lambda::EventSourceMapping" => {
                 for conn in extract_event_source_connections(cfn, resources) {
-                    try_push_connection(conn, resources, false, &mut seen, &mut connections);
+                    try_push_connection(conn, resources, false, &mut dedupe);
                 }
             }
             "AWS::S3::Bucket" => {
                 for conn in extract_s3_notification_connections(id, cfn) {
-                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                    try_push_connection(conn, resources, true, &mut dedupe);
                 }
             }
             "AWS::SNS::Topic" => {
                 for conn in extract_sns_topic_subscription_connections(id, cfn) {
-                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                    try_push_connection(conn, resources, true, &mut dedupe);
                 }
             }
             "AWS::SNS::Subscription" => {
                 for conn in extract_sns_subscription_resource_connections(cfn) {
-                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                    try_push_connection(conn, resources, true, &mut dedupe);
                 }
             }
             "AWS::Events::Rule" => {
                 for conn in extract_events_rule_connections(id, cfn) {
-                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                    try_push_connection(conn, resources, true, &mut dedupe);
                 }
             }
             // SAM: source must be a known node in the template (no external ARN supported here).
             "AWS::Serverless::Function" => {
                 for conn in extract_sam_function_event_connections(id, cfn, resources) {
-                    try_push_connection(conn, resources, true, &mut seen, &mut connections);
+                    try_push_connection(conn, resources, true, &mut dedupe);
                 }
             }
             _ => {}
         }
     }
 
-    connections
+    dedupe.into_connections()
 }
 
 fn extract_event_source_connections(

@@ -42,3 +42,15 @@ pub enum CfnError {
     #[error("YAML parse error")]
     Yaml(#[from] serde_yaml_ng::Error),
 }
+
+/// Funnel the shared IaC read error into the existing [`CfnError::Io`]
+/// variant so that adding `read_iac_file` does **not** introduce a new
+/// public enum variant. The full `IoReadError` `Display` (which includes
+/// the offending path) is preserved by embedding it as the inner
+/// `io::Error`'s message.
+impl From<yevice_core::io::IoReadError> for CfnError {
+    fn from(e: yevice_core::io::IoReadError) -> Self {
+        let kind = e.source.kind();
+        CfnError::Io(std::io::Error::new(kind, e.to_string()))
+    }
+}

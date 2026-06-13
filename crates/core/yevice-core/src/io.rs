@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -37,6 +37,50 @@ pub fn read_to_string_capped(path: &Path) -> io::Result<String> {
         ));
     }
     std::fs::read_to_string(path)
+}
+
+/// Unified error type returned by the shared IaC file-read helper.
+///
+/// Carries the offending path along with the underlying [`io::Error`] so that
+/// downstream parser errors can render messages of the form
+/// `"<path>: <io error>"` without each call site re-implementing the wrap.
+///
+/// Each IaC parser's error enum should add a `#[from] IoReadError` variant
+/// (and keep its legacy `Io(std::io::Error)` variant intact) so [`read_iac_file`]
+/// flows through the existing `?` chains.
+#[derive(Debug, Error)]
+#[error("failed to read {}: {source}", path.display())]
+pub struct IoReadError {
+    /// File that could not be read.
+    pub path: PathBuf,
+    /// Underlying I/O error (including the size-limit error from
+    /// [`read_to_string_capped`]).
+    #[source]
+    pub source: io::Error,
+}
+
+impl IoReadError {
+    /// Construct an [`IoReadError`] for `path` from a raw [`io::Error`].
+    pub fn new(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// Read an IaC input file as a UTF-8 string with the workspace-wide size cap
+/// applied (see [`MAX_IAC_FILE_BYTES`]).
+///
+/// This is a thin wrapper over [`read_to_string_capped`] that attaches the
+/// offending path to the returned error. Every IaC parser (CFn, Terraform,
+/// Wrangler) should funnel its file reads through this helper so that:
+///
+/// 1. The 16 MiB cap is enforced consistently.
+/// 2. Read failures carry the path in their `Display` output.
+/// 3. Parser-specific error enums can convert via `#[from] IoReadError`.
+pub fn read_iac_file(path: &Path) -> Result<String, IoReadError> {
+    read_to_string_capped(path).map_err(|source| IoReadError::new(path, source))
 }
 
 /// A YAML scalar that could not be interpreted as an `f64`.
@@ -296,6 +340,38 @@ mod tests {
         let result = read_to_string_capped(&path);
         assert!(result.is_ok(), "exact limit should succeed");
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_iac_file_attaches_path_to_error() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "yevice_core_io_test_missing_{}.txt",
+            std::process::id()
+        ));
+        // Ensure the file is absent.
+        let _ = std::fs::remove_file(&path);
+
+        let err = read_iac_file(&path).expect_err("missing file must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(path.to_string_lossy().as_ref()),
+            "error must mention the path; got: {msg}"
+        );
+        assert!(
+            msg.contains("failed to read"),
+            "error must mention 'failed to read'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_iac_file_passes_through_content() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("yevice_core_io_test_ok_{}.txt", std::process::id()));
+        std::fs::write(&path, b"hello").unwrap();
+        let content = read_iac_file(&path).unwrap();
+        assert_eq!(content, "hello");
         let _ = std::fs::remove_file(&path);
     }
 
