@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -46,7 +46,8 @@ impl Service for MskService {
         };
 
         let instance_cost = Expr::linear(hourly_price * HOURS_PER_MONTH, broker_expr, 0.0);
-        let storage_cost = Expr::linear(storage_price, Expr::variable(id.var("storage_gb")), 0.0);
+        let storage_cost =
+            Expr::linear(storage_price, Expr::variable(id.var(var::STORAGE_GB)), 0.0);
 
         let mut vars = vec![];
         if spec.broker_count.is_none() {
@@ -59,7 +60,7 @@ impl Service for MskService {
         }
         vars.push(VariableInfo::new(
             id,
-            "storage_gb",
+            var::STORAGE_GB,
             "Total broker storage",
             "GB",
         ));

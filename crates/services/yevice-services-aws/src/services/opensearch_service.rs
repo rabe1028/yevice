@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -46,7 +46,7 @@ impl Service for OpenSearchServiceService {
 
         let instance_expr = match spec.instance_count {
             Some(n) => Expr::constant(n),
-            None => Expr::variable(id.var("instance_count")),
+            None => Expr::variable(id.var(var::INSTANCE_COUNT)),
         };
 
         let instance_cost =
@@ -54,7 +54,7 @@ impl Service for OpenSearchServiceService {
 
         let storage_expr = match spec.storage_gb {
             Some(gb) => Expr::constant(gb),
-            None => Expr::variable(id.var("storage_gb")),
+            None => Expr::variable(id.var(var::STORAGE_GB)),
         };
         let storage_cost = Expr::linear(
             storage_price,
@@ -68,7 +68,7 @@ impl Service for OpenSearchServiceService {
         if spec.instance_count.is_none() {
             required.push(VariableInfo::new(
                 id,
-                "instance_count",
+                var::INSTANCE_COUNT,
                 "Number of data nodes",
                 "nodes",
             ));
@@ -76,7 +76,7 @@ impl Service for OpenSearchServiceService {
         if spec.storage_gb.is_none() {
             required.push(VariableInfo::new(
                 id,
-                "storage_gb",
+                var::STORAGE_GB,
                 "EBS storage per node",
                 "GB",
             ));

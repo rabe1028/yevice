@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::{Expr, Tier},
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -72,12 +72,16 @@ impl Service for LambdaService {
                     unit_price: request_price,
                 },
             ],
-            Expr::variable(id.var("requests")),
+            Expr::variable(id.var(var::REQUESTS)),
         );
 
         let gb_seconds = Expr::product(vec![
-            Expr::variable(id.var("requests")),
-            Expr::linear(1.0 / 1000.0, Expr::variable(id.var("avg_duration_ms")), 0.0),
+            Expr::variable(id.var(var::REQUESTS)),
+            Expr::linear(
+                1.0 / 1000.0,
+                Expr::variable(id.var(var::AVG_DURATION_MS)),
+                0.0,
+            ),
             Expr::constant(memory_gb),
         ]);
 
@@ -121,10 +125,15 @@ impl Service for LambdaService {
                 },
             ],
             required_variables: vec![
-                VariableInfo::new(id, "requests", "Lambda invocations per month", "requests"),
                 VariableInfo::new(
                     id,
-                    "avg_duration_ms",
+                    var::REQUESTS,
+                    "Lambda invocations per month",
+                    "requests",
+                ),
+                VariableInfo::new(
+                    id,
+                    var::AVG_DURATION_MS,
                     "Average duration per invocation",
                     "ms",
                 ),
@@ -141,7 +150,11 @@ impl Service for LambdaService {
     ) -> Option<CapacityModel> {
         let concurrent = Expr::product(vec![
             Expr::variable(id.var("peak_requests_per_sec")),
-            Expr::linear(1.0 / 1000.0, Expr::variable(id.var("avg_duration_ms")), 0.0),
+            Expr::linear(
+                1.0 / 1000.0,
+                Expr::variable(id.var(var::AVG_DURATION_MS)),
+                0.0,
+            ),
         ]);
 
         Some(CapacityModel {

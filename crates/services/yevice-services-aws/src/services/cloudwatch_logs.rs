@@ -3,7 +3,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::{Expr, Tier},
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -53,7 +53,7 @@ impl Service for CloudWatchLogsService {
                     unit_price: ingestion_price,
                 },
             ],
-            Expr::variable(id.var("ingestion_gb")),
+            Expr::variable(id.var(var::INGESTION_GB)),
         );
         let storage = Expr::tiered(
             vec![
@@ -66,7 +66,7 @@ impl Service for CloudWatchLogsService {
                     unit_price: storage_price,
                 },
             ],
-            Expr::variable(id.var("storage_gb")),
+            Expr::variable(id.var(var::STORAGE_GB)),
         );
 
         Ok(ResourceCost {
@@ -85,8 +85,8 @@ impl Service for CloudWatchLogsService {
                 },
             ],
             required_variables: vec![
-                VariableInfo::new(id, "ingestion_gb", "Log data ingested per month", "GB"),
-                VariableInfo::new(id, "storage_gb", "Log data storage", "GB"),
+                VariableInfo::new(id, var::INGESTION_GB, "Log data ingested per month", "GB"),
+                VariableInfo::new(id, var::STORAGE_GB, "Log data storage", "GB"),
             ],
         })
     }

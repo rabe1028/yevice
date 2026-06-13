@@ -5,7 +5,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::{Expr, Tier},
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -75,7 +75,7 @@ impl Service for DynamoDbService {
                     unit_price: storage_price_per_gb,
                 },
             ],
-            Expr::variable(id.var("storage_gb")),
+            Expr::variable(id.var(var::STORAGE_GB)),
         );
 
         match &spec.billing_mode {
@@ -143,7 +143,7 @@ impl Service for DynamoDbService {
                             "Read request units per month",
                             "RRU",
                         ),
-                        VariableInfo::new(id, "storage_gb", "Table storage", "GB"),
+                        VariableInfo::new(id, var::STORAGE_GB, "Table storage", "GB"),
                     ],
                 })
             }
@@ -163,7 +163,12 @@ impl Service for DynamoDbService {
                 let write_cost = Expr::linear(wcu_hour_price * HOURS_PER_MONTH, wcu_expr, 0.0);
                 let read_cost = Expr::linear(rcu_hour_price * HOURS_PER_MONTH, rcu_expr, 0.0);
 
-                let mut vars = vec![VariableInfo::new(id, "storage_gb", "Table storage", "GB")];
+                let mut vars = vec![VariableInfo::new(
+                    id,
+                    var::STORAGE_GB,
+                    "Table storage",
+                    "GB",
+                )];
                 if write_capacity_units.is_none() {
                     vars.insert(
                         0,

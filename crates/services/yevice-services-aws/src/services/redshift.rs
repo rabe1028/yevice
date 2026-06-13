@@ -3,7 +3,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -56,7 +56,7 @@ impl Service for RedshiftService {
         let hours = spec.hours.unwrap_or(FULL_MONTH_HOURS);
         let nodes = Expr::product(vec![Expr::constant(node_hour * hours), node_expr]);
         // Managed (RA3/RMS) storage per GB-month.
-        let storage = Expr::linear(storage_price, Expr::variable(id.var("storage_gb")), 0.0);
+        let storage = Expr::linear(storage_price, Expr::variable(id.var(var::STORAGE_GB)), 0.0);
         // Redshift Spectrum: per-TB scanned against external (S3) data.
         let spectrum = Expr::linear(spectrum_price, Expr::variable(id.var("spectrum_tb")), 0.0);
 
@@ -69,7 +69,12 @@ impl Service for RedshiftService {
                 "nodes",
             ));
         }
-        required.push(VariableInfo::new(id, "storage_gb", "Managed storage", "GB"));
+        required.push(VariableInfo::new(
+            id,
+            var::STORAGE_GB,
+            "Managed storage",
+            "GB",
+        ));
         required.push(VariableInfo::new(
             id,
             "spectrum_tb",

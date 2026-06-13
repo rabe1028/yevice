@@ -4,7 +4,7 @@ use yevice_core::{
     cost::{CostComponent, ResourceCost, VariableInfo},
     expr::Expr,
     resource::Provider,
-    types::{LogicalId, ResourceType},
+    types::{LogicalId, ResourceType, var},
 };
 use yevice_pricing::catalog::{PriceCatalog, Sku};
 use yevice_service_api::{Service, error::CostError};
@@ -42,19 +42,20 @@ impl Service for DocumentDbService {
 
         let instance_expr = match spec.instance_count {
             Some(n) => Expr::constant(n),
-            None => Expr::variable(id.var("instance_count")),
+            None => Expr::variable(id.var(var::INSTANCE_COUNT)),
         };
 
         let instance_cost = Expr::linear(instance_hour * HOURS_PER_MONTH, instance_expr, 0.0);
-        let storage_cost = Expr::linear(storage_price, Expr::variable(id.var("storage_gb")), 0.0);
+        let storage_cost =
+            Expr::linear(storage_price, Expr::variable(id.var(var::STORAGE_GB)), 0.0);
 
         let total = Expr::sum(vec![instance_cost.clone(), storage_cost.clone()]);
 
-        let mut required = vec![VariableInfo::new(id, "storage_gb", "Storage size", "GB")];
+        let mut required = vec![VariableInfo::new(id, var::STORAGE_GB, "Storage size", "GB")];
         if spec.instance_count.is_none() {
             required.push(VariableInfo::new(
                 id,
-                "instance_count",
+                var::INSTANCE_COUNT,
                 "Number of instances in cluster",
                 "instances",
             ));
