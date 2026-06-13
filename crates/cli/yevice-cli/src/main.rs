@@ -104,6 +104,20 @@ enum Commands {
         /// Show detailed cost breakdown per component.
         #[arg(long)]
         breakdown: bool,
+
+        /// Optional display currency (e.g. `USD`, `JPY`). When unset and the
+        /// model is single-currency, the native currency is shown as-is.
+        /// When the model is multi-currency, an unset flag prints per-currency
+        /// totals and emits a warning. A set flag converts everything to the
+        /// target currency using `--exchange-rate` entries; missing rates are
+        /// a hard error.
+        #[arg(long = "display-currency", value_name = "CODE")]
+        display_currency: Option<String>,
+
+        /// Static exchange rate of the form `FROM=TO:RATE` (e.g.
+        /// `JPY=USD:0.0067`). May be repeated.
+        #[arg(long = "exchange-rate", value_name = "FROM=TO:RATE")]
+        exchange_rate: Vec<String>,
     },
 
     /// Compare multiple cost models.
@@ -118,6 +132,14 @@ enum Commands {
         /// Show detailed cost breakdown per component.
         #[arg(long)]
         breakdown: bool,
+
+        /// Optional display currency. See `eval --display-currency`.
+        #[arg(long = "display-currency", value_name = "CODE")]
+        display_currency: Option<String>,
+
+        /// Static exchange rate. See `eval --exchange-rate`.
+        #[arg(long = "exchange-rate", value_name = "FROM=TO:RATE")]
+        exchange_rate: Vec<String>,
     },
 
     /// Sensitivity analysis: vary a parameter and show cost impact.
@@ -300,12 +322,28 @@ fn main() -> Result<()> {
             cost_model,
             params,
             breakdown,
-        } => commands::evaluate(&cost_model, &params, breakdown),
+            display_currency,
+            exchange_rate,
+        } => commands::evaluate(
+            &cost_model,
+            &params,
+            breakdown,
+            display_currency.as_deref(),
+            &exchange_rate,
+        ),
         Commands::Compare {
             cost_models,
             params,
             breakdown,
-        } => commands::compare(&cost_models, &params, breakdown),
+            display_currency,
+            exchange_rate,
+        } => commands::compare(
+            &cost_models,
+            &params,
+            breakdown,
+            display_currency.as_deref(),
+            &exchange_rate,
+        ),
         Commands::Sensitivity {
             cost_model,
             params,

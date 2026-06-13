@@ -293,10 +293,10 @@ fn test_fargate_prd_vs_dev_total_cost() {
     let prd_result = evaluate_architecture(&prd_arch, &prd_params).unwrap();
 
     assert!(
-        prd_result.total_monthly_cost > dev_result.total_monthly_cost,
+        prd_result.naive_total() > dev_result.naive_total(),
         "production (${:.2}) should cost more than dev (${:.2})",
-        prd_result.total_monthly_cost,
-        dev_result.total_monthly_cost
+        prd_result.naive_total(),
+        dev_result.naive_total()
     );
 }
 

@@ -25,19 +25,19 @@ pub(crate) fn render_eval_breakdown_table(result: &ArchitectureResult) -> Table 
     for r in &result.resources {
         table.add_row(vec![
             Cell::new(&r.label).fg(Color::Cyan),
-            Cell::new(format!("${:.2}", r.monthly_cost)).fg(Color::Cyan),
+            Cell::new(format!("${:.2}", r.monthly_cost.value)).fg(Color::Cyan),
         ]);
         for (name, cost) in &r.component_costs {
             table.add_row(vec![
                 Cell::new(format!("  └─ {name}")),
-                Cell::new(format!("${cost:.4}")),
+                Cell::new(format!("${:.4}", cost.value)),
             ]);
         }
     }
 
     table.add_row(vec![
         Cell::new("TOTAL").fg(Color::Green),
-        Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
+        Cell::new(format!("${:.2}", result.naive_total())).fg(Color::Green),
     ]);
 
     table
@@ -56,14 +56,14 @@ pub(crate) fn render_eval_table(result: &ArchitectureResult) -> Table {
         table.add_row(vec![
             Cell::new(&r.label),
             Cell::new(&r.resource_type),
-            Cell::new(format!("${:.2}", r.monthly_cost)),
+            Cell::new(format!("${:.2}", r.monthly_cost.value)),
         ]);
     }
 
     table.add_row(vec![
         Cell::new("TOTAL").fg(Color::Green),
         Cell::new(""),
-        Cell::new(format!("${:.2}", result.total_monthly_cost)).fg(Color::Green),
+        Cell::new(format!("${:.2}", result.naive_total())).fg(Color::Green),
     ]);
 
     table
@@ -91,7 +91,7 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
     // Total row
     let mut total_row = vec![Cell::new("Total Monthly Cost").fg(Color::Green)];
     for r in results {
-        total_row.push(Cell::new(format!("${:.2}", r.total_monthly_cost)));
+        total_row.push(Cell::new(format!("${:.2}", r.naive_total())));
     }
     summary.add_row(total_row);
 
@@ -114,7 +114,7 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
                 .find(|res| &res.label == label)
                 .map_or_else(
                     || "-".to_string(),
-                    |res| format!("${:.2}", res.monthly_cost),
+                    |res| format!("${:.2}", res.monthly_cost.value),
                 );
             row.push(Cell::new(cost));
         }
@@ -139,7 +139,7 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
                         .iter()
                         .find(|res| &res.label == label)
                         .and_then(|res| res.component_costs.iter().find(|(n, _)| n == comp_name))
-                        .map_or_else(|| "-".to_string(), |(_, v)| format!("${v:.4}"));
+                        .map_or_else(|| "-".to_string(), |(_, v)| format!("${:.4}", v.value));
                     comp_row.push(Cell::new(comp_cost));
                 }
                 summary.add_row(comp_row);
@@ -149,7 +149,7 @@ pub(crate) fn render_compare_table(results: &[ArchitectureResult], breakdown: bo
 
     // Difference row (only when exactly 2 architectures are compared).
     if results.len() == 2 {
-        let diff = results[1].total_monthly_cost - results[0].total_monthly_cost;
+        let diff = results[1].naive_total() - results[0].naive_total();
         let diff_str = if diff >= 0.0 {
             format!("+${diff:.2}")
         } else {

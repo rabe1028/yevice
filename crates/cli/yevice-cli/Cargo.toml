@@ -17,6 +17,8 @@ name = "yevice"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
+tracing = { workspace = true }
 yevice-core = { workspace = true }
 yevice-engine = { workspace = true }
 yevice-solver = { workspace = true }
