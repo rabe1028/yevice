@@ -196,15 +196,20 @@ Wrangler は変数層を持たず構造体に直接 deserialize するため、p
 
 - **「未解決参照は demote 候補、構文エラーは hard error 据え置き」が原則。**
   前者は入力の不完全さで、後者は入力の壊れ。
-- 〇 の 4 バリアントは ADR 本文の Context 表で挙げた CFN 早期 abort の原因
-  そのもの。これらだけ片付ければ「CFN だけ厳しい」非対称は実質解消する。
-- △ の 3 つは「未解決」に近いが副作用が大きい（条件分岐が黙って倒れる /
+- 〇 の 4 バリアント (CFN) は ADR 本文の Context 表で挙げた CFN 早期 abort
+  の原因そのもの。これらを片付けることが「CFN だけ厳しい」非対称解消の中核。
+- △ の 3 つ (CFN) は「未解決」に近いが副作用が大きい（条件分岐が黙って倒れる /
   unknown resource を黙ってスキップ）ため Phase 2 送り。
-- TF の `warn!` 経路を「すでに lenient 相当」と見なせば、Phase 1 の追加実装
-  は CFN 側のみで済み、対象バリアントは合計 4 で打ち止め。バリアント総数
-  16 に対し policy 対象が 4 (Phase 1) / 7 (Phase 2 累計) と限定的なため、
-  enum 拡張ではなく既存 4 バリアント → diagnostic への変換ロジックで完結
-  する見込み。
+- TF の現状 `warn!` 経路は「型に上がっていない lenient 相当」であり、policy
+  制御下に置くには **新バリアント `TfError::UnresolvedReference` を Phase 1
+  で導入する** 必要がある (型システム拡張)。これは CFN 側の diagnostic 化
+  (既存バリアント変換) とは作業性質が異なるため Phase 1 の二本柱として明示。
+- まとめると Phase 1 は **CFN 既存 4 バリアント → diagnostic 変換 + TF
+  `UnresolvedReference` 新設 (型拡張)** の二本立て。Phase 2 は △ バリアント
+  (CFN の `ConditionNotFound` / `UnsupportedResourceType` / `MissingProperty`
+  と TF の `MissingAttribute`) を追加で policy 制御下に取り込む。
+  バリアント総数 16 に対し policy 対象は Phase 1 で 4 (CFN) + 1 (TF 新設)、
+  Phase 2 累計で 8 と限定的。
 
 ## Out of scope
 
