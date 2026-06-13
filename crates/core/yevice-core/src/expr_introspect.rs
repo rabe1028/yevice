@@ -742,6 +742,8 @@ pub fn classify_ceil_context(problem: &OptimizationProblem) -> CeilContextResult
     for (expr_snippet, sign) in obj_ceils {
         match (direction, sign) {
             (ObjectiveDirection::Minimize, CoeffSign::Positive) => {} // ok
+            // Zero coefficient: the ceil is effectively absent; skip.
+            (_, CoeffSign::Zero) => {}
             (ObjectiveDirection::Minimize, CoeffSign::Negative) => {
                 return CeilContextResult::Reject {
                     expr_repr: expr_snippet,
@@ -771,6 +773,8 @@ pub fn classify_ceil_context(problem: &OptimizationProblem) -> CeilContextResult
             let allowed = match (c.relation, sign) {
                 (Relation::Le, CoeffSign::Positive) => true,
                 (Relation::Ge, CoeffSign::Negative) => true,
+                // Zero coefficient: ceil is effectively absent; always allowed.
+                (_, CoeffSign::Zero) => true,
                 (Relation::Eq, _) => false,
                 (Relation::Le, CoeffSign::Negative) => false,
                 (Relation::Ge, CoeffSign::Positive) => false,
@@ -803,6 +807,9 @@ enum CoeffSign {
     Positive,
     Negative,
     Unknown,
+    /// The effective coefficient is (approximately) zero; the ceil is
+    /// multiplied away and has no impact on the objective / constraint.
+    Zero,
 }
 
 /// Find every `Ceil(...)` node in `expr` and report the sign of its effective
@@ -825,11 +832,16 @@ fn find_ceils_with_coeff_sign(expr: &Expr) -> Vec<(String, CoeffSign)> {
     out
 }
 
+/// Threshold below which a coefficient is treated as zero (same constant used
+/// in the MILP encoder).
+const COEFF_EPS: f64 = 1e-12;
+
 fn multiply_sign(a: CoeffSign, factor: f64) -> CoeffSign {
-    if factor == 0.0 {
-        // A zero-coefficient ceil disappears; mark Unknown rather than risking
-        // a false "positive" classification.
-        return CoeffSign::Unknown;
+    if factor.abs() < COEFF_EPS {
+        // A zero (or near-zero) coefficient makes the ceil term vanish.
+        // Return Zero so callers can skip this occurrence entirely rather than
+        // incorrectly treating it as an undetermined (Unknown) context.
+        return CoeffSign::Zero;
     }
     let f_sign = if factor > 0.0 {
         CoeffSign::Positive
@@ -837,6 +849,7 @@ fn multiply_sign(a: CoeffSign, factor: f64) -> CoeffSign {
         CoeffSign::Negative
     };
     match (a, f_sign) {
+        (CoeffSign::Zero, _) | (_, CoeffSign::Zero) => CoeffSign::Zero,
         (CoeffSign::Positive, CoeffSign::Positive) => CoeffSign::Positive,
         (CoeffSign::Negative, CoeffSign::Negative) => CoeffSign::Positive,
         (CoeffSign::Positive, CoeffSign::Negative) | (CoeffSign::Negative, CoeffSign::Positive) => {
@@ -924,8 +937,13 @@ fn walk(expr: &Expr, outer: CoeffSign, out: &mut Vec<(String, CoeffSign)>) {
             }
         }
         Expr::Ceil { expr: inner } => {
-            // Record this ceil's effective sign.
-            out.push((format!("ceil({:?})", flatten_for_debug(inner)), outer));
+            // A zero effective coefficient means the ceil term is multiplied
+            // away; it has no impact on the objective/constraint value, so
+            // skip recording it (treating it as absent prevents spurious
+            // Unknown-context rejections for free/zero-priced components).
+            if !matches!(outer, CoeffSign::Zero) {
+                out.push((format!("ceil({:?})", flatten_for_debug(inner)), outer));
+            }
             // Walk inside for nested ceils, with sign Unknown.
             walk(inner, CoeffSign::Unknown, out);
         }
@@ -1285,6 +1303,97 @@ mod tests {
                 CeilContextResult::Reject { .. }
             ),
             "neg_price * ceil(x) with fixed_params[neg_price]=-1.0 must be Reject for Minimize"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_ceil_context — zero-coefficient / free billing component (#37)
+    // -------------------------------------------------------------------------
+
+    /// `0 * ceil(x)` (literal zero coefficient) must be accepted: the ceil
+    /// term is effectively absent from the objective.
+    #[test]
+    fn classify_ceil_context_zero_literal_coeff_accepted() {
+        use crate::optimize::{DecisionVariable, OptimizationProblem};
+        use std::collections::HashMap;
+
+        // objective = 0.0 * ceil(x), direction = Minimize
+        let objective = Expr::product(vec![Expr::constant(0.0), Expr::ceil(Expr::variable("x"))]);
+        let problem = OptimizationProblem {
+            objective,
+            direction: crate::optimize::ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+
+        assert!(
+            matches!(classify_ceil_context(&problem), CeilContextResult::Ok),
+            "0 * ceil(x) must be Ok (zero-coefficient ceil is effectively absent)"
+        );
+    }
+
+    /// `price * ceil(x)` where `price = 0` (fixed param) must be accepted.
+    /// This models a "free" billing component that contributes nothing to cost.
+    #[test]
+    fn classify_ceil_context_zero_fixed_param_accepted() {
+        use crate::optimize::{DecisionVariable, OptimizationProblem};
+        use std::collections::HashMap;
+
+        // objective = price * ceil(x), direction = Minimize
+        // price is a fixed param set to 0.0 (free component)
+        let objective = Expr::product(vec![
+            Expr::variable("price"),
+            Expr::ceil(Expr::variable("x")),
+        ]);
+        let problem = OptimizationProblem {
+            objective,
+            direction: crate::optimize::ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::from([(var("price"), 0.0)]),
+            bindings: vec![],
+        };
+
+        assert!(
+            matches!(classify_ceil_context(&problem), CeilContextResult::Ok),
+            "price * ceil(x) with fixed_params[price]=0.0 must be Ok (zero-priced free component)"
+        );
+    }
+
+    /// `price * ceil(x)` where `price = 2.0` (non-zero fixed param) must still
+    /// be accepted as before (positive coefficient, Minimize).
+    #[test]
+    fn classify_ceil_context_nonzero_fixed_param_still_accepted() {
+        use crate::optimize::{DecisionVariable, OptimizationProblem};
+        use std::collections::HashMap;
+
+        let objective = Expr::product(vec![
+            Expr::variable("price"),
+            Expr::ceil(Expr::variable("x")),
+        ]);
+        let problem = OptimizationProblem {
+            objective,
+            direction: crate::optimize::ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::from([(var("price"), 2.0)]),
+            bindings: vec![],
+        };
+
+        assert!(
+            matches!(classify_ceil_context(&problem), CeilContextResult::Ok),
+            "price * ceil(x) with fixed_params[price]=2.0 must still be Ok for Minimize"
         );
     }
 }
