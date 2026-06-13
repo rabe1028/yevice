@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 
+use yevice_core::evaluate::{Params, evaluate};
 use yevice_core::expr::Expr;
 use yevice_core::expr_introspect::{VarRanges, expr_bounds, substitute_fixed_params};
 use yevice_core::optimize::{
@@ -166,12 +167,55 @@ pub(crate) fn encode(
         .iter()
         .map(|dv| dv.name.clone())
         .collect();
-    let fixed_param_map: BTreeMap<VariableName, f64> = problem
+    let mut fixed_param_map: BTreeMap<VariableName, f64> = problem
         .fixed_params
         .iter()
         .filter(|(k, _)| !decision_names.contains(*k))
         .map(|(k, &v)| (k.clone(), v))
         .collect();
+
+    // Pre-pass: fold constant bindings into fixed_param_map.
+    //
+    // A binding `rate = 2` (or any RHS that evaluates to a constant given
+    // the current fixed_params) is effectively a constant, not a
+    // variable.  If we leave it as an auxiliary variable, an expression
+    // like `rate * x` would appear to have two variable-containing
+    // factors and the encoder would surface `SolverError::Nonlinear`.
+    // By folding such bindings into `fixed_param_map` first, `normalise`
+    // will later substitute them as `Constant` nodes, making the product
+    // linear.
+    //
+    // We run a fixed-point loop (bounded by `bindings.len()`) to handle
+    // chains like `a = 2; b = a * 3` — once `a` is folded, `b` can be
+    // folded in the next pass.  Bindings whose target is shadowed by a
+    // decision variable are skipped; decision wins per ADR-0002.
+    {
+        let mut eval_params: Params = fixed_param_map
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        let max_passes = problem.bindings.len() + 1;
+        for _ in 0..max_passes {
+            let mut progressed = false;
+            for binding in &problem.bindings {
+                if decision_names.contains(&binding.target) {
+                    continue;
+                }
+                if eval_params.contains_key(&binding.target) {
+                    continue;
+                }
+                if let Ok(value) = evaluate(&binding.expr, &eval_params) {
+                    eval_params.insert(binding.target.clone(), value);
+                    fixed_param_map.insert(binding.target.clone(), value);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
     let normalise = |e: &Expr| -> Expr { substitute_fixed_params(e, &fixed_param_map) };
     let normalised_objective = normalise(&problem.objective);
     let normalised_constraints: Vec<(Expr, &OptimizationConstraint)> = problem
@@ -937,6 +981,39 @@ mod tests {
         assert!(
             result.is_ok(),
             "encode must succeed when the last binding for a target is resolvable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Regression for issue #37: a constant-valued binding (`rate = 2`) used
+    /// as a factor in a product expression (`rate * x`) must be folded into
+    /// `fixed_param_map` before the encoder classifies products.  Without the
+    /// fold, `rate` appears as an auxiliary variable and the product would have
+    /// two variable-containing factors, causing `SolverError::Nonlinear`.
+    #[test]
+    fn encode_constant_binding_folded_before_product_classification() {
+        // objective = rate * x
+        // binding: rate = 2  (constant binding)
+        // decision variable x in {3.0}
+        let problem = OptimizationProblem {
+            objective: Expr::Product {
+                exprs: vec![Expr::variable("rate"), Expr::variable("x")],
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding("rate", Expr::Constant { value: 2.0 })],
+        };
+
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when a constant binding is used as a product factor; got: {:?}",
             result.err()
         );
     }
