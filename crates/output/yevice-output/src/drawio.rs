@@ -538,6 +538,7 @@ mod tests {
             bindings: vec![],
             region: Region::new("ap-northeast-1"),
             topology,
+            diagnostics: Vec::new(),
         }
     }
 

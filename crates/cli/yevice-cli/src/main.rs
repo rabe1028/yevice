@@ -336,6 +336,7 @@ fn main() -> Result<()> {
                 &output_format,
                 &cli.region,
                 cli.input_format.to_command_format(),
+                cli.strict,
             )?;
             // Constraint violations are a structured outcome, not an error:
             // the command's own Result only covers operational failures.

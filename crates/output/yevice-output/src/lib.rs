@@ -111,6 +111,7 @@ mod tests {
             bindings: vec![],
             region: Region::new("ap-northeast-1"),
             topology,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -326,6 +327,7 @@ mod tests {
             bindings: vec![],
             region: Region::new("ap-northeast-1"),
             topology,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -427,6 +429,7 @@ mod tests {
             bindings: vec![],
             region: Region::new("ap-northeast-1"),
             topology,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -594,6 +597,7 @@ mod tests {
             bindings: vec![],
             region: Region::new("ap-northeast-1"),
             topology,
+            diagnostics: Vec::new(),
         };
 
         let output = MermaidRenderer.render(&cost).expect("render");
@@ -639,6 +643,7 @@ mod tests {
             bindings: vec![],
             region: Region::new("ap-northeast-1"),
             topology,
+            diagnostics: Vec::new(),
         };
 
         let output = DrawIoRenderer.render(&cost).expect("render");

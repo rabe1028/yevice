@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_yaml_ng::Value;
 use yevice_core::io::read_iac_file;
+use yevice_core::parse_policy::{
+    DiagnosticSource, IacParseDiagnostic, ParseOutcome, ParsePolicy, SourceLocation,
+};
 
 use crate::error::CfnError;
 use crate::intrinsic::{ResolveContext, resolve};
@@ -32,7 +35,7 @@ pub struct ParameterDef {
 /// A `CloudFormation` resource.
 ///
 /// Generic over the property representation `P` (see [`CfnTemplate`]).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CfnResource<P = Value> {
     pub logical_id: String,
     pub resource_type: String,
@@ -247,11 +250,50 @@ fn parse_resources(
 }
 
 /// Resolve all intrinsic functions in a template's resource properties.
+///
+/// Defaults to [`ParsePolicy::Strict`] for backward compatibility — i.e.
+/// preserves the historical CFN behaviour where missing parameters / unresolved
+/// `Fn::ImportValue` / unknown mapping keys abort the resolve. Use
+/// [`resolve_template_with_policy`] to opt into Lenient mode.
 pub fn resolve_template(
     template: &CfnTemplate,
     param_values: &HashMap<String, String>,
     import_values: &HashMap<String, String>,
 ) -> Result<BTreeMap<String, ResolvedResource>, CfnError> {
+    let outcome = resolve_template_with_policy(
+        template,
+        param_values,
+        import_values,
+        ParsePolicy::Strict,
+        None,
+    )?;
+    Ok(outcome.value)
+}
+
+/// Resolve all intrinsic functions in a template's resource properties under
+/// the given [`ParsePolicy`].
+///
+/// Under [`ParsePolicy::Lenient`] the four policy-controllable variants
+/// ([`CfnError::MissingParameters`], [`CfnError::ParameterNotFound`],
+/// [`CfnError::ImportValueNotFound`], [`CfnError::MappingNotFound`]) are
+/// demoted to [`IacParseDiagnostic`] entries on the returned [`ParseOutcome`]
+/// and resolution continues best-effort.
+///
+/// Syntax / IO / programmer-error variants ([`CfnError::Yaml`],
+/// [`CfnError::Io`], [`CfnError::IntrinsicError`], [`CfnError::ParseError`])
+/// stay policy-neutral and abort.
+///
+/// `template_path`, when supplied, is attached to each diagnostic's
+/// [`SourceLocation`].
+pub fn resolve_template_with_policy(
+    template: &CfnTemplate,
+    param_values: &HashMap<String, String>,
+    import_values: &HashMap<String, String>,
+    policy: ParsePolicy,
+    template_path: Option<&Path>,
+) -> Result<ParseOutcome<BTreeMap<String, ResolvedResource>>, CfnError> {
+    let mut diagnostics: Vec<IacParseDiagnostic> = Vec::new();
+
     // Build effective parameters: supplied values override defaults
     let mut effective_params = HashMap::new();
     for (name, def) in &template.parameters {
@@ -271,7 +313,16 @@ pub fn resolve_template(
         .collect();
     if !missing.is_empty() {
         missing.sort();
-        return Err(CfnError::MissingParameters(missing.join(", ")));
+        match policy {
+            ParsePolicy::Strict => {
+                return Err(CfnError::MissingParameters(missing.join(", ")));
+            }
+            ParsePolicy::Lenient => {
+                // Best-effort: leave the parameter unbound (downstream `!Ref`
+                // will then raise ParameterNotFound, also demoted below).
+                diagnostics.push(missing_parameters_diagnostic(&missing, template_path));
+            }
+        }
     }
 
     // Evaluate conditions
@@ -291,7 +342,18 @@ pub fn resolve_template(
             continue;
         }
 
-        let resolved_props = resolve(&resource.properties, &ctx)?;
+        let resolved_props = match resolve(&resource.properties, &ctx) {
+            Ok(v) => v,
+            Err(e) if policy == ParsePolicy::Lenient && is_policy_controllable(&e) => {
+                diagnostics.push(cfn_error_to_diagnostic(&e, template_path));
+                // Best-effort: skip the offending resource. Including a
+                // partially-resolved value here would risk handing wrong data
+                // to downstream adapters; downstream is more forgiving of a
+                // missing resource than a silently-wrong one.
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         resolved_resources.insert(
             id.clone(),
             CfnResource {
@@ -304,7 +366,71 @@ pub fn resolve_template(
         );
     }
 
-    Ok(resolved_resources)
+    Ok(ParseOutcome::with_diagnostics(
+        resolved_resources,
+        diagnostics,
+    ))
+}
+
+/// Whether a `CfnError` is one of the four ADR-0003 policy-controllable
+/// variants (Phase 1).
+fn is_policy_controllable(err: &CfnError) -> bool {
+    matches!(
+        err,
+        CfnError::MissingParameters(_)
+            | CfnError::ParameterNotFound(_)
+            | CfnError::ImportValueNotFound(_)
+            | CfnError::MappingNotFound { .. }
+    )
+}
+
+fn missing_parameters_diagnostic(
+    missing: &[String],
+    template_path: Option<&Path>,
+) -> IacParseDiagnostic {
+    let mut d = IacParseDiagnostic::error(
+        DiagnosticSource::Cfn,
+        "missing_parameter",
+        format!("Parameters: [{}] must have values", missing.join(", ")),
+    );
+    if let Some(p) = template_path {
+        d = d.with_location(SourceLocation::file_only(PathBuf::from(p)));
+    }
+    d
+}
+
+fn cfn_error_to_diagnostic(err: &CfnError, template_path: Option<&Path>) -> IacParseDiagnostic {
+    let (code, message): (&str, String) = match err {
+        CfnError::MissingParameters(names) => (
+            "missing_parameter",
+            format!("Parameters: [{names}] must have values"),
+        ),
+        CfnError::ParameterNotFound(name) => (
+            "parameter_not_found",
+            format!("parameter not found: {name}"),
+        ),
+        CfnError::ImportValueNotFound(name) => (
+            "import_value_not_found",
+            format!("import value not found: {name}"),
+        ),
+        CfnError::MappingNotFound {
+            map_name,
+            first_key,
+            second_key,
+        } => (
+            "mapping_not_found",
+            format!("mapping not found: {map_name}.{first_key}.{second_key}"),
+        ),
+        // Defensive: the caller guards via `is_policy_controllable`, but keep
+        // a fallback so adding new variants does not silently produce empty
+        // diagnostics.
+        other => ("cfn_error", other.to_string()),
+    };
+    let mut d = IacParseDiagnostic::error(DiagnosticSource::Cfn, code, message);
+    if let Some(p) = template_path {
+        d = d.with_location(SourceLocation::file_only(PathBuf::from(p)));
+    }
+    d
 }
 
 /// Context for condition evaluation.
@@ -884,9 +1010,7 @@ Resources:
 "#;
         let tmpl = parse_template_str(TEMPLATE).unwrap();
         let result = resolve_template(&tmpl, &HashMap::new(), &HashMap::new());
-        let err = result
-            .err()
-            .expect("expected Err for missing required parameters");
+        let err = result.expect_err("expected Err for missing required parameters");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("Env"),
@@ -920,5 +1044,142 @@ Resources:
             result.is_ok(),
             "expected Ok when required parameter is supplied"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-0003 / Issue #38 — ParsePolicy
+    // -----------------------------------------------------------------------
+
+    /// Under Lenient the missing-parameter case becomes a diagnostic and the
+    /// resolved value carries a `had_errors=true` ParseOutcome instead of an
+    /// Err. The offending resource (which depends on the unbound `!Ref`) is
+    /// best-effort skipped, but the rest of the template still resolves.
+    #[test]
+    fn lenient_demotes_missing_parameter_to_diagnostic() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Env:
+    Type: String
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-bucket"
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let outcome = resolve_template_with_policy(
+            &tmpl,
+            &HashMap::new(),
+            &HashMap::new(),
+            ParsePolicy::Lenient,
+            None,
+        )
+        .expect("lenient must not hard-error on missing parameter");
+        assert!(
+            outcome.had_errors,
+            "missing parameter must surface had_errors=true under Lenient"
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "missing_parameter"),
+            "diagnostics should include 'missing_parameter'; got {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// Under Strict the same template must surface a hard CfnError.
+    #[test]
+    fn strict_preserves_missing_parameter_hard_error() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  Env:
+    Type: String
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Env}-bucket"
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let err = resolve_template_with_policy(
+            &tmpl,
+            &HashMap::new(),
+            &HashMap::new(),
+            ParsePolicy::Strict,
+            None,
+        )
+        .expect_err("strict must error on missing parameter");
+        assert!(
+            matches!(err, CfnError::MissingParameters(_)),
+            "expected MissingParameters; got {err:?}"
+        );
+    }
+
+    /// `Fn::ImportValue` against an unknown export becomes a diagnostic
+    /// under Lenient (instead of `CfnError::ImportValueNotFound`).
+    #[test]
+    fn lenient_demotes_import_value_not_found() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  Func:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: example
+      Environment:
+        Variables:
+          ARN:
+            Fn::ImportValue: missing-export
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let outcome = resolve_template_with_policy(
+            &tmpl,
+            &HashMap::new(),
+            &HashMap::new(),
+            ParsePolicy::Lenient,
+            None,
+        )
+        .expect("lenient must demote ImportValueNotFound to diagnostic");
+        assert!(outcome.had_errors);
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "import_value_not_found"),
+            "expected import_value_not_found diagnostic; got {:?}",
+            outcome.diagnostics
+        );
+    }
+
+    /// Strict preserves the historical `CfnError::ImportValueNotFound` on the
+    /// same template.
+    #[test]
+    fn strict_preserves_import_value_not_found() {
+        const TEMPLATE: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  Func:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: example
+      Environment:
+        Variables:
+          ARN:
+            Fn::ImportValue: missing-export
+"#;
+        let tmpl = parse_template_str(TEMPLATE).unwrap();
+        let err = resolve_template_with_policy(
+            &tmpl,
+            &HashMap::new(),
+            &HashMap::new(),
+            ParsePolicy::Strict,
+            None,
+        )
+        .expect_err("strict must error");
+        assert!(matches!(err, CfnError::ImportValueNotFound(_)));
     }
 }

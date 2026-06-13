@@ -163,3 +163,84 @@ fn validate_supports_wrangler_directory_input() {
         String::from_utf8_lossy(&output.stdout).contains("All capacity constraints satisfied.")
     );
 }
+
+// -----------------------------------------------------------------------
+// ADR-0003 / Issue #38 — ParsePolicy CLI surface
+// -----------------------------------------------------------------------
+
+const CFN_TEMPLATE_REQUIRES_PARAM: &str = r#"
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  TableName:
+    Type: String
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+"#;
+
+/// Default (Lenient) generate of a CFN template missing a required parameter
+/// must succeed AND record a `missing_parameter` diagnostic in the emitted
+/// cost_model.json.
+#[test]
+fn lenient_default_emits_diagnostic_in_cost_model() {
+    let temp_dir = make_temp_dir("policy-lenient");
+    let template_path = temp_dir.join("template.yaml");
+    fs::write(&template_path, CFN_TEMPLATE_REQUIRES_PARAM).unwrap();
+    let output_path = temp_dir.join("model.json");
+
+    let output = run_yevice(&[
+        "generate",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--output",
+        output_path.to_str().unwrap(),
+    ]);
+    assert_success(&output);
+
+    let cost_model = read_cost_model(&output_path);
+    assert!(
+        cost_model
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "missing_parameter"),
+        "lenient generate must record missing_parameter diagnostic in cost_model.json; got {:?}",
+        cost_model.diagnostics
+    );
+
+    fs::remove_dir_all(temp_dir).unwrap();
+}
+
+/// The same template under top-level `--strict` must exit non-zero.
+#[test]
+fn strict_flag_exits_nonzero_on_missing_parameter() {
+    let temp_dir = make_temp_dir("policy-strict");
+    let template_path = temp_dir.join("template.yaml");
+    fs::write(&template_path, CFN_TEMPLATE_REQUIRES_PARAM).unwrap();
+    let output_path = temp_dir.join("model.json");
+
+    let output = run_yevice(&[
+        "--strict",
+        "generate",
+        "--template",
+        template_path.to_str().unwrap(),
+        "--output",
+        output_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit under --strict; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    fs::remove_dir_all(temp_dir).unwrap();
+}
