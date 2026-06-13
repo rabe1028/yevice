@@ -167,10 +167,21 @@ future adapter work）であり、policy 設計より先にアダプタ層の責
 | `ParseError(String)` | HCL 構文エラー (`hcl::Error` from 経由含む) | ✕ | remain hard error | remain hard error |
 | `Io(std::io::Error)` | ファイル IO 失敗 | ✕ | remain hard error | remain hard error |
 
-TF の本命である「未解決 `var.*` / `local.*` / cross-resource ref」は現状
-`TfError` に届かず `tracing::warn!` で握り潰されている (parser/adapter 層)。
-**Phase 1 でこれらを `TfError::UnresolvedReference { reference, location }`
+TF の本命である「未定義 `var.*` / `local.*` 参照 (resolver が解決できず残った
+シンボル)」は現状 `TfError` に届かず `tracing::warn!` で握り潰されている
+(`resolver.rs` の variable warn + `convert.rs::tf_resource_to_raw` の attr drop)。
+**Phase 1 でこれらを `TfError::UnresolvedSymbol { kind, name, location }`
 として型化し、policy 制御下に置く。** Phase スコープ節を参照。
+
+なお `TfValue::ResourceRef` (`resource.<type>.<name>.<attr>` 形式の
+cross-resource 参照) は **正常に解決された参照** として `build_connections` が
+topology edge (S3 bucket notification → Lambda, IAM role attachment 等) を
+構築するのに使う。`tf_resource_to_raw` 内で `ResourceRef` がスカラー attr 値
+としては JSON 化できず drop される (`tf_value_to_json` が `None` を返す) 経路は
+ある (`convert.rs:114` のコメント参照) が、これは「未解決」ではなく
+「dyn 表面 = JSON 化できない型」だからであり、診断対象外。`UnresolvedSymbol`
+は **resolver が解決できなかった `var.*` / `local.*` のみ** が対象で、
+cross-resource ref は対象外とする。
 
 ### Wrangler — `WranglerError` (2 variants)
 
@@ -188,17 +199,26 @@ Wrangler は変数層を持たず構造体に直接 deserialize するため、p
 - **Phase 1 (〇 + TF 型化):**
   - CFN の 4 バリアント (`MissingParameters` / `ParameterNotFound` /
     `ImportValueNotFound` / `MappingNotFound`) を `IacParseDiagnostic` 化。
-  - **TF: `TfError::UnresolvedReference { reference: String, location: Option<SourceLocation> }`
+  - **TF: `TfError::UnresolvedSymbol { kind: VariableOrLocal, name: String, location: Option<SourceLocation> }`
     バリアントを新設**し、現状 `tracing::warn!` で握り潰している
-    `var.*` / `local.*` / cross-resource ref を型化。policy 制御下に置く。
-    type system 拡張として `TfError` に新バリアントを追加する作業を含む
-    (詳細は次節)。
+    **未定義の `var.*` / `local.*` 参照のみ** を型化。policy 制御下に置く。
+    - `kind`: `VariableOrLocal::Variable` (未定義 `var.*`) / `VariableOrLocal::Local`
+      (未解決 `local.*`) の二択。
+    - `name`: 未定義の変数 / local 名 (例: `instance_type_var`)。
+    - `TfValue::ResourceRef` (`resource.<type>.<name>.<attr>`) は **対象外**。
+      resolver で解決済みの正常な参照であり `build_connections` が topology に
+      使うため、これを `UnresolvedSymbol` 扱いにすると有効な TF テンプレートを
+      reject してしまう。`tf_resource_to_raw` で `ResourceRef` がスカラー attr
+      JSON 化に失敗して drop される経路も診断対象外 (型上 JSON 化できない
+      ことに起因し、未解決ではない)。
+    - type system 拡張として `TfError` に新バリアントを追加する作業を含む
+      (詳細は次節)。
   - Wrangler は policy 引数受け取りのみで挙動は据え置き (現状で
     policy 対象バリアントなし)。
 - **Phase 2 (△ の取り込み):** CFN の `ConditionNotFound` /
   `UnsupportedResourceType` / `MissingProperty` を診断化。TF の
   `MissingAttribute` も合わせて policy 制御下に置く
-  (Phase 1 で `UnresolvedReference` が片付いているため、ここは残務)。
+  (Phase 1 で `UnresolvedSymbol` が片付いているため、ここは残務)。
 - **Phase 範囲外（恒久 hard error）:** すべての ✕ 行 — 構文エラー・IO・
   programmer error。これらは lenient でスキップすると下流で必ず破綻する。
 
@@ -210,16 +230,19 @@ Wrangler は変数層を持たず構造体に直接 deserialize するため、p
   の原因そのもの。これらを片付けることが「CFN だけ厳しい」非対称解消の中核。
 - △ の 3 つ (CFN) は「未解決」に近いが副作用が大きい（条件分岐が黙って倒れる /
   unknown resource を黙ってスキップ）ため Phase 2 送り。
-- TF の現状 `warn!` 経路は「型に上がっていない lenient 相当」であり、policy
-  制御下に置くには **新バリアント `TfError::UnresolvedReference` を Phase 1
+- TF の現状 `warn!` 経路 (resolver の variable-without-default warn と
+  `tf_resource_to_raw` の attr drop warn) のうち、**未定義 `var.*` / `local.*`
+  に起因するもののみ** を型に上げる。`ResourceRef` の JSON 化失敗経路は
+  正常動作 (cross-resource ref は topology へ流す) であり対象外。policy
+  制御下に置くには **新バリアント `TfError::UnresolvedSymbol` を Phase 1
   で導入する** 必要がある (型システム拡張)。これは CFN 側の diagnostic 化
   (既存バリアント変換) とは作業性質が異なるため Phase 1 の二本柱として明示。
 - まとめると Phase 1 は **CFN 既存 4 バリアント → diagnostic 変換 + TF
-  `UnresolvedReference` 新設 (型拡張)** の二本立て。Phase 2 は △ バリアント
-  (CFN の `ConditionNotFound` / `UnsupportedResourceType` / `MissingProperty`
-  と TF の `MissingAttribute`) を追加で policy 制御下に取り込む。
-  バリアント総数 16 に対し policy 対象は Phase 1 で 4 (CFN) + 1 (TF 新設)、
-  Phase 2 累計で 8 と限定的。
+  `UnresolvedSymbol` 新設 (var/local のみ、型拡張)** の二本立て。Phase 2 は
+  △ バリアント (CFN の `ConditionNotFound` / `UnsupportedResourceType` /
+  `MissingProperty` と TF の `MissingAttribute`) を追加で policy 制御下に
+  取り込む。バリアント総数 16 に対し policy 対象は Phase 1 で 4 (CFN) +
+  1 (TF 新設)、Phase 2 累計で 8 と限定的。
 
 ## Out of scope
 
