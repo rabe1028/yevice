@@ -38,6 +38,13 @@ use yevice_services_aws::AwsPricingCatalog;
 /// the smoke test catches a missing match arm.
 const DYNAMIC_SKU_SAMPLES: &[&str] = &[
     "aws.ec2.instance.t3.micro",
+    // EC2 Windows: prefix `aws.ec2.os.windows.<instance>` is matched
+    // separately from the Linux `aws.ec2.instance.*` arm. The Windows
+    // price table covers a smaller subset of instance types than Linux;
+    // pick one known to be priced for both OSes (e.g. `t3.medium`).
+    "aws.ec2.os.windows.t3.medium",
+    // AWS Backup warm storage: `aws.backup.warm_storage_gb_month.<engine>`.
+    "aws.backup.warm_storage_gb_month.ebs",
     // `aws.rds.<engine>.<instance>` and `aws.rds_storage.<engine>.<instance>`
     // both delegate to `rds_price(instance, engine)`.
     "aws.rds.mysql.db.t3.micro",
@@ -184,23 +191,33 @@ fn is_rust_source(path: &Path) -> bool {
         && path.file_name().is_some_and(|name| name != "mod.rs")
 }
 
-/// Scan a source file for `Sku::new("...")` and `Sku(Cow::Borrowed("..."))`
-/// literal arguments and insert each unique SKU into `out`.
+/// Scan a source file for `Sku::new("...")` literal arguments and insert
+/// each unique SKU into `out`.
 ///
 /// We do not pull in a regex crate just for this test, so the parser is a
-/// hand-written scanner: find the literal `Sku::new("`, then read until the
-/// closing `"`. Escaped quotes are not expected in SKU strings.
+/// hand-written scanner: find `Sku::new(`, skip any whitespace (including
+/// newlines — `rustfmt` splits long calls across lines), then expect an
+/// opening `"`, read until the closing `"`. Escaped quotes are not
+/// expected in SKU strings.
 fn extract_static_skus(source: &str, out: &mut BTreeSet<String>) {
-    const NEEDLE: &str = "Sku::new(\"";
+    const NEEDLE: &str = "Sku::new(";
     let mut rest = source;
     while let Some(idx) = rest.find(NEEDLE) {
         rest = &rest[idx + NEEDLE.len()..];
-        if let Some(end) = rest.find('"') {
-            let sku = &rest[..end];
+        // Skip whitespace after the opening `(` so multiline
+        // `Sku::new(\n    "..."\n)` is parsed the same as the single-line form.
+        let after_ws = rest.trim_start();
+        let Some(quoted) = after_ws.strip_prefix('"') else {
+            // Not a static string literal (e.g. `Sku::new(SOME_CONST)`),
+            // skip this occurrence and keep scanning.
+            continue;
+        };
+        if let Some(end) = quoted.find('"') {
+            let sku = &quoted[..end];
             if sku.starts_with("aws.") {
                 out.insert(sku.to_string());
             }
-            rest = &rest[end + 1..];
+            rest = &quoted[end + 1..];
         } else {
             break;
         }
