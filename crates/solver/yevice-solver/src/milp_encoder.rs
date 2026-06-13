@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 
 use yevice_core::expr::Expr;
-use yevice_core::expr_introspect::{Bounds, VarRanges, expr_bounds};
+use yevice_core::expr_introspect::{VarRanges, expr_bounds};
 use yevice_core::optimize::{
     DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
 };
@@ -172,28 +172,41 @@ pub(crate) fn encode(
         enc.register_var(name.clone(), val, val, VarType::Continuous);
     }
 
-    // 3) Encode bindings: for every binding `target = expr`, allocate a
-    //    continuous aux var for `target` and constrain it to equal the
-    //    linearization of `expr`. Fixed-param / decision-var collisions
-    //    are already handled by `register_var` (skip if present).
+    // 3) Encode bindings in two passes so the order of `problem.bindings`
+    //    does not matter. Pass A allocates a `VarId` for every binding
+    //    target (with broad default bounds — the RHS may reference targets
+    //    not yet seen). Pass B encodes each RHS and emits the linking
+    //    equality `target == linearize(expr)`. This matches the fixed-point
+    //    semantics enforced by `validate_bindings` and `EnumerationSolver`.
+    let mut binding_target_ids: Vec<Option<VarId>> = Vec::with_capacity(problem.bindings.len());
     for binding in &problem.bindings {
         if enc.var_index.contains_key(&binding.target) {
             // Target shadowed by fixed_param or decision_var → skip.
+            binding_target_ids.push(None);
             continue;
         }
-        // Allocate the target. Bounds come from interval arithmetic on the
-        // RHS expression so the backend has tight bounds for big-M usage.
-        let bounds = expr_bounds(&binding.expr, &enc.ranges);
-        let (lo, hi) = finite_or_default(bounds, -1e30, 1e30);
-        let target_id = enc.backend.add_var(lo, hi, 0.0, VarType::Continuous);
+        // Default to a very wide interval; bindings whose RHS we can already
+        // bound tightly will see tighter ranges after `expr_bounds` is
+        // applied in pass B (we cannot do it here because the RHS may
+        // reference other not-yet-registered targets).
+        let target_id = enc.backend.add_var(-1e30, 1e30, 0.0, VarType::Continuous);
         enc.var_index.insert(binding.target.clone(), target_id);
-        // Update ranges so subsequent expressions see this var's bounds.
-        enc.ranges
-            .decision_var_ranges
-            .insert(binding.target.clone(), (lo, hi));
+        binding_target_ids.push(Some(target_id));
+    }
+    for (binding, target_opt) in problem.bindings.iter().zip(binding_target_ids.iter()) {
+        let Some(target_id) = *target_opt else {
+            continue;
+        };
+        // Update ranges from the now-resolvable RHS so downstream Max/Min
+        // big-M derivation sees a finite interval where possible.
+        let bounds = expr_bounds(&binding.expr, &enc.ranges);
+        if bounds.is_finite() {
+            enc.ranges
+                .decision_var_ranges
+                .insert(binding.target.clone(), (bounds.lower, bounds.upper));
+        }
         // Constrain: target == linearize(expr).
         let lhs = encode_expr(&mut enc, &binding.expr)?;
-        // (target - lhs) == 0
         let combined = LinearTerms::from_var(target_id, 1.0).sub(lhs);
         emit_linear_eq(enc.backend, &combined, 0.0);
     }
@@ -235,20 +248,6 @@ fn build_ranges(problem: &OptimizationProblem) -> VarRanges {
         ranges.fixed_params.insert(name.clone(), v);
     }
     ranges
-}
-
-fn finite_or_default(b: Bounds, default_lo: f64, default_hi: f64) -> (f64, f64) {
-    let lo = if b.lower.is_finite() {
-        b.lower
-    } else {
-        default_lo
-    };
-    let hi = if b.upper.is_finite() {
-        b.upper
-    } else {
-        default_hi
-    };
-    (lo, hi)
 }
 
 /// Encode a single decision variable as a 1-of-N binary indicator set.
@@ -422,10 +421,19 @@ fn encode_max(enc: &mut Encoder<'_>, inner: &Expr, floor: f64) -> Result<LinearT
     let m = enc.alloc_aux(m_lo, m_hi, VarType::Continuous);
     let z = enc.alloc_aux(0.0, 1.0, VarType::Binary);
 
-    // big-M sized to span both sides comfortably.
-    let big_m = (b.upper - b.lower)
+    // big-M must dominate the slack of the *disabled* side of every
+    // inequality. For z=0 (selecting `expr`):
+    //   - `m ≤ floor + M·z` collapses to `m ≤ floor + 0`. The active side
+    //     `m = expr` can reach `b.upper`, so M ≥ b.upper - floor.
+    // For z=1 (selecting `floor`):
+    //   - `m ≤ expr + M·(1 - z)` collapses to `m ≤ expr`. The active side
+    //     `m = floor` must not be cut off when `expr` can dip down to
+    //     `b.lower`, so M ≥ floor - b.lower.
+    // Take the max of both legs (and the interval width, for headroom).
+    let big_m = (b.upper - floor)
         .abs()
-        .max((b.upper - floor).abs())
+        .max((floor - b.lower).abs())
+        .max((b.upper - b.lower).abs())
         .max(1.0)
         + 1.0;
 
@@ -465,8 +473,11 @@ fn encode_min(
     let m = enc.alloc_aux(m_lo, m_hi, VarType::Continuous);
     let z = enc.alloc_aux(0.0, 1.0, VarType::Binary);
 
-    let big_m = (b.upper - b.lower)
+    // Same two-leg derivation as encode_max, dual sign.
+    let big_m = (b.upper - ceiling)
         .abs()
+        .max((ceiling - b.lower).abs())
+        .max((b.upper - b.lower).abs())
         .max((ceiling - b.lower).abs())
         .max(1.0)
         + 1.0;

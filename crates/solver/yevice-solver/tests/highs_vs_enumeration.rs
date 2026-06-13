@@ -185,6 +185,97 @@ fn ceil_minimization_le_constraint() {
 }
 
 #[test]
+fn max_with_floor_above_range() {
+    // Codex P1 regression: floor sits above the inner's interval, so
+    // big-M must cover (floor - lower) on the other leg.
+    //   minimize max(x, 100) + x,  x ∈ {0, 5, 10}  → max=100, total=100.
+    let problem = OptimizationProblem {
+        objective: Expr::sum(vec![
+            Expr::Max {
+                expr: Box::new(Expr::variable("x")),
+                floor: 100.0,
+            },
+            Expr::variable("x"),
+        ]),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![0.0, 5.0, 10.0],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings: vec![],
+    };
+    let e = EnumerationSolver.solve(&problem).unwrap();
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(e.feasible && h.feasible);
+    assert_close(e.objective_value, h.objective_value, "max floor-above");
+    assert!((h.objective_value - 100.0).abs() < 1e-4);
+}
+
+#[test]
+fn product_constant_times_ceil() {
+    // Codex P2 regression: `2.0 * ceil(x)` should classify the ceil as
+    // positive in a minimization objective (auto-tight), not Unknown.
+    let problem = OptimizationProblem {
+        objective: Expr::product(vec![Expr::constant(2.0), Expr::ceil(Expr::variable("x"))]),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![0.5, 1.5],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings: vec![],
+    };
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(h.feasible, "constant * ceil(...) must be accepted");
+    // x=0.5 → 2 * ceil(0.5) = 2 * 1 = 2.
+    assert!((h.objective_value - 2.0).abs() < 1e-4);
+}
+
+#[test]
+fn binding_target_referenced_before_definition() {
+    // Codex P2 regression: a binding `b = a + 1` listed BEFORE the
+    // binding `a = x` must still resolve via the encoder's two-pass
+    // target-registration strategy.
+    use yevice_core::cost::VariableBinding;
+    let bindings = vec![
+        VariableBinding {
+            target: VariableName::new("b"),
+            expr: Expr::linear(1.0, Expr::variable("a"), 1.0),
+            description: "b = a + 1".into(),
+            source: "test".into(),
+        },
+        VariableBinding {
+            target: VariableName::new("a"),
+            expr: Expr::variable("x"),
+            description: "a = x".into(),
+            source: "test".into(),
+        },
+    ];
+    let problem = OptimizationProblem {
+        objective: Expr::variable("b"),
+        direction: ObjectiveDirection::Minimize,
+        decision_variables: vec![DecisionVariable {
+            name: VariableName::new("x"),
+            domain: vec![1.0, 2.0],
+        }],
+        constraints: vec![],
+        fixed_params: HashMap::new(),
+        bindings,
+    };
+    let e = EnumerationSolver.solve(&problem).unwrap();
+    let h = highs_solver().solve(&problem).unwrap();
+    assert!(e.feasible && h.feasible);
+    assert_close(
+        e.objective_value,
+        h.objective_value,
+        "out-of-order bindings",
+    );
+}
+
+#[test]
 fn infeasible_problem_consistent() {
     // x ∈ {1,2,3}, constraint x >= 100 → infeasible.
     let problem = OptimizationProblem {

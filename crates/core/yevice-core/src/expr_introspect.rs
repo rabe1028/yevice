@@ -690,21 +690,25 @@ fn walk(expr: &Expr, outer: CoeffSign, out: &mut Vec<(String, CoeffSign)>) {
             // Conservative pass: walk each child with sign = outer * (product
             // of sibling constants); when a sibling is non-constant, mark
             // Unknown.
+            // Compute the product of all constant-only factors plus a count
+            // of variable-containing (non-constant) factors. Linearizable
+            // expressions have at most one such non-constant factor; if more
+            // than one appears, we cannot determine the sign of a ceil that
+            // hides inside any single factor.
             let mut all_const_product = 1.0;
-            let mut has_non_constant_sibling = false;
+            let mut non_constant_count = 0usize;
             for e in exprs {
                 match e.as_linear() {
                     Some(lf) if lf.coefficients.values().all(|&c| c == 0.0) => {
                         all_const_product *= lf.constant;
                     }
                     _ => {
-                        has_non_constant_sibling = true;
+                        non_constant_count += 1;
                     }
                 }
             }
             for e in exprs {
-                // If this child is itself a constant factor, no ceil hides
-                // inside it (constants have no ceil).
+                // Constant-only factors contain no ceil to classify.
                 let is_const = matches!(
                     e.as_linear(),
                     Some(ref lf) if lf.coefficients.values().all(|&c| c == 0.0)
@@ -712,17 +716,15 @@ fn walk(expr: &Expr, outer: CoeffSign, out: &mut Vec<(String, CoeffSign)>) {
                 if is_const {
                     continue;
                 }
-                // Sibling constant product (excluding this child).
-                // Since at most one variable-containing factor is supported
-                // for linearizability, sibling constants ARE the full
-                // `all_const_product` here.
-                let sibling_product = all_const_product;
-                let child_outer = if has_non_constant_sibling {
-                    // Two non-constant factors: any ceil under one is hard to
-                    // classify. Mark Unknown.
+                // Walking child `e` itself — siblings are the *other* children.
+                // For a linearizable Product (non_constant_count <= 1) every
+                // sibling is constant, so sibling product = all_const_product.
+                // Only when there are TWO+ non-constant factors do we lose
+                // sign information.
+                let child_outer = if non_constant_count > 1 {
                     CoeffSign::Unknown
                 } else {
-                    multiply_sign(outer, sibling_product)
+                    multiply_sign(outer, all_const_product)
                 };
                 walk(e, child_outer, out);
             }
