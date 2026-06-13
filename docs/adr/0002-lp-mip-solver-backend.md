@@ -1,6 +1,6 @@
 # ADR 0002: LP/MIP Solver Backend
 
-**Status:** Proposed
+**Status:** Accepted (2026-06-13). Refs #37.
 
 ## Context
 
@@ -30,45 +30,103 @@ linear backend must accept a MILP encoding for them or refuse the problem.
 
 | Option | Pros | Cons |
 |---|---|---|
-| **HiGHS** (via `highs` crate or `good_lp`) | Best-in-class open LP/MIP, BSD-friendly, active upstream. | C++ dep; build complexity on Windows. |
-| **CBC** (COIN-OR) | Mature, broad coverage. | Slow vs HiGHS; weaker MILP performance. |
-| **`good_lp`** (Rust facade) | Pluggable backend (HiGHS / CBC / minilp / Cplex). | Limited expressiveness for MILP shaping. |
-| **Hand-rolled MILP** | Zero external deps; full control. | Months of work; immature numerics. |
+| **A. HiGHS via `good_lp`** | Pluggable backend layer, well-trodden path. | `good_lp` の表現力が MILP shaping (big-M / SOS2 / 自前 introspection) で足を引っ張る。 |
+| **B. HiGHS directly via `highs` crate, no facade** | Full control over encoding; one less abstraction layer. | 他バックエンド (CBC 等) を後で足す時に独自 facade を書く必要。 |
+| **C. 自前 `MilpBackend` trait + `highs` crate 初期実装** | trait 境界で encoder / solver を分離。CBC や別ソルバを将来差し替え可能。expr_introspect を共通化できる。 | facade 設計の手間。最初の実装は HiGHS のみ。 |
+| **D. Hand-rolled MILP** | Zero external deps. | Months of work; immature numerics. 採用しない。 |
 
 ## Tiered / Ceil / Max / Min MILP formulations (sketch)
 
-- `Tiered(tiers, var)` → piecewise-linear. Standard reformulation: introduce
-  one continuous "fill" variable per tier `q_i ∈ [0, width_i]`, plus binary
-  activators `z_i` with the SOS2-style chain `z_i ≥ z_{i+1}`,
+- `Tiered(tiers, var)` → piecewise-linear. **Incremental (fill) formulation**:
+  introduce one continuous "fill" variable per tier `q_i ∈ [0, width_i]`,
+  plus binary activators `z_i` with the chain `z_i ≥ z_{i+1}`,
   `q_i ≤ width_i · z_i`, `q_i ≥ width_i · z_{i+1}`, and the link
   `var = Σ q_i`. Objective contribution = `Σ price_i · q_i`.
-- `Ceil(expr)` → integer variable `y` with `expr ≤ y ≤ expr + 1 − ε`.
+  SOS2 を直接利用せず線形不等式のみで表現する (CBC / 他バックエンド互換)。
+- `Ceil(expr)` → 整数変数 `y` で `expr ≤ y ≤ expr + 1` (ε 不要、両端閉)。
 - `Max(expr − k, 0)` (free-tier shape) → `m ≥ expr − k`, `m ≥ 0`,
   plus big-M to keep `m` tight: `m ≤ expr − k + M(1 − z)`, `m ≤ M · z`.
 - `Min` is the dual; use the same trick with reversed signs.
 
-These all rely on tight big-M values: the encoder must compute domain bounds
-for each subexpression up-front so big-M doesn't bloat the relaxation.
+big-M 値は `expr_introspect::expr_bounds(e, params, ranges)` で自動推定する。
+無限値が出る場合は `SolverError::UnboundedExpression` で reject。
 
-## Recommendation
+## Decision
 
-1. **Backend**: HiGHS via `good_lp` (`good_lp = { version = "*", features = ["highs"] }`).
-   Best MILP performance with the least bespoke glue.
-2. **Feature gate**: `--features lp` on `yevice-solver`. The default build
-   stays dep-free (`EnumerationSolver` only).
-3. **Factory wiring**: `solver_from_name("lp")` returns the new backend when
-   the feature is on, otherwise `UnknownSolver { allowed: [...] }`.
-4. **Encoder**: a new module `yevice_solver::milp` translating `Expr` →
-   linear form, lowering `Tiered`/`Ceil`/`Max`/`Min` to auxiliary variables
-   with the formulations above. Reject expressions it can't encode with an
-   explicit error pointing at the offending sub-expression.
+**Option C — 自前 `MilpBackend` trait + `highs` クレートで初期実装。**
+
+### Expr カバレッジ
+
+- 線形化可能な shape のみサポート。
+- `var * var` / `var / var` (decision var 同士の積/商) は
+  `SolverError::Nonlinear { expr: String }` で reject。
+- **本番リスク評価:** リポジトリ全体で `var * var` / `var / var` は
+  実装ゼロ件 (`expr_introspect` で確認済み)。reject 戦略で十分。
+
+### 検出タイミング
+
+solve 冒頭で **プリチェック**。新設関数:
+
+```rust
+pub fn expr_is_linearizable(expr: &Expr, decision_vars: &[VarId]) -> Result<(), SolverError>;
+```
+
+`yevice-solver::expr_introspect` に追加。MILP 問題構築前に走らせて、
+非線形 shape を含む式を早期 reject する。
+
+### 離散 decision variable の扱い
+
+各 candidate value に binary indicator `z_i` を割り当て、`Σz_i = 1` 制約で
+正確に 1 つ選択。連続値の decision var は使わない (現状の domain モデルが
+discrete のため)。
+
+### Feature gate
+
+- `Cargo.toml` の `default = []` (デフォルト無効)
+- `--features highs` で有効化、`MilpBackend` impl が登場
+- enumeration は常に有効
+
+### CLI flags
+
+- `--solver enumeration|highs` (デフォルト `enumeration`)
+- HiGHS 指定時のみ有効化:
+  - `--time-limit <seconds>`
+  - `--mip-gap <ratio>`
+  - `--threads <n>`
+
+### enumeration へのフォールバック
+
+**自動フォールバックなし。** `--solver highs` 指定下で reject が起きたら
+エラーメッセージで `--solver enumeration` の利用を案内するに留める。
+silent fallback はベンチマーク再現性と user surprise の観点で禁止。
+
+### Property test
+
+`proptest` で **domain size ≤ 50 / constraints ≤ 5** の小問題を生成し、
+両ソルバーの最適値が次の許容範囲に収まることを確認:
+
+```
+|cost_enum - cost_milp| ≤ max(abs_tol, rel_tol * |cost_enum|)
+```
+
+具体値は `abs_tol = 1e-6`, `rel_tol = 1e-9` を初期値とする (HiGHS のデフォ
+ルト feasibility tolerance に揃える)。
+
+### CI
+
+`highs-sys` の **vendored ビルド可能性を着手時に調査**:
+
+- vendored build が全 OS で通る → CI 標準で `--features highs` 有効化
+- vendored が macOS/Windows で通らない → Linux 限定 feature とし、
+  非 Linux ビルドでは `MilpBackend` impl をコンパイル対象外にする
 
 ## Consequences
 
-- Adds a non-trivial native dep; CI must cover Linux + macOS + Windows.
-- `Expr::as_linear` keeps returning `None` for non-linear shapes; the MILP
-  encoder grows its own dispatch. (Symmetric, no breaking change.)
-- Enumeration stays the source of truth for golden tests — the MILP backend
-  is validated against it on every problem small enough to enumerate.
-- Future ADR will pick a strategy for **stochastic / non-convex** shapes
-  (e.g. exchange-rate scenarios from ADR-0001) once the LP path is in.
+- `yevice-solver` に `MilpBackend` trait と `HighsBackend` impl を追加。
+- `expr_introspect` に `expr_is_linearizable` / `expr_bounds` を新設。
+- CLI に solver 選択フラグ + HiGHS チューニングフラグを追加。
+- `proptest` ベースの cross-solver 検証スイート追加。
+- Enumeration はテスト golden / 小問題の source of truth として残る。
+- 将来の CBC / Cplex 等は同じ `MilpBackend` trait の別 impl として追加可能。
+- 将来 ADR で stochastic / non-convex shapes (ADR-0001 の為替シナリオ等)
+  を扱う。
