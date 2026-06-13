@@ -167,34 +167,65 @@ label, expr, components, required_variables }` を含む。Expr 自体は dimens
   - Pros: schema 変更なし。
   - Cons: cost_model.json が self-contained でなくなる。SKU/region/effective-date
     の組から PricingMetadata を再構築する負担が評価側に残る。
-- **案 (b, 採用)**: `CostComponent` に `currency: &'static str` を追加 (`name`,
-  `expr`, `currency` の 3 フィールド構成)。SKU lookup 時に確定した通貨を焼き込む。
-  - Pros: cost_model.json が self-contained (PricingMetadata なしで評価可能)。
-    リソース内で SKU が複数通貨にまたがるケースも `CostComponent` 単位で正しく
-    扱える。`CostComponent` は既に SKU 粒度に近い自然な境界。
-  - Cons: schema 破壊変更 (フィールド追加)。既存 cost_model.json は再生成が必要。
-- **案 (c)**: `ResourceCost` 全体に 1 つの `currency` フィールド。リソース内で
-  通貨混在しない前提を置く。
+- **案 (b)**: `CostComponent` のみに `currency: &'static str` を追加。
+  - Pros: SKU 粒度に最も近い。
+  - Cons: `ResourceCost.components` が空 (`vec![]`) のサービスでは通貨情報が
+    どこにも乗らない。`evaluate_architecture` の現実装は `components` が空または
+    部分評価失敗時に `ResourceCost.expr` を直接評価する経路を持つため、現状
+    AWS service 実装 57 件中 **9 件以上** が `components: vec![]` で完結しており、
+    主要パスで通貨が失われる。
+- **案 (b+, 採用)**: `ResourceCost` と `CostComponent` の **二段持ち** で
+  リソース全体のデフォルト通貨 + コンポーネント単位のオーバーライドを表現。
+  ```rust
+  pub struct ResourceCost {
+      // ... 既存フィールド ...
+      pub currency: Option<&'static str>,   // 追加: リソース全体のデフォルト
+  }
+  pub struct CostComponent {
+      pub name: String,
+      pub expr: Expr,
+      pub currency: Option<&'static str>,   // 追加: コンポーネント単位の override
+  }
+  ```
+  - Pros: `components` 空のサービスでも `ResourceCost.currency` で通貨を保持できる。
+    コンポーネント単位で混在する場合 (例: AWS region SKU + サードパーティ SKU)
+    は `CostComponent.currency` で override 可能。cost_model.json は依然
+    self-contained。
+  - Cons: フィールドが 2 段になり優先順位ルールが必要。
+- **案 (c)**: `ResourceCost` 全体に 1 つの `currency` フィールド (混在不可)。
   - Pros: フィールド数最小。
-  - Cons: リソース内 SKU 混在通貨 (例: AWS US region SKU + サードパーティ SKU)
-    を扱えない。前提が将来崩れる可能性。
+  - Cons: リソース内 SKU 混在通貨を扱えない。
 
-**採用: 案 (b)**。理由: cost_model.json の self-contained 性が高まる
-(PricingMetadata なしでも評価可能)、リソース内 SKU 混在通貨も扱える、
-`CostComponent` は既に存在する自然な粒度で SKU 単位の通貨を焼き込むのに適切。
+**採用: 案 (b+)**。理由: 案 (b) 単独では `evaluate_architecture` の
+`components` 空経路で通貨情報が完全に失われる (実装調査で 9 件以上の AWS
+service が該当)。`ResourceCost` レベルでもデフォルト通貨を持つことで全経路で
+通貨を保持しつつ、コンポーネント単位の混在も `Option` の override で表現できる。
 
-具体的な schema 変更:
+#### 優先順位ルール
 
-```rust
-pub struct CostComponent {
-    pub name: String,
-    pub expr: Expr,
-    pub currency: &'static str,  // 追加: SKU lookup 時に確定
-}
-```
+`ArchitectureResult.totals_by_currency` への積み上げ時、評価する各値の通貨は
+以下の順で解決する:
 
-`ResourceCost` 集約時には子 `CostComponent.currency` を集めて `Money` に
-erase し、`ArchitectureResult.totals_by_currency` に積み上げる。
+1. `CostComponent.currency` が `Some` ならそれを使用
+2. それが `None` なら親 `ResourceCost.currency` を使用
+3. それも `None` なら評価時に `PricingMetadata` 経由でルックアップ (fallback)
+4. PricingMetadata でも解決できない場合は migration 期間の暫定処理として
+   `"USD"` 扱い (warn ログを出して可視化)
+
+`ArchitectureCost` レベルでは通貨を保持しない。複数リソースで混在し得るため、
+集約は `BTreeMap<&'static str, f64>` で個別管理する (Layer 3 の erase 仕様と
+整合)。
+
+#### 後方互換 (migration period)
+
+- 既存 cost_model.json は `currency` フィールドなしで serialize されていた。
+  `#[serde(default)]` で `None` に deserialize し、評価時に上記 fallback
+  (USD + warn) を適用する。
+- 新規生成される cost_model.json は SKU lookup 時に `ResourceCost.currency`
+  へ通貨を必ず焼き込む。`CostComponent.currency` は混在が起きるケースだけ
+  `Some` で埋める。
+- migration 期間終了 (全 cost_model.json 再生成後) に `Option` を外して
+  `&'static str` (必須) に絞り込むかは別 Issue で判断。
 
 ### 主要な配線変更
 
@@ -211,8 +242,11 @@ erase し、`ArchitectureResult.totals_by_currency` に積み上げる。
 - 評価結果型の破壊変更: `ArchitectureResult.total_monthly_cost: f64` →
   `totals_by_currency: BTreeMap<&'static str, f64>` + `display_total: Option<Money>`、
   `ResourceResult.monthly_cost: f64` → `Money`。
-- cost_model.json schema の破壊変更: `CostComponent` に `currency: &'static str`
-  フィールドを追加 (案 b)。既存 cost_model.json は再生成が必要。
+- cost_model.json schema の拡張: `ResourceCost` と `CostComponent` の双方に
+  `currency: Option<&'static str>` を追加 (案 b+)。`#[serde(default)]` により
+  既存 cost_model.json は再生成なしで deserialize 可能 (None → 評価時に USD
+  fallback + warn)。優先順位は `CostComponent.currency` > `ResourceCost.currency`
+  > `PricingMetadata` ルックアップ > USD fallback。
 - CLI に `--display-currency` フラグを追加、未指定混在時の警告を実装。
 - f64 → Decimal、Hourly/Yearly 変換は本 ADR の射程外。
 - Option A 全面適用 (Expr AST まで型化) は採らない。AST を dimensionless
