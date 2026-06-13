@@ -267,27 +267,61 @@ pub(crate) fn encode(
     //    equality `target == linearize(expr)`. This matches the fixed-point
     //    semantics enforced by `validate_bindings` and `EnumerationSolver`.
     //
-    //    Duplicate-target handling: when multiple bindings share the same
-    //    target, `resolve_bindings_into` (yevice-core) uses a fixed-point
-    //    loop that skips already-resolved targets, which means the **first**
-    //    binding that successfully resolves wins.  In practice that is the
-    //    last resolvable binding encountered in order (earlier ones with
-    //    missing variables are skipped until a later one supplies the
-    //    value).  The encoder mirrors this by pre-computing, for each target
-    //    name, the index of the **last** binding that has not already been
-    //    shadowed by a decision variable or fixed param.  Only that binding
-    //    gets a real `VarId`; earlier duplicates are marked `None` (skipped
-    //    in Pass B) so the encoder never tries to linearize an unresolvable
-    //    RHS.
-    let last_binding_index_for_target: BTreeMap<&VariableName, usize> = problem
-        .bindings
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| !enc.var_index.contains_key(&b.target))
-        .fold(BTreeMap::new(), |mut m, (i, b)| {
-            m.insert(&b.target, i);
-            m
-        });
+    //    Duplicate-target handling: `resolve_bindings_into` (yevice-core)
+    //    uses a fixed-point loop that skips already-resolved targets, so the
+    //    **first** binding that successfully resolves wins.  For example,
+    //    `b = x; b = missing` resolves `b = x` in the first pass and then
+    //    skips the second binding because `b` is already in `params`.
+    //
+    //    The encoder mirrors this first-resolvable semantics by running its
+    //    own fixed-point loop (Pass A pre-computation).  A binding is
+    //    considered "resolvable" when every variable referenced in its
+    //    normalised RHS is already registered in `enc.var_index` (decision
+    //    vars, fixed params, or an already-selected binding target) *and* no
+    //    earlier binding for the same target has already been selected.  Only
+    //    the first such binding per target gets a real `VarId`; later
+    //    duplicates are marked `None` (skipped in Pass B).
+    let first_resolvable_index_for_target: BTreeMap<&VariableName, usize> = {
+        // Seed a "resolved" set with targets already covered by decision
+        // variables and fixed params (i.e. already in enc.var_index).
+        let mut resolved: std::collections::BTreeSet<&VariableName> =
+            enc.var_index.keys().collect();
+        let mut result: BTreeMap<&VariableName, usize> = BTreeMap::new();
+        let max_passes = problem.bindings.len() + 1;
+        for _ in 0..max_passes {
+            let mut progressed = false;
+            for (i, (binding, rhs_expr)) in problem
+                .bindings
+                .iter()
+                .zip(normalised_bindings.iter())
+                .enumerate()
+            {
+                // Skip targets already resolved (decision/fixed-param/earlier binding).
+                if resolved.contains(&binding.target) {
+                    continue;
+                }
+                // Skip if we already picked a binding for this target.
+                if result.contains_key(&binding.target) {
+                    continue;
+                }
+                // A binding is resolvable if every variable in its normalised
+                // RHS is already registered in var_index or resolved so far.
+                let all_vars_known = rhs_expr
+                    .variables()
+                    .iter()
+                    .all(|v| enc.var_index.contains_key(v) || result.contains_key(v));
+                if all_vars_known {
+                    result.insert(&binding.target, i);
+                    resolved.insert(&binding.target);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        result
+    };
     let mut binding_target_ids: Vec<Option<VarId>> = Vec::with_capacity(problem.bindings.len());
     for (i, binding) in problem.bindings.iter().enumerate() {
         if enc.var_index.contains_key(&binding.target) {
@@ -295,10 +329,9 @@ pub(crate) fn encode(
             binding_target_ids.push(None);
             continue;
         }
-        if last_binding_index_for_target.get(&binding.target) != Some(&i) {
-            // An earlier binding for this target: a later (last) binding will
-            // be the authoritative one. Skip here to avoid encoding an
-            // unresolvable RHS.
+        if first_resolvable_index_for_target.get(&binding.target) != Some(&i) {
+            // Not the first-resolvable binding for this target: skip to avoid
+            // encoding an unresolvable RHS or overriding the chosen one.
             binding_target_ids.push(None);
             continue;
         }
@@ -953,14 +986,15 @@ mod tests {
 
     /// Duplicate binding targets: `b = missing_var; b = x`.
     ///
-    /// Before the fix, the encoder would attempt to encode the first (unresolvable)
-    /// binding and fail with `UnboundVariables`.  After the fix it picks only the
-    /// last binding for `b` and encodes `b = x` successfully.
+    /// `resolve_bindings_into` adopts first-resolvable semantics: the first
+    /// binding whose RHS can be evaluated wins.  Here `b = missing_var` is
+    /// unresolvable (missing_var is never defined), so `b = x` — the first
+    /// *resolvable* binding — is adopted.
     #[test]
-    fn encode_last_binding_wins_for_duplicate_target() {
+    fn encode_first_resolvable_binding_wins_for_duplicate_target() {
         // objective = b, direction = Minimize, decision variable x in {1.0}
-        // binding[0]: b = missing_var  (unresolvable)
-        // binding[1]: b = x            (resolvable — last binding for `b`)
+        // binding[0]: b = missing_var  (unresolvable — missing_var never defined)
+        // binding[1]: b = x            (first-resolvable binding for `b`)
         let problem = OptimizationProblem {
             objective: Expr::variable("b"),
             direction: ObjectiveDirection::Minimize,
@@ -980,7 +1014,39 @@ mod tests {
         let result = encode(&mut backend, &problem);
         assert!(
             result.is_ok(),
-            "encode must succeed when the last binding for a target is resolvable; got: {:?}",
+            "encode must succeed when the first-resolvable binding for a target is resolvable; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Regression: `b = x; b = missing` — first binding is resolvable, second
+    /// is not.  The encoder must adopt `b = x` (first-resolvable), not
+    /// `b = missing` (last).
+    #[test]
+    fn encode_first_binding_wins_when_later_is_unresolvable() {
+        // objective = b, direction = Minimize, decision variable x in {1.0}
+        // binding[0]: b = x        (first-resolvable — should be adopted)
+        // binding[1]: b = missing  (unresolvable — must NOT shadow b = x)
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![
+                binding("b", Expr::variable("x")),
+                binding("b", Expr::variable("missing")),
+            ],
+        };
+
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must adopt first-resolvable binding `b = x` and ignore later unresolvable `b = missing`; got: {:?}",
             result.err()
         );
     }
