@@ -1,6 +1,6 @@
 # ADR 0001: Currency and Time Dimensions in Cost Expressions
 
-**Status:** Proposed
+**Status:** Accepted (2026-06-13). Refs #36.
 
 ## Context
 
@@ -65,26 +65,102 @@ existing callers are unaffected until they opt in.
 **Cons:** Two-step evaluation; risk of callers skipping the normalizer and
 reporting raw values.
 
-## Recommendation
+## Decision
 
-**Option C** is the recommended starting point.
+**Option B 変形 — Phantom type at SKU→component, erase at component→architecture.**
 
-Rationale:
-- It requires no changes to `Expr` or the existing service implementations,
-  keeping backward compatibility while `Expr` gains stability under
-  `#[non_exhaustive]`.
-- Unit conversion is a cross-cutting concern that belongs outside the
-  expression engine; it can be introduced incrementally and adopted per
-  service.
-- If strong compile-time enforcement becomes necessary, Option A can be
-  layered on top later — but only after the conversion layer has stabilised
-  the required unit vocabulary.
+`Expr` 自体は dimensionless のまま据え置き、評価結果に通貨/期間メタデータを
+伴わせる方針 (Option B) を採るが、Layer によって表現を切り替える:
+
+### Phantom type の適用範囲
+
+- **Layer 1 (SKU lookup → CostComponent):** `Currency<f64, C: CurrencyCode>`
+  を保持。`PricingMetadata.currency` を実際に読んで型パラメータとして引き
+  回し、SKU の通貨ミスマッチをコンパイル時に検出する。
+- **Layer 2 (CostComponent → ResourceCost):** 境界で
+  `Money { value: f64, currency: &'static str, period: BillingPeriod }`
+  に erase。複数 SKU を集約する時点で型レベルの通貨情報は失われるが、
+  値レベルでは保持される。
+- **Layer 3 (ResourceCost → Architecture):** `BTreeMap<&'static str, f64>`
+  (`totals_by_currency`) に集約。`Architecture` 全体ではもはや通貨は
+  単一とは限らないため、通貨別合計を辞書で持つ。
+
+### 通貨型の表現
+
+Marker struct + trait:
+
+```rust
+pub trait CurrencyCode { const CODE: &'static str; }
+pub struct USD; impl CurrencyCode for USD { const CODE: &'static str = "USD"; }
+pub struct EUR; impl CurrencyCode for EUR { const CODE: &'static str = "EUR"; }
+pub struct JPY; impl CurrencyCode for JPY { const CODE: &'static str = "JPY"; }
+```
+
+### `BillingPeriod`
+
+```rust
+pub enum BillingPeriod { Monthly, Hourly, Yearly, /* reserved */ }
+```
+
+Phase 1 では `Monthly` のみ実装。他バリアントは型として予約し、cross-period
+変換 (Hourly→Monthly 等) は別 Issue で対応する。
+
+### CLI フラグ
+
+`--display-currency <CODE>`:
+
+| ケース | 挙動 |
+|---|---|
+| 未指定 + 全通貨同一 | そのまま表示 |
+| 未指定 + 混在 | `tracing::warn!` + 通貨別内訳のみ表示 (synthetic total なし) |
+| 指定あり + rate 完備 | 指定通貨に換算して表示 |
+| 指定あり + rate 欠落 | hard error (`FxError::MissingRate`) |
+
+### `ExchangeRates` trait
+
+最初から日付パラメータを焼く:
+
+```rust
+pub trait ExchangeRates {
+    fn rate(&self, from: &str, to: &str, at: RateDate) -> Result<Rate, FxError>;
+}
+pub enum RateDate { Monthly(YearMonth), Spot(DateTime<Utc>) }
+```
+
+monthly estimate (請求月平均) と spot rate (リアルタイム) を別概念として
+シグネチャに表現する。Phase 1 の実装は `Monthly` のみで OK。
+
+### Serialize/Deserialize
+
+`Currency<f64, C>` の deserialize 時に通貨コードが不一致なら
+`serde::de::Error::custom(...)` で Result 返却。**panic は禁止**。
+
+### スコープ外
+
+- **`f64` → `Decimal` 化**: 別 Issue (#TBD) として保留。誤差解析と
+  HiGHS encoder への影響範囲が別問題のため。
+- **Hourly/Yearly の cross-period 変換ロジック**: 別 Issue。
+
+### 破壊変更
+
+既存の `ResourceCost.total_monthly_cost: f64` は **完全置換**。互換 alias
+は持たない。メジャーリリース扱いとして CHANGELOG に明記する。
+
+### 主要な配線変更
+
+- `PricingMetadata.currency` を Layer 1 の SKU lookup 側で実際に読み取り、
+  `Currency<f64, C>` の型パラメータ決定に使う。現状は metadata に存在する
+  が読まれていない。
 
 ## Consequences
 
-- A `CostContext` struct and `CostNormalizer` trait will be introduced in a
-  future PR; existing `evaluate()` signature is unchanged.
-- Service implementations may continue returning monthly-USD `f64` values
-  until they explicitly opt in to the normalizer.
-- Exchange-rate data sourcing is deferred; an initial implementation may
-  assume a fixed rate table or a no-op (USD identity) normalizer.
+- `yevice-pricing` に `Currency<T, C>` / `Money` / `BillingPeriod` /
+  `ExchangeRates` を新設。
+- `PriceCatalog` 系トレイトの返り値は `Currency<f64, C>` に変わる
+  (provider crate 側で `C` を確定)。
+- `Architecture` のシリアライズ JSON スキーマが破壊変更
+  (`total_monthly_cost: f64` → `totals_by_currency: { "USD": ... }`).
+- CLI に `--display-currency` フラグを追加、未指定混在時の警告を実装。
+- f64 → Decimal、Hourly/Yearly 変換は本 ADR の射程外。
+- Option A 全面適用 (Expr AST まで型化) は採らない。AST を dimensionless
+  に保つことで MILP encoder (ADR-0002) との結合度を下げる効果を維持する。
