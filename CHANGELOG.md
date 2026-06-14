@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `IacPropertyValue` enum (`Concrete`, `ResourceRef`, `ResourceAttr`,
+  `Interpolated`) and `IacStringPart` enum (`Literal`, `Ref`, `Attr`) in
+  `yevice-service-api::iac`. Both types are `#[non_exhaustive]` and derive
+  `Serialize, Deserialize, Debug, Clone, PartialEq`. Refs #39.
+
+### Changed
+
+- `RawCfnResource.properties` is now `BTreeMap<String, IacPropertyValue>`.
+  The CFN convert layer (`resolved_to_cfn_property`) now emits typed
+  `ResourceRef` / `ResourceAttr` for single-ref values and
+  `IacPropertyValue::Interpolated` for multi-part `Fn::Sub`-style values
+  instead of rendering them as `${...}` concrete strings. Refs #39.
+- `RawTfResource.attrs` is now `HashMap<String, IacPropertyValue>`.
+  `TfValue::ResourceRef` is converted to `IacPropertyValue::ResourceAttr`
+  (instead of being silently dropped); `VarRef`, `LocalRef`, and `Unknown`
+  still return `None` and are dropped with a tracing warning. Refs #39.
+
+### Removed
+
+- **BREAKING**: `CfnPropertyValue` enum (`Concrete`, `ResourceRef`,
+  `ResourceGetAtt`) is fully removed from `yevice-service-api`. Use
+  `IacPropertyValue` instead. All CFN and TF adapter `convert()` methods
+  already receive `RawCfnResource` / `RawTfResource` whose helper methods
+  (`get_str`, `get_f64`, `get_bool`, `get_object`) are unchanged in
+  signature. Refs #39.
+
+### Added (continued)
+
 - `yevice generate` / `yevice validate` now accept CloudFormation,
   Terraform, and Cloudflare Wrangler inputs via auto-detection or explicit
   `--input-format`, including provider-aware AWS/GCP pricing for Terraform.

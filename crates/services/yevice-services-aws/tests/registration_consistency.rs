@@ -312,6 +312,7 @@ fn build_registries() -> (ServiceCatalog, CfnAdapterRegistry, TfAdapterRegistry)
 ///   (catches deleted tf.register() calls), and
 /// - every TF type in the real registry is present in the expected mapping
 ///   (catches mapping-table update omissions).
+///
 /// Services intentionally without a TF adapter are listed in
 /// `SERVICES_WITHOUT_TF_ADAPTER`.
 #[test]
