@@ -2,10 +2,24 @@ use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::cost::{ArchitectureCost, Expr};
+use crate::cost::{ArchitectureCost, CostBuildError, Expr};
 use crate::currency::Money;
 use crate::error::CoreError;
 use crate::types::{ArchitectureName, LogicalId, ResourceType, VariableName};
+
+impl From<CostBuildError> for CoreError {
+    fn from(e: CostBuildError) -> Self {
+        match e {
+            CostBuildError::ComponentCurrencyMismatch {
+                resource_id,
+                currencies,
+            } => CoreError::ComponentCurrencyMismatch {
+                resource_id,
+                currencies,
+            },
+        }
+    }
+}
 
 /// Default fallback currency applied when a `ResourceCost` does not declare
 /// `currency` and components do not override it. See ADR-0001
@@ -179,6 +193,11 @@ pub fn evaluate_architecture(
     arch: &ArchitectureCost,
     params: &Params,
 ) -> Result<ArchitectureResult, CoreError> {
+    // Guard: validate currency consistency for all resources before evaluation.
+    // This catches ResourceCost values constructed via struct literals or
+    // deserialized from hand-edited JSON that bypass ResourceCost::new().
+    arch.validate().map_err(CoreError::from)?;
+
     let mut effective_params = resolve_bindings(&arch.bindings, params)?;
 
     // User-provided params override bindings
@@ -497,5 +516,82 @@ mod tests {
         let resolved = resolve_bindings(&bindings, &base).unwrap();
         // Unresolvable binding stays unset, but the function returns Ok.
         assert!(!resolved.contains_key(&var("Derived")));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Currency-mismatch guard at evaluate_architecture boundary
+    // ---------------------------------------------------------------------------
+
+    fn make_arch(resources: Vec<crate::cost::ResourceCost>) -> ArchitectureCost {
+        use crate::cost::ArchitectureCost;
+        use crate::topology::Topology;
+        use crate::types::{ArchitectureName, Region};
+        ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources,
+            bindings: vec![],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+            diagnostics: vec![],
+        }
+    }
+
+    /// A struct-literal ResourceCost with mixed currencies (USD + JPY) must
+    /// cause `evaluate_architecture` to fail with `ComponentCurrencyMismatch`
+    /// rather than silently summing incompatible amounts.
+    #[test]
+    fn evaluate_architecture_rejects_mixed_currency_resource() {
+        use crate::cost::{CostComponent, ResourceCost};
+        use crate::types::{LogicalId, ResourceType};
+
+        let rc = ResourceCost {
+            logical_id: LogicalId::new("MixedResource"),
+            resource_type: ResourceType::new("AWS::Foo::Bar"),
+            label: "mixed".into(),
+            expr: Expr::constant(101.0),
+            components: vec![
+                CostComponent::with_currency("usd_part", Expr::constant(1.0), "USD"),
+                CostComponent::with_currency("jpy_part", Expr::constant(100.0), "JPY"),
+            ],
+            required_variables: vec![],
+            currency: Some("USD".into()),
+        };
+
+        let arch = make_arch(vec![rc]);
+        let result = evaluate_architecture(&arch, &Params::default());
+        assert!(
+            matches!(result, Err(CoreError::ComponentCurrencyMismatch { .. })),
+            "expected ComponentCurrencyMismatch, got {result:?}"
+        );
+    }
+
+    /// A ResourceCost with a single, consistent currency must pass through
+    /// `evaluate_architecture` without error.
+    #[test]
+    fn evaluate_architecture_accepts_single_currency_resource() {
+        use crate::cost::{CostComponent, ResourceCost};
+        use crate::types::{LogicalId, ResourceType};
+
+        let rc = ResourceCost {
+            logical_id: LogicalId::new("UsdResource"),
+            resource_type: ResourceType::new("AWS::Foo::Bar"),
+            label: "usd".into(),
+            expr: Expr::constant(10.0),
+            components: vec![
+                CostComponent::with_currency("part_a", Expr::constant(6.0), "USD"),
+                CostComponent::with_currency("part_b", Expr::constant(4.0), "USD"),
+            ],
+            required_variables: vec![],
+            currency: Some("USD".into()),
+        };
+
+        let arch = make_arch(vec![rc]);
+        let result = evaluate_architecture(&arch, &Params::default());
+        assert!(result.is_ok(), "single-currency resource must evaluate OK");
+        let arch_result = result.unwrap();
+        assert_eq!(
+            arch_result.totals_by_currency.get("USD").copied(),
+            Some(10.0)
+        );
     }
 }

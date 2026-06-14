@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::bindings::{BindingsFile, to_variable_bindings};
 use crate::capacity::Quotas;
-use crate::cost::{ArchitectureCost, VariableBinding};
+use crate::cost::{ArchitectureCost, CostBuildError, VariableBinding};
 use crate::evaluate::Params;
 use crate::types::VariableName;
 
@@ -270,12 +270,26 @@ pub fn parse_quotas(content: &str) -> Result<Quotas, QuotasParseError> {
 
 /// Error raised while parsing a cost-model JSON document.
 #[derive(Debug, Error)]
-#[error("failed to parse cost model JSON")]
-pub struct CostModelParseError(#[source] serde_json::Error);
+pub enum CostModelParseError {
+    /// The document is not valid JSON or does not match the expected schema.
+    #[error("failed to parse cost model JSON")]
+    Json(#[source] serde_json::Error),
+    /// One or more resources have inconsistent component currencies.
+    #[error(transparent)]
+    CurrencyMismatch(#[from] CostBuildError),
+}
 
 /// Parse a cost model (as produced by `generate`) from JSON text.
+///
+/// After JSON deserialization, each [`ResourceCost`] is validated for currency
+/// consistency. Returns [`CostModelParseError::CurrencyMismatch`] when any
+/// resource mixes currencies across its components — catching hand-edited JSON
+/// that bypasses the [`ResourceCost::new`] constructor.
 pub fn parse_cost_model(content: &str) -> Result<ArchitectureCost, CostModelParseError> {
-    serde_json::from_str(content).map_err(CostModelParseError)
+    let arch: ArchitectureCost =
+        serde_json::from_str(content).map_err(CostModelParseError::Json)?;
+    arch.validate()?;
+    Ok(arch)
 }
 
 #[cfg(test)]
@@ -517,5 +531,76 @@ Nested:
             err.to_string().contains("failed to parse cost model JSON"),
             "got: {err}"
         );
+    }
+
+    /// A cost_model.json with mixed currencies (USD + JPY on the same resource)
+    /// must be rejected at parse time, preventing silent incorrect summation.
+    #[test]
+    fn parse_cost_model_rejects_mixed_currency_resource() {
+        let json = r#"{
+            "name": "arch",
+            "resources": [
+                {
+                    "logical_id": "MixedResource",
+                    "resource_type": "AWS::Foo::Bar",
+                    "label": "mixed",
+                    "expr": { "type": "Constant", "value": 101.0 },
+                    "components": [
+                        {
+                            "name": "usd_part",
+                            "expr": { "type": "Constant", "value": 1.0 },
+                            "currency": "USD"
+                        },
+                        {
+                            "name": "jpy_part",
+                            "expr": { "type": "Constant", "value": 100.0 },
+                            "currency": "JPY"
+                        }
+                    ],
+                    "required_variables": [],
+                    "currency": "USD"
+                }
+            ],
+            "region": "ap-northeast-1"
+        }"#;
+        let err = parse_cost_model(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inconsistent component currencies"),
+            "error must describe currency mismatch; got: {msg}"
+        );
+    }
+
+    /// A cost_model.json with a single consistent currency must be accepted.
+    #[test]
+    fn parse_cost_model_accepts_single_currency_resource() {
+        let json = r#"{
+            "name": "arch",
+            "resources": [
+                {
+                    "logical_id": "UsdResource",
+                    "resource_type": "AWS::Foo::Bar",
+                    "label": "usd",
+                    "expr": { "type": "Constant", "value": 10.0 },
+                    "components": [
+                        {
+                            "name": "part_a",
+                            "expr": { "type": "Constant", "value": 6.0 },
+                            "currency": "USD"
+                        },
+                        {
+                            "name": "part_b",
+                            "expr": { "type": "Constant", "value": 4.0 },
+                            "currency": "USD"
+                        }
+                    ],
+                    "required_variables": [],
+                    "currency": "USD"
+                }
+            ],
+            "region": "ap-northeast-1"
+        }"#;
+        let model = parse_cost_model(json).unwrap();
+        assert_eq!(model.resources.len(), 1);
     }
 }

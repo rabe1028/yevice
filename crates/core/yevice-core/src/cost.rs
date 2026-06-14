@@ -212,6 +212,19 @@ pub struct ArchitectureCost {
 }
 
 impl ArchitectureCost {
+    /// Validate currency consistency for all [`ResourceCost`] entries.
+    ///
+    /// Iterates every resource and calls [`ResourceCost::validate`]. Returns
+    /// the first [`CostBuildError`] encountered, or `Ok(())` when all resources
+    /// pass. Call this after `serde` deserialization or any path that bypasses
+    /// [`ResourceCost::new`] to ensure invariants hold at evaluation boundaries.
+    pub fn validate(&self) -> Result<(), CostBuildError> {
+        for rc in &self.resources {
+            rc.validate()?;
+        }
+        Ok(())
+    }
+
     /// Returns the total cost expression (sum of all resource costs).
     pub fn total_expr(&self) -> Expr {
         Expr::sum(self.resources.iter().map(|r| r.expr.clone()).collect())
