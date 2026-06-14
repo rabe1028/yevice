@@ -667,7 +667,7 @@ fn resolved_to_cfn_property(value: &ResolvedValue) -> IacPropertyValue {
                     },
                 })
                 .collect();
-            IacPropertyValue::Interpolated { parts: iac_parts }
+            IacPropertyValue::new_interpolated(iac_parts)
         }
         other => IacPropertyValue::Concrete(resolved_to_json(other)),
     }
@@ -1752,7 +1752,7 @@ mod determinism_tests {
         ]);
         let result = resolved_to_cfn_property(&value);
         match result {
-            IacPropertyValue::Interpolated { ref parts } => {
+            IacPropertyValue::Interpolated { ref parts, .. } => {
                 assert_eq!(parts.len(), 4);
                 assert!(
                     matches!(&parts[0], IacStringPart::Literal(s) if s == "arn:aws:lambda:${AWS::Region}:fn:"),

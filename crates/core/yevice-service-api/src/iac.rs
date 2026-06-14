@@ -57,7 +57,29 @@ pub enum IacPropertyValue {
     ResourceAttr { logical_id: String, attr: String },
     /// An interpolated string composed of literal text and typed references
     /// (e.g., from `Fn::Sub` or TF template strings).
-    Interpolated { parts: Vec<IacStringPart> },
+    ///
+    /// `rendered` is the CFN-native `${...}` form of the interpolated string,
+    /// pre-computed from `parts` at construction time so that `get_str()` can
+    /// return a `&str` without allocating.
+    Interpolated {
+        parts: Vec<IacStringPart>,
+        /// Pre-rendered CFN-native form (e.g. `"hello-${MyBucket}-suffix"`).
+        /// Skipped during serialization/deserialization; rebuild with
+        /// `render_iac_parts(&parts)` if needed after deserialization.
+        #[serde(skip)]
+        rendered: String,
+    },
+}
+
+impl IacPropertyValue {
+    /// Construct an `Interpolated` variant from a list of parts.
+    ///
+    /// The `rendered` field is computed automatically via `render_iac_parts`
+    /// so callers do not need to manage it manually.
+    pub fn new_interpolated(parts: Vec<IacStringPart>) -> Self {
+        let rendered = render_iac_parts(&parts);
+        Self::Interpolated { parts, rendered }
+    }
 }
 
 /// One segment of an interpolated string property value.
@@ -73,6 +95,35 @@ pub enum IacStringPart {
     Ref(String),
     /// A `!GetAtt`-style / resource attribute reference segment.
     Attr { logical_id: String, attr: String },
+}
+
+// ---------------------------------------------------------------------------
+// Helper
+// ---------------------------------------------------------------------------
+
+/// Render a slice of `IacStringPart` into a CFN-native `${...}` interpolated
+/// string.  Literal segments are emitted as-is; `Ref` segments become
+/// `${LogicalId}`; `Attr` segments become `${LogicalId.Attr}`.
+fn render_iac_parts(parts: &[IacStringPart]) -> String {
+    let mut result = String::new();
+    for part in parts {
+        match part {
+            IacStringPart::Literal(s) => result.push_str(s),
+            IacStringPart::Ref(id) => {
+                result.push_str("${");
+                result.push_str(id);
+                result.push('}');
+            }
+            IacStringPart::Attr { logical_id, attr } => {
+                result.push_str("${");
+                result.push_str(logical_id);
+                result.push('.');
+                result.push_str(attr);
+                result.push('}');
+            }
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +167,11 @@ impl RawCfnResource {
     }
 
     /// Get a string property value.
+    ///
+    /// For `Interpolated` values the pre-rendered CFN-native form (e.g.
+    /// `"hello-${MyBucket}-suffix"`) is returned so that adapters that
+    /// previously received a concrete `Fn::Sub` / `Fn::Join` string continue
+    /// to work correctly after the typed `Interpolated` migration.
     pub fn get_str(&self, key: &str) -> Option<&str> {
         match self.properties.get(key)? {
             IacPropertyValue::Concrete(Value::String(s)) => Some(s.as_str()),
@@ -128,7 +184,7 @@ impl RawCfnResource {
                 tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where str expected; skipping");
                 None
             }
-            IacPropertyValue::Interpolated { .. } => None,
+            IacPropertyValue::Interpolated { rendered, .. } => Some(rendered.as_str()),
         }
     }
 
@@ -433,5 +489,62 @@ mod tests {
         let mut registry = TfAdapterRegistry::new();
         registry.register(DummyTfAdapter);
         registry.register(DummyTfAdapter);
+    }
+
+    // -----------------------------------------------------------------------
+    // IacPropertyValue::Interpolated regression test (PR #44 / issue #39)
+    // -----------------------------------------------------------------------
+
+    /// `get_str()` must return the CFN-native rendered form for `Interpolated`
+    /// values so that adapters that previously received a concrete
+    /// `Fn::Sub`/`Fn::Join` string continue to work after the typed migration.
+    #[test]
+    fn get_str_interpolated_renders_parts() {
+        let parts = vec![
+            IacStringPart::Literal("hello-".to_string()),
+            IacStringPart::Ref("MyBucket".to_string()),
+            IacStringPart::Literal("-suffix".to_string()),
+        ];
+        let mut raw =
+            RawCfnResource::new("MyResource", "AWS::Test::Resource", serde_json::json!({}));
+        raw.properties.insert(
+            "Name".to_string(),
+            IacPropertyValue::new_interpolated(parts),
+        );
+
+        assert_eq!(raw.get_str("Name"), Some("hello-${MyBucket}-suffix"));
+    }
+
+    /// `get_str()` also handles `Attr` parts correctly.
+    #[test]
+    fn get_str_interpolated_with_attr_part() {
+        let parts = vec![
+            IacStringPart::Literal("arn:prefix:".to_string()),
+            IacStringPart::Attr {
+                logical_id: "MyTable".to_string(),
+                attr: "Arn".to_string(),
+            },
+        ];
+        let mut raw =
+            RawCfnResource::new("MyResource", "AWS::Test::Resource", serde_json::json!({}));
+        raw.properties
+            .insert("Arn".to_string(), IacPropertyValue::new_interpolated(parts));
+
+        assert_eq!(raw.get_str("Arn"), Some("arn:prefix:${MyTable.Arn}"));
+    }
+
+    /// `render_iac_parts` helper produces the correct CFN `${...}` string.
+    #[test]
+    fn render_iac_parts_all_variants() {
+        let parts = vec![
+            IacStringPart::Literal("prefix-".to_string()),
+            IacStringPart::Ref("ResA".to_string()),
+            IacStringPart::Literal(":".to_string()),
+            IacStringPart::Attr {
+                logical_id: "ResB".to_string(),
+                attr: "Name".to_string(),
+            },
+        ];
+        assert_eq!(render_iac_parts(&parts), "prefix-${ResA}:${ResB.Name}");
     }
 }
