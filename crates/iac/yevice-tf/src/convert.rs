@@ -9,7 +9,7 @@ use yevice_core::{
     },
     types::{LogicalId, Region, ResourceType},
 };
-use yevice_service_api::{RawTfResource, TfAdapterRegistry};
+use yevice_service_api::{IacPropertyValue, RawTfResource, TfAdapterRegistry};
 
 use crate::{
     parser::{TfResource, TfValue},
@@ -68,12 +68,16 @@ pub fn build_architecture(
 /// Adapters that fall back to a hardcoded default for missing attrs will therefore use that
 /// default, so the warning names both the resource and the attr so operators can supply the
 /// variable via tfvars for accurate pricing.
+///
+/// `ResourceRef` values are converted to `IacPropertyValue::ResourceRef` or
+/// `IacPropertyValue::ResourceAttr` and are preserved in `attrs` so that adapters
+/// can inspect them; connection building uses the original `TfResource` directly.
 fn tf_resource_to_raw(resource: &TfResource, logical_id: &str) -> RawTfResource {
-    let mut attrs: HashMap<String, JsonValue> = HashMap::new();
+    let mut attrs: HashMap<String, IacPropertyValue> = HashMap::new();
     for (k, v) in &resource.attrs {
-        match tf_value_to_json(v) {
-            Some(jv) => {
-                attrs.insert(k.clone(), jv);
+        match tf_value_to_iac_property(v) {
+            Some(iac) => {
+                attrs.insert(k.clone(), iac);
             }
             None => {
                 tracing::warn!(
@@ -109,8 +113,52 @@ fn tf_resource_to_raw(resource: &TfResource, logical_id: &str) -> RawTfResource 
     raw
 }
 
+/// Convert a `TfValue` to an `IacPropertyValue`.
+///
+/// Concrete scalars and containers are wrapped in `IacPropertyValue::Concrete`.
+/// `ResourceRef { attr: None }` becomes `IacPropertyValue::ResourceRef`.
+/// `ResourceRef { attr: Some(_) }` becomes `IacPropertyValue::ResourceAttr`.
+/// `VarRef`, `LocalRef`, and `Unknown` — which represent unresolved symbols —
+/// return `None` so the caller can log a warning and the adapter falls back to
+/// its hardcoded default.
+fn tf_value_to_iac_property(value: &TfValue) -> Option<IacPropertyValue> {
+    match value {
+        TfValue::String(s) => Some(IacPropertyValue::Concrete(JsonValue::String(s.clone()))),
+        TfValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(|n| IacPropertyValue::Concrete(JsonValue::Number(n))),
+        TfValue::Bool(b) => Some(IacPropertyValue::Concrete(JsonValue::Bool(*b))),
+        TfValue::Object(map) => {
+            let obj: serde_json::Map<String, JsonValue> = map
+                .iter()
+                .filter_map(|(k, v)| tf_value_to_json(v).map(|jv| (k.clone(), jv)))
+                .collect();
+            Some(IacPropertyValue::Concrete(JsonValue::Object(obj)))
+        }
+        TfValue::Array(items) => {
+            let arr: Vec<JsonValue> = items.iter().filter_map(tf_value_to_json).collect();
+            Some(IacPropertyValue::Concrete(JsonValue::Array(arr)))
+        }
+        TfValue::ResourceRef {
+            resource_type,
+            name,
+            attr,
+        } => {
+            let logical_id = format!("{resource_type}_{name}");
+            Some(IacPropertyValue::ResourceAttr {
+                logical_id,
+                attr: attr.clone(),
+            })
+        }
+        TfValue::VarRef(_) | TfValue::LocalRef(_) | TfValue::Unknown => {
+            tracing::debug!(value = ?value, "unresolved TfValue reference dropped during conversion");
+            None
+        }
+    }
+}
+
 /// Convert a concrete `TfValue` to a `serde_json::Value`.
 ///
+/// Used for block attribute conversion (blocks retain `serde_json::Value` type).
 /// Returns `None` for unresolved references (`VarRef`, `LocalRef`, `ResourceRef`,
 /// `Unknown`). `ResourceRef` is not a scalar value; it is consumed separately by
 /// [`build_connections`].
