@@ -281,10 +281,10 @@ pub enum CostModelParseError {
 
 /// Parse a cost model (as produced by `generate`) from JSON text.
 ///
-/// After JSON deserialization, each [`ResourceCost`] is validated for currency
+/// After JSON deserialization, each [`crate::cost::ResourceCost`] is validated for currency
 /// consistency. Returns [`CostModelParseError::CurrencyMismatch`] when any
 /// resource mixes currencies across its components — catching hand-edited JSON
-/// that bypasses the [`ResourceCost::new`] constructor.
+/// that bypasses the [`crate::cost::ResourceCost::new`] constructor.
 pub fn parse_cost_model(content: &str) -> Result<ArchitectureCost, CostModelParseError> {
     let arch: ArchitectureCost =
         serde_json::from_str(content).map_err(CostModelParseError::Json)?;
