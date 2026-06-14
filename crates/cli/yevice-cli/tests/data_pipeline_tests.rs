@@ -56,9 +56,9 @@ fn test_kinesis_provisioned_base_cost() {
         .unwrap();
     let expected_base = 2.0 * 0.0195 * 730.0; // $28.47
     assert!(
-        (kinesis.monthly_cost - expected_base).abs() < 0.01,
+        (kinesis.monthly_cost.value - expected_base).abs() < 0.01,
         "2-shard Kinesis base cost should be ~${expected_base:.2}, got ${:.2}",
-        kinesis.monthly_cost
+        kinesis.monthly_cost.value
     );
 }
 
@@ -96,9 +96,9 @@ fn test_kinesis_provisioned_shard_cost() {
     let expected_two_shards = 2.0 * per_shard_month;
 
     assert!(
-        (kinesis_zero.monthly_cost - expected_two_shards).abs() < 0.01,
+        (kinesis_zero.monthly_cost.value - expected_two_shards).abs() < 0.01,
         "2-shard provisioned cost should be 2x one-shard rate: expected ${expected_two_shards:.3}, got ${:.3}",
-        kinesis_zero.monthly_cost
+        kinesis_zero.monthly_cost.value
     );
 }
 
@@ -146,10 +146,10 @@ fn test_firehose_scales_with_ingestion() {
     let high_result = evaluate_architecture(&arch, &p(&high_params)).unwrap();
 
     assert!(
-        high_result.total_monthly_cost > low_result.total_monthly_cost,
+        high_result.naive_total() > low_result.naive_total(),
         "1000 GB firehose ingestion (${:.2}) should cost more than 100 GB (${:.2})",
-        high_result.total_monthly_cost,
-        low_result.total_monthly_cost
+        high_result.naive_total(),
+        low_result.naive_total()
     );
 }
 
@@ -179,9 +179,9 @@ fn test_firehose_exact_cost() {
         .unwrap();
     let expected = 500.0 * 0.031; // $15.50
     assert!(
-        (firehose.monthly_cost - expected).abs() < 0.001,
+        (firehose.monthly_cost.value - expected).abs() < 0.001,
         "500 GB Firehose ingestion should cost ${expected:.2}, got ${:.2}",
-        firehose.monthly_cost
+        firehose.monthly_cost.value
     );
 }
 
@@ -228,9 +228,9 @@ fn test_cloudfront_free_tier_applies() {
         .unwrap();
     // With 0 requests and 500 GB transfer (within free tier), CloudFront cost should be $0
     assert!(
-        cdn.monthly_cost.abs() < 0.001,
+        cdn.monthly_cost.value.abs() < 0.001,
         "CloudFront at 500 GB (within 1000 GB free tier) should cost $0, got ${:.4}",
-        cdn.monthly_cost
+        cdn.monthly_cost.value
     );
 }
 
@@ -266,10 +266,10 @@ fn test_cloudfront_above_free_tier() {
     let result_over = evaluate_architecture(&arch, &params_over).unwrap();
 
     assert!(
-        result_over.total_monthly_cost > result_under.total_monthly_cost,
+        result_over.naive_total() > result_under.naive_total(),
         "2000 GB transfer (${:.2}) should cost more than 500 GB (${:.2})",
-        result_over.total_monthly_cost,
-        result_under.total_monthly_cost
+        result_over.naive_total(),
+        result_under.naive_total()
     );
 
     let cdn_over = result_over
@@ -279,9 +279,9 @@ fn test_cloudfront_above_free_tier() {
         .unwrap();
     let expected_transfer_cost = (2000.0 - 1000.0) * 0.114; // $114.00
     assert!(
-        (cdn_over.monthly_cost - expected_transfer_cost).abs() < 0.01,
+        (cdn_over.monthly_cost.value - expected_transfer_cost).abs() < 0.01,
         "CloudFront at 2000 GB should cost ~${expected_transfer_cost:.2} (1000 GB over free tier), got ${:.2}",
-        cdn_over.monthly_cost
+        cdn_over.monthly_cost.value
     );
 }
 
@@ -313,9 +313,9 @@ fn test_nat_gateway_base_cost() {
         .unwrap();
     let expected_base = 0.062 * 730.0; // $45.26
     assert!(
-        (nat.monthly_cost - expected_base).abs() < 0.01,
+        (nat.monthly_cost.value - expected_base).abs() < 0.01,
         "NAT Gateway base (0 data) should cost ~${expected_base:.2}, got ${:.2}",
-        nat.monthly_cost
+        nat.monthly_cost.value
     );
 }
 
@@ -342,9 +342,9 @@ fn test_nat_gateway_scales_with_data() {
         .unwrap();
     let expected = 0.062 * 730.0 + 100.0 * 0.062; // $45.26 + $6.20 = $51.46
     assert!(
-        (nat.monthly_cost - expected).abs() < 0.01,
+        (nat.monthly_cost.value - expected).abs() < 0.01,
         "NAT Gateway with 100 GB data should cost ~${expected:.2}, got ${:.2}",
-        nat.monthly_cost
+        nat.monthly_cost.value
     );
 }
 
@@ -379,8 +379,8 @@ fn test_s3_storage_cost_scales() {
         .unwrap();
     let expected = 10_000.0 * 0.025; // $250.00
     assert!(
-        (bucket.monthly_cost - expected).abs() < 0.01,
+        (bucket.monthly_cost.value - expected).abs() < 0.01,
         "S3 10000 GB storage should cost ~${expected:.2}, got ${:.2}",
-        bucket.monthly_cost
+        bucket.monthly_cost.value
     );
 }

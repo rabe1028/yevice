@@ -61,10 +61,14 @@ impl Service for BedrockService {
                 CostComponent {
                     name: "Input Tokens".into(),
                     expr: input_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Output Tokens".into(),
                     expr: output_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -81,6 +85,8 @@ impl Service for BedrockService {
                     "thousand tokens",
                 ),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

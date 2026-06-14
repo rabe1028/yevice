@@ -92,9 +92,9 @@ fn test_rest_api_cost_is_positive() {
 
     let result = evaluate_architecture(&arch, &usage).unwrap();
     assert!(
-        result.total_monthly_cost > 0.0,
+        result.naive_total() > 0.0,
         "total cost should be positive, got {}",
-        result.total_monthly_cost
+        result.naive_total()
     );
 }
 
@@ -135,13 +135,15 @@ fn test_rest_api_write_lambda_costs_more_than_read() {
         .iter()
         .find(|r| r.logical_id == "GetFunction")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let write_cost = result
         .resources
         .iter()
         .find(|r| r.logical_id == "WriteFunction")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         write_cost > get_cost,
@@ -190,7 +192,8 @@ fn test_http_api_cheaper_than_rest_api() {
         .iter()
         .find(|r| r.logical_id == "Api")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // Build HTTP API arch
     let http_resources = load_template("serverless-http-api.yml");
@@ -212,7 +215,8 @@ fn test_http_api_cheaper_than_rest_api() {
         .iter()
         .find(|r| r.logical_id == "HttpApi")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         http_api_cost < rest_api_cost,
@@ -255,7 +259,8 @@ fn test_waf_has_fixed_cost() {
         .iter()
         .find(|r| r.logical_id == "WebAcl")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // WebACL fixed = $5.00; 2 rules * $1.00/rule = $2.00 → total >= $5.00
     assert!(
@@ -312,13 +317,15 @@ fn test_provisioned_dynamodb_cost_is_constant() {
         .iter()
         .find(|r| r.logical_id == "HotTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let hot_high = result_high
         .resources
         .iter()
         .find(|r| r.logical_id == "HotTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     // Provisioned capacity cost must be identical regardless of usage volume
     assert!(
@@ -394,13 +401,15 @@ fn test_provisioned_vs_ondemand() {
         .iter()
         .find(|r| r.logical_id == "HotTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let user_cost_low = ondemand_low
         .resources
         .iter()
         .find(|r| r.logical_id == "UserTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         hot_cost > user_cost_low,
@@ -436,7 +445,8 @@ fn test_provisioned_vs_ondemand() {
         .iter()
         .find(|r| r.logical_id == "UserTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         hot_cost < user_cost_high,
@@ -477,7 +487,8 @@ fn test_lambda_free_tier_applies() {
         .iter()
         .find(|r| r.logical_id == "HandlerFunction")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         handler_cost.abs() < 1e-9,
@@ -532,13 +543,15 @@ fn test_dynamodb_on_demand_scales_with_writes() {
         .iter()
         .find(|r| r.logical_id == "DataTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let cost_double = result_double
         .resources
         .iter()
         .find(|r| r.logical_id == "DataTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(cost_base > 0.0, "base write cost should be positive");
     assert!(cost_double > 0.0, "doubled write cost should be positive");
@@ -613,13 +626,15 @@ fn test_hot_table_costs_more_than_cold_table() {
         .iter()
         .find(|r| r.logical_id == "HotTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
     let cold = result
         .resources
         .iter()
         .find(|r| r.logical_id == "ColdTable")
         .unwrap()
-        .monthly_cost;
+        .monthly_cost
+        .value;
 
     assert!(
         hot > cold,

@@ -112,14 +112,20 @@ impl Service for CloudflareWorkerService {
                 CostComponent {
                     name: "Paid plan base".into(),
                     expr: base_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Requests (over 10M)".into(),
                     expr: request_overage,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "CPU time (over 30M ms)".into(),
                     expr: cpu_overage,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -136,6 +142,8 @@ impl Service for CloudflareWorkerService {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }
@@ -206,10 +214,14 @@ impl Service for CloudflareKvService {
                 CostComponent {
                     name: "Reads".into(),
                     expr: read_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Writes".into(),
                     expr: write_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -226,6 +238,8 @@ impl Service for CloudflareKvService {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }
@@ -314,14 +328,20 @@ impl Service for CloudflareR2Service {
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Class A ops (write/list)".into(),
                     expr: class_a_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Class B ops (read)".into(),
                     expr: class_b_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -344,6 +364,8 @@ impl Service for CloudflareR2Service {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }
@@ -414,10 +436,14 @@ impl Service for CloudflareD1Service {
                 CostComponent {
                     name: "Rows read".into(),
                     expr: read_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Rows written".into(),
                     expr: write_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -434,6 +460,8 @@ impl Service for CloudflareD1Service {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }
@@ -493,6 +521,8 @@ impl Service for CloudflareQueueService {
             components: vec![CostComponent {
                 name: "Message operations".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo {
                 name: id.var("monthly_messages"),
@@ -500,6 +530,8 @@ impl Service for CloudflareQueueService {
                 unit: "count".into(),
                 kind: VariableKind::Usage,
             }],
+
+            currency: Some("USD".into()),
         })
     }
 }
@@ -588,14 +620,20 @@ impl Service for CloudflareDurableObjectService {
                 CostComponent {
                     name: "Requests".into(),
                     expr: request_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Duration (GB-seconds)".into(),
                     expr: duration_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -618,6 +656,8 @@ impl Service for CloudflareDurableObjectService {
                     kind: VariableKind::Usage,
                 },
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

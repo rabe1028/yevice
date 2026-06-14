@@ -120,14 +120,20 @@ impl Service for DynamoDbService {
                         CostComponent {
                             name: "Write Request Units".into(),
                             expr: write_cost,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Read Request Units".into(),
                             expr: read_cost,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Storage".into(),
                             expr: storage_cost,
+
+                            currency: None,
                         },
                     ],
                     required_variables: vec![
@@ -145,6 +151,8 @@ impl Service for DynamoDbService {
                         ),
                         VariableInfo::new(id, var::STORAGE_GB, "Table storage", "GB"),
                     ],
+
+                    currency: Some("USD".into()),
                 })
             }
             DynamoDbBillingMode::Provisioned {
@@ -206,17 +214,25 @@ impl Service for DynamoDbService {
                         CostComponent {
                             name: "Write Capacity".into(),
                             expr: write_cost,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Read Capacity".into(),
                             expr: read_cost,
+
+                            currency: None,
                         },
                         CostComponent {
                             name: "Storage".into(),
                             expr: storage_cost,
+
+                            currency: None,
                         },
                     ],
                     required_variables: vars,
+
+                    currency: Some("USD".into()),
                 })
             }
         }

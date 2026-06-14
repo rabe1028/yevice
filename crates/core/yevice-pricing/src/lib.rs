@@ -24,7 +24,11 @@ pub mod model;
 pub mod noop;
 pub mod registry;
 
-pub use catalog::{PriceCatalog, PriceRecord, Sku};
+#[allow(deprecated)]
+pub use catalog::PriceRecord;
+pub use catalog::{
+    PriceCatalog, PricedTier, PricedValue, Sku, TypedPriceRecord, TypedPricingProvider, TypedTier,
+};
 pub use file_registry::PricingMetadata;
 pub use gcp_model::GcpPricing;
 pub use gcp_registry::hardcoded_pricing as gcp_hardcoded_pricing;

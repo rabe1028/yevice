@@ -1,8 +1,30 @@
+use std::collections::BTreeMap;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::cost::{ArchitectureCost, Expr};
+use crate::cost::{ArchitectureCost, CostBuildError, Expr};
+use crate::currency::Money;
 use crate::error::CoreError;
 use crate::types::{ArchitectureName, LogicalId, ResourceType, VariableName};
+
+impl From<CostBuildError> for CoreError {
+    fn from(e: CostBuildError) -> Self {
+        match e {
+            CostBuildError::ComponentCurrencyMismatch {
+                resource_id,
+                currencies,
+            } => CoreError::ComponentCurrencyMismatch {
+                resource_id,
+                currencies,
+            },
+        }
+    }
+}
+
+/// Default fallback currency applied when a `ResourceCost` does not declare
+/// `currency` and components do not override it. See ADR-0001
+/// "後方互換 (migration period)".
+pub const FALLBACK_CURRENCY: &str = "USD";
 
 /// Parameters for cost evaluation: variable name -> value.
 pub type Params = FxHashMap<VariableName, f64>;
@@ -93,22 +115,73 @@ pub fn evaluate(expr: &Expr, params: &Params) -> Result<f64, CoreError> {
 }
 
 /// Result of evaluating a single resource's cost.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResourceResult {
     pub logical_id: LogicalId,
     pub resource_type: ResourceType,
     pub label: String,
-    pub monthly_cost: f64,
-    /// Named cost component breakdown (name, cost).
-    pub component_costs: Vec<(String, f64)>,
+    /// Monthly cost as a runtime-tagged [`Money`] (currency derived from
+    /// `ResourceCost.currency` with USD fallback per ADR-0001).
+    pub monthly_cost: Money,
+    /// Named cost component breakdown (name, money).
+    pub component_costs: Vec<(String, Money)>,
 }
 
 /// Result of evaluating an entire architecture's cost.
-#[derive(Debug)]
+///
+/// `totals_by_currency` holds the per-currency aggregate. `display_total` is
+/// an FX-converted single-currency summary (populated by the CLI when
+/// `--display-currency` is supplied); the evaluator itself leaves it `None`.
+#[derive(Debug, Clone)]
 pub struct ArchitectureResult {
     pub name: ArchitectureName,
     pub resources: Vec<ResourceResult>,
-    pub total_monthly_cost: f64,
+    /// Per-currency monthly totals. Keys are currency codes (e.g. `"USD"`,
+    /// `"JPY"`) and values are the summed monthly amount in that currency.
+    pub totals_by_currency: BTreeMap<String, f64>,
+    /// Optional FX-converted single-currency display total, populated by the
+    /// CLI layer when `--display-currency` is supplied and rates are
+    /// available.
+    pub display_total: Option<Money>,
+}
+
+impl ArchitectureResult {
+    /// `true` when every resource shares the same currency.
+    pub fn is_single_currency(&self) -> bool {
+        self.totals_by_currency.len() <= 1
+    }
+
+    /// Sum of all per-currency totals as a raw `f64`. **Only meaningful in
+    /// single-currency mode** — for multi-currency results, callers must
+    /// either pick `display_total` (after FX conversion) or iterate
+    /// `totals_by_currency`.
+    pub fn naive_total(&self) -> f64 {
+        self.totals_by_currency.values().sum()
+    }
+}
+
+/// Resolve the effective currency for a `ResourceCost.expr` evaluation.
+///
+/// Priority: explicit resource currency → first non-None component currency →
+/// fallback (`FALLBACK_CURRENCY`). When the resource carries no currency at
+/// all, a `tracing::warn!` is emitted once per evaluation; the value is then
+/// treated as USD so legacy `cost_model.json` files still load.
+fn resource_currency(rc: &crate::cost::ResourceCost) -> String {
+    if let Some(c) = &rc.currency {
+        return c.clone();
+    }
+    if let Some(first) = rc.components.iter().find_map(|c| c.currency.clone()) {
+        return first;
+    }
+    tracing::warn!(
+        resource = %rc.logical_id,
+        "ResourceCost.currency is None and no component overrides; falling back to {FALLBACK_CURRENCY}"
+    );
+    FALLBACK_CURRENCY.to_string()
+}
+
+fn component_currency(c: &crate::cost::CostComponent, parent: &str) -> String {
+    c.currency.clone().unwrap_or_else(|| parent.to_string())
 }
 
 /// Evaluate all resource costs in an architecture.
@@ -120,6 +193,11 @@ pub fn evaluate_architecture(
     arch: &ArchitectureCost,
     params: &Params,
 ) -> Result<ArchitectureResult, CoreError> {
+    // Guard: validate currency consistency for all resources before evaluation.
+    // This catches ResourceCost values constructed via struct literals or
+    // deserialized from hand-edited JSON that bypass ResourceCost::new().
+    arch.validate().map_err(CoreError::from)?;
+
     let mut effective_params = resolve_bindings(&arch.bindings, params)?;
 
     // User-provided params override bindings
@@ -128,14 +206,18 @@ pub fn evaluate_architecture(
     }
 
     let mut resources = Vec::new();
-    let mut total = 0.0;
+    let mut totals_by_currency: BTreeMap<String, f64> = BTreeMap::new();
 
     for rc in &arch.resources {
-        let component_costs: Vec<(String, f64)> = rc
+        let parent_currency = resource_currency(rc);
+        let component_costs: Vec<(String, Money)> = rc
             .components
             .iter()
             .filter_map(|c| match evaluate(&c.expr, &effective_params) {
-                Ok(v) => Some((c.name.clone(), v)),
+                Ok(v) => Some((
+                    c.name.clone(),
+                    Money::monthly(v, component_currency(c, &parent_currency)),
+                )),
                 Err(e) => {
                     tracing::warn!(
                         component = %c.name,
@@ -149,17 +231,20 @@ pub fn evaluate_architecture(
 
         // Derive total from components when all evaluated successfully; otherwise re-evaluate expr.
         let cost = if component_costs.len() == rc.components.len() && !rc.components.is_empty() {
-            component_costs.iter().map(|(_, v)| v).sum()
+            component_costs.iter().map(|(_, m)| m.value).sum()
         } else {
             evaluate(&rc.expr, &effective_params)?
         };
 
-        total += cost;
+        *totals_by_currency
+            .entry(parent_currency.clone())
+            .or_insert(0.0) += cost;
+
         resources.push(ResourceResult {
             logical_id: rc.logical_id.clone(),
             resource_type: rc.resource_type.clone(),
             label: rc.label.clone(),
-            monthly_cost: cost,
+            monthly_cost: Money::monthly(cost, parent_currency),
             component_costs,
         });
     }
@@ -167,7 +252,8 @@ pub fn evaluate_architecture(
     Ok(ArchitectureResult {
         name: arch.name.clone(),
         resources,
-        total_monthly_cost: total,
+        totals_by_currency,
+        display_total: None,
     })
 }
 
@@ -430,5 +516,82 @@ mod tests {
         let resolved = resolve_bindings(&bindings, &base).unwrap();
         // Unresolvable binding stays unset, but the function returns Ok.
         assert!(!resolved.contains_key(&var("Derived")));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Currency-mismatch guard at evaluate_architecture boundary
+    // ---------------------------------------------------------------------------
+
+    fn make_arch(resources: Vec<crate::cost::ResourceCost>) -> ArchitectureCost {
+        use crate::cost::ArchitectureCost;
+        use crate::topology::Topology;
+        use crate::types::{ArchitectureName, Region};
+        ArchitectureCost {
+            name: ArchitectureName::new("test"),
+            resources,
+            bindings: vec![],
+            region: Region::new("ap-northeast-1"),
+            topology: Topology::default(),
+            diagnostics: vec![],
+        }
+    }
+
+    /// A struct-literal ResourceCost with mixed currencies (USD + JPY) must
+    /// cause `evaluate_architecture` to fail with `ComponentCurrencyMismatch`
+    /// rather than silently summing incompatible amounts.
+    #[test]
+    fn evaluate_architecture_rejects_mixed_currency_resource() {
+        use crate::cost::{CostComponent, ResourceCost};
+        use crate::types::{LogicalId, ResourceType};
+
+        let rc = ResourceCost {
+            logical_id: LogicalId::new("MixedResource"),
+            resource_type: ResourceType::new("AWS::Foo::Bar"),
+            label: "mixed".into(),
+            expr: Expr::constant(101.0),
+            components: vec![
+                CostComponent::with_currency("usd_part", Expr::constant(1.0), "USD"),
+                CostComponent::with_currency("jpy_part", Expr::constant(100.0), "JPY"),
+            ],
+            required_variables: vec![],
+            currency: Some("USD".into()),
+        };
+
+        let arch = make_arch(vec![rc]);
+        let result = evaluate_architecture(&arch, &Params::default());
+        assert!(
+            matches!(result, Err(CoreError::ComponentCurrencyMismatch { .. })),
+            "expected ComponentCurrencyMismatch, got {result:?}"
+        );
+    }
+
+    /// A ResourceCost with a single, consistent currency must pass through
+    /// `evaluate_architecture` without error.
+    #[test]
+    fn evaluate_architecture_accepts_single_currency_resource() {
+        use crate::cost::{CostComponent, ResourceCost};
+        use crate::types::{LogicalId, ResourceType};
+
+        let rc = ResourceCost {
+            logical_id: LogicalId::new("UsdResource"),
+            resource_type: ResourceType::new("AWS::Foo::Bar"),
+            label: "usd".into(),
+            expr: Expr::constant(10.0),
+            components: vec![
+                CostComponent::with_currency("part_a", Expr::constant(6.0), "USD"),
+                CostComponent::with_currency("part_b", Expr::constant(4.0), "USD"),
+            ],
+            required_variables: vec![],
+            currency: Some("USD".into()),
+        };
+
+        let arch = make_arch(vec![rc]);
+        let result = evaluate_architecture(&arch, &Params::default());
+        assert!(result.is_ok(), "single-currency resource must evaluate OK");
+        let arch_result = result.unwrap();
+        assert_eq!(
+            arch_result.totals_by_currency.get("USD").copied(),
+            Some(10.0)
+        );
     }
 }

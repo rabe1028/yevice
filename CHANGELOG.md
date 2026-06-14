@@ -12,6 +12,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `yevice generate` / `yevice validate` now accept CloudFormation,
   Terraform, and Cloudflare Wrangler inputs via auto-detection or explicit
   `--input-format`, including provider-aware AWS/GCP pricing for Terraform.
+- **Currency / billing-period metadata (ADR-0001, Issue #36).** New
+  `yevice_core::currency::{Currency<T, C>, CurrencyCode, USD, JPY, EUR,
+  BillingPeriod, Money}` types implement the phantom-typed currency at the
+  SKU layer and the runtime-tagged `Money` at the architecture aggregation
+  layer. New `yevice_core::fx::{ExchangeRates, StaticRates, RateDate,
+  convert_to}` provide FX conversion plumbing.
+- `yevice_pricing::{PricedValue, PricedTier, TypedPriceRecord<C>, TypedTier<C>,
+  TypedPricingProvider<C>}`. `AwsPricingCatalog` implements
+  `TypedPricingProvider<USD>` and the existing dyn-friendly `PriceCatalog`.
+- New `PricingError::CurrencyMismatch { expected, actual, sku }` for Bulk-API
+  metadata vs. provider-declared currency mismatch.
+- `CostBuildError::ComponentCurrencyMismatch` raised by `ResourceCost::new`
+  (and `ResourceCost::validate`) when a resource's components disagree on
+  currency.
+- `yevice eval` / `yevice compare` accept `--display-currency <CODE>` plus
+  repeatable `--exchange-rate FROM=TO:RATE` for FX conversion of
+  mixed-currency totals. Missing rate → hard error; mixed currencies with no
+  `--display-currency` → warning + per-currency breakdown.
+- `yevice simulate` is now currency-aware: `ArchSimulation` tracks
+  `totals_by_currency: BTreeMap<String, f64>` and `display_total: Option<Money>`
+  matching the `eval`/`compare`/`sensitivity` pattern. The `simulate` command
+  accepts `--display-currency` and `--exchange-rate` flags. Mixed-currency
+  models without `--display-currency` print a per-currency breakdown and warn
+  instead of silently summing incompatible amounts. The `$`-hardcoded renderer
+  is replaced by `fmt_money`-based formatting that respects the declared
+  currency (e.g., `¥`-style or `JPY` suffix).
 - `ParsePolicy` (`Lenient` / `Strict`, default `Lenient`) and
   `IacParseDiagnostic` in `yevice-core`. The top-level CLI `--strict` flag
   now also drives the parse policy and aborts when the parsers raise any
@@ -19,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terraform parser surfaces unresolved `var.*` / `local.*` references via
   the new `TfError::UnresolvedSymbol { kind, name, location }` variant under
   Strict, and as `IacParseDiagnostic` entries under Lenient.
+
+### Changed (BREAKING — major)
+
+- `ArchitectureResult.total_monthly_cost: f64` has been **removed**. Use
+  `ArchitectureResult.totals_by_currency: BTreeMap<String, f64>` for
+  per-currency totals, `ArchitectureResult.display_total: Option<Money>` for
+  the FX-converted single-currency summary populated by the CLI, or
+  `ArchitectureResult::naive_total()` for a raw sum (only meaningful in
+  single-currency models).
+- `ResourceResult.monthly_cost: f64` is now `Money`. Access the scalar with
+  `.value` and the ISO 4217 tag with `.currency`.
+- `ResourceResult.component_costs: Vec<(String, f64)>` is now
+  `Vec<(String, Money)>`.
+- `cost_model.json` schema: `ResourceCost` and `CostComponent` carry an
+  optional `currency: Option<String>` field. Pre-ADR `cost_model.json`
+  deserializes with `currency = None`, evaluated as `USD` with a one-shot
+  warning.
+- `PriceCatalog::lookup` returns `PricedValue` (currency-tagged Scalar /
+  Tiered enum) in place of the deprecated `PriceRecord` alias.
 
 ### Changed
 

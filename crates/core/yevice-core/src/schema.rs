@@ -236,6 +236,8 @@ mod tests {
                 VariableInfo::new(&lambda, "requests", "Invocation count", "count"),
                 VariableInfo::new(&lambda, "avg_duration_ms", "Avg duration", "ms"),
             ],
+
+            currency: Some("USD".into()),
         };
 
         // MyQueue has one variable: requests (not bound)
@@ -251,6 +253,8 @@ mod tests {
                 "Message count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         // Binding: MyFunction_requests is derived from MyQueue_requests
@@ -329,6 +333,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         let binding = VariableBinding {
@@ -418,6 +424,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         let binding = VariableBinding {
@@ -469,6 +477,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         // Binding target is Function_requests, but its expr references
@@ -526,6 +536,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
         let resource_b = ResourceCost {
             logical_id: fn_b.clone(),
@@ -539,6 +551,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         // Circular: FnA_requests = FnB_requests, FnB_requests = FnA_requests.
@@ -604,6 +618,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
         let resource_b = ResourceCost {
             logical_id: fn_b.clone(),
@@ -617,6 +633,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         let binding_a = VariableBinding {
@@ -671,6 +689,8 @@ mod tests {
                 "Invocation count",
                 "count",
             )],
+
+            currency: Some("USD".into()),
         };
 
         let binding = VariableBinding {

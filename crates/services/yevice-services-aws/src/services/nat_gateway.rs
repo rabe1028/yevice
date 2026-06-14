@@ -48,10 +48,14 @@ impl Service for NatGatewayService {
                 CostComponent {
                     name: "Gateway Hours".into(),
                     expr: nat_fixed,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Data Processing".into(),
                     expr: nat_data,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![VariableInfo::new(
@@ -60,6 +64,8 @@ impl Service for NatGatewayService {
                 "Data processed per month",
                 "GB",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

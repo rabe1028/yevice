@@ -17,6 +17,8 @@ name = "yevice"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
+tracing = { workspace = true }
 yevice-core = { workspace = true }
 yevice-engine = { workspace = true }
 yevice-solver = { workspace = true }
@@ -27,7 +29,6 @@ yevice-services-aws = { workspace = true }
 yevice-services-gcp = { workspace = true }
 yevice-wrangler = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

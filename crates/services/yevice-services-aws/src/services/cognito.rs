@@ -66,6 +66,8 @@ impl Service for CognitoService {
             components: vec![CostComponent {
                 name: "MAU".into(),
                 expr: cost,
+
+                currency: None,
             }],
             required_variables: vec![VariableInfo::new(
                 id,
@@ -73,6 +75,8 @@ impl Service for CognitoService {
                 "Monthly Active Users",
                 "users",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

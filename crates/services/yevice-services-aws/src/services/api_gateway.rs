@@ -72,6 +72,8 @@ impl Service for ApiGatewayService {
                 "Requests per month",
                 "requests",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

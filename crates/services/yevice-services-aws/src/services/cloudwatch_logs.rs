@@ -78,16 +78,22 @@ impl Service for CloudWatchLogsService {
                 CostComponent {
                     name: "Ingestion".into(),
                     expr: ingestion,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Storage".into(),
                     expr: storage,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
                 VariableInfo::new(id, var::INGESTION_GB, "Log data ingested per month", "GB"),
                 VariableInfo::new(id, var::STORAGE_GB, "Log data storage", "GB"),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

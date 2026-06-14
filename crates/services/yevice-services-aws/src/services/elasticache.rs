@@ -48,6 +48,8 @@ impl Service for ElastiCacheService {
             expr: Expr::constant(hourly_price * HOURS_PER_MONTH * spec.num_nodes),
             components: vec![],
             required_variables: vec![],
+
+            currency: Some("USD".into()),
         })
     }
 }

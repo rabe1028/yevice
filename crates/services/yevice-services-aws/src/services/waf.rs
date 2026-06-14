@@ -79,17 +79,25 @@ impl Service for WafService {
                 CostComponent {
                     name: "Web ACL".into(),
                     expr: acl_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Rules".into(),
                     expr: rule_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: "Requests".into(),
                     expr: request_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vars,
+
+            currency: Some("USD".into()),
         })
     }
 }

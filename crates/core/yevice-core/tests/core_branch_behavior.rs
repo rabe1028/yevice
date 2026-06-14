@@ -188,6 +188,7 @@ fn resource(label: &str, expr: Expr, components: Vec<CostComponent>) -> Resource
         expr,
         components,
         required_variables: vec![],
+        currency: Some("USD".into()),
     }
 }
 
@@ -213,17 +214,21 @@ fn evaluate_architecture_sums_components_when_all_components_evaluate() {
             CostComponent {
                 name: "a".into(),
                 expr: Expr::constant(10.0),
+
+                currency: None,
             },
             CostComponent {
                 name: "b".into(),
                 expr: Expr::constant(20.0),
+
+                currency: None,
             },
         ],
     );
     let result =
         evaluate_architecture(&architecture(vec![rc], vec![]), &Params::default()).unwrap();
-    approx(result.total_monthly_cost, 30.0);
-    approx(result.resources[0].monthly_cost, 30.0);
+    approx(result.naive_total(), 30.0);
+    approx(result.resources[0].monthly_cost.value, 30.0);
 }
 
 #[test]
@@ -236,11 +241,13 @@ fn evaluate_architecture_falls_back_to_expr_when_a_component_cannot_evaluate() {
         vec![CostComponent {
             name: "c".into(),
             expr: Expr::variable("missing"),
+
+            currency: None,
         }],
     );
     let result =
         evaluate_architecture(&architecture(vec![rc], vec![]), &Params::default()).unwrap();
-    approx(result.total_monthly_cost, 42.0);
+    approx(result.naive_total(), 42.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +267,8 @@ fn all_variables_excludes_bound_variables_and_keeps_unbound_ones() {
             VariableInfo::new(&id, "bound", "bound var", "u"),
             VariableInfo::new(&id, "free", "free var", "u"),
         ],
+
+        currency: Some("USD".into()),
     };
     let binding = VariableBinding {
         target: id.var("bound"),

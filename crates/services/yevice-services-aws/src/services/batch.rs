@@ -141,10 +141,14 @@ impl Service for BatchService {
                 CostComponent {
                     name: format!("Compute ({}vCPU, {}GB)", spec.vcpu, spec.memory_gb),
                     expr: compute_cost,
+
+                    currency: None,
                 },
                 CostComponent {
                     name: storage_label,
                     expr: storage_cost,
+
+                    currency: None,
                 },
             ],
             required_variables: vec![
@@ -156,6 +160,8 @@ impl Service for BatchService {
                 ),
                 VariableInfo::new(id, var::AVG_DURATION_SEC, "Average job duration", "seconds"),
             ],
+
+            currency: Some("USD".into()),
         })
     }
 }

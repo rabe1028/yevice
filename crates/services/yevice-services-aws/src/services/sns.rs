@@ -62,6 +62,8 @@ impl Service for SnsService {
                 "Deliveries per month",
                 "deliveries",
             )],
+
+            currency: Some("USD".into()),
         })
     }
 }

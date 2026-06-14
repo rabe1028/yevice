@@ -1,11 +1,13 @@
 pub mod bindings;
 pub mod capacity;
 pub mod cost;
+pub mod currency;
 pub mod error;
 pub mod evaluate;
 pub mod expr;
 pub mod expr_introspect;
 pub mod expr_parser;
+pub mod fx;
 pub mod io;
 pub mod optimize;
 pub mod parse_policy;
@@ -15,7 +17,9 @@ pub mod simulate;
 pub mod topology;
 pub mod types;
 
+pub use currency::{BillingPeriod, Currency, CurrencyCode, EUR, JPY, Money, USD};
 pub use expr_introspect::LinearForm;
+pub use fx::{ExchangeRates, FxError, Rate, RateDate, StaticRates, convert_to};
 pub use optimize::{
     DecisionVariable, ObjectiveDirection, OptimizationConstraint, OptimizationProblem, Relation,
 };
