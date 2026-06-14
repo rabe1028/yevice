@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use yevice_core::{
     resource::ResourceShell,
@@ -28,22 +29,55 @@ pub enum IacError {
 }
 
 // ---------------------------------------------------------------------------
-// CloudFormation
+// Shared property value type (all IaC formats)
 // ---------------------------------------------------------------------------
 
-/// A property value for a CloudFormation resource.
-/// Whole-string unresolved intrinsics (`!Ref`, `!GetAtt`) become typed variants.
-/// Embedded sentinels inside string values (from `Fn::Sub`, `Fn::Join`, etc.)
-/// and nested object properties remain as `Concrete`.
-#[derive(Debug, Clone)]
-pub enum CfnPropertyValue {
-    /// A statically-resolved concrete value.
+/// A property value shared across all IaC formats (CFN, TF, Wrangler).
+///
+/// `Concrete` holds a statically-resolved JSON value.  The typed reference
+/// variants (`ResourceRef`, `ResourceAttr`, `Interpolated`) carry unresolved
+/// cross-resource references so that adapters can inspect or ignore them as
+/// appropriate.
+///
+/// # Non-exhaustiveness
+///
+/// This enum is marked `#[non_exhaustive]` so that adding new variants in a
+/// future release is not a breaking change for downstream match arms that
+/// include a wildcard (`_`) arm.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IacPropertyValue {
+    /// A statically-resolved concrete JSON value.
     Concrete(serde_json::Value),
-    /// An unresolved `!Ref LogicalId` referencing a resource in the same template.
-    ResourceRef(String),
-    /// An unresolved `!GetAtt LogicalId.Attr`.
-    ResourceGetAtt { logical_id: String, attr: String },
+    /// An unresolved `!Ref LogicalId` / `resource_type.name` referencing
+    /// another resource in the same template/config.
+    ResourceRef { logical_id: String },
+    /// An unresolved `!GetAtt LogicalId.Attr` /
+    /// `resource_type.name.attr` resource attribute reference.
+    ResourceAttr { logical_id: String, attr: String },
+    /// An interpolated string composed of literal text and typed references
+    /// (e.g., from `Fn::Sub` or TF template strings).
+    Interpolated { parts: Vec<IacStringPart> },
 }
+
+/// One segment of an interpolated string property value.
+///
+/// Matches the variant structure of `IacPropertyValue` but at the
+/// per-segment level inside an `Interpolated` value.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IacStringPart {
+    /// A plain literal string segment.
+    Literal(String),
+    /// A `!Ref`-style / resource-name reference segment.
+    Ref(String),
+    /// A `!GetAtt`-style / resource attribute reference segment.
+    Attr { logical_id: String, attr: String },
+}
+
+// ---------------------------------------------------------------------------
+// CloudFormation
+// ---------------------------------------------------------------------------
 
 /// A raw CloudFormation resource as parsed from YAML.
 ///
@@ -53,13 +87,13 @@ pub struct RawCfnResource {
     pub logical_id: LogicalId,
     pub resource_type: ResourceType,
     /// The `Properties` block of the CFn resource, keyed by property name.
-    pub properties: BTreeMap<String, CfnPropertyValue>,
+    pub properties: BTreeMap<String, IacPropertyValue>,
 }
 
 impl RawCfnResource {
     /// Construct a `RawCfnResource` from a concrete `serde_json::Value` properties block.
     ///
-    /// All top-level property values are wrapped as `CfnPropertyValue::Concrete`.
+    /// All top-level property values are wrapped as `IacPropertyValue::Concrete`.
     /// This constructor is intended for use in tests and adapters that work with
     /// already-resolved concrete JSON values (no sentinel parsing is performed).
     pub fn new(
@@ -69,7 +103,7 @@ impl RawCfnResource {
     ) -> Self {
         let props = if let Value::Object(map) = properties {
             map.into_iter()
-                .map(|(k, v)| (k, CfnPropertyValue::Concrete(v)))
+                .map(|(k, v)| (k, IacPropertyValue::Concrete(v)))
                 .collect()
         } else {
             BTreeMap::new()
@@ -84,54 +118,57 @@ impl RawCfnResource {
     /// Get a string property value.
     pub fn get_str(&self, key: &str) -> Option<&str> {
         match self.properties.get(key)? {
-            CfnPropertyValue::Concrete(Value::String(s)) => Some(s.as_str()),
-            CfnPropertyValue::Concrete(_) => None,
-            CfnPropertyValue::ResourceRef(id) => {
-                tracing::warn!(key, ref_id = %id, "unresolved !Ref where str expected; skipping");
+            IacPropertyValue::Concrete(Value::String(s)) => Some(s.as_str()),
+            IacPropertyValue::Concrete(_) => None,
+            IacPropertyValue::ResourceRef { logical_id } => {
+                tracing::warn!(key, ref_id = %logical_id, "unresolved !Ref where str expected; skipping");
                 None
             }
-            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+            IacPropertyValue::ResourceAttr { logical_id, attr } => {
                 tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where str expected; skipping");
                 None
             }
+            IacPropertyValue::Interpolated { .. } => None,
         }
     }
 
     /// Get a numeric property value as f64.
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         match self.properties.get(key)? {
-            CfnPropertyValue::Concrete(Value::Number(n)) => n.as_f64(),
-            CfnPropertyValue::Concrete(Value::String(s)) => s.parse().ok(),
-            CfnPropertyValue::Concrete(_) => None,
-            CfnPropertyValue::ResourceRef(id) => {
-                tracing::warn!(key, ref_id = %id, "unresolved !Ref where f64 expected; skipping");
+            IacPropertyValue::Concrete(Value::Number(n)) => n.as_f64(),
+            IacPropertyValue::Concrete(Value::String(s)) => s.parse().ok(),
+            IacPropertyValue::Concrete(_) => None,
+            IacPropertyValue::ResourceRef { logical_id } => {
+                tracing::warn!(key, ref_id = %logical_id, "unresolved !Ref where f64 expected; skipping");
                 None
             }
-            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+            IacPropertyValue::ResourceAttr { logical_id, attr } => {
                 tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where f64 expected; skipping");
                 None
             }
+            IacPropertyValue::Interpolated { .. } => None,
         }
     }
 
     /// Get a boolean property value.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         match self.properties.get(key)? {
-            CfnPropertyValue::Concrete(Value::Bool(b)) => Some(*b),
-            CfnPropertyValue::Concrete(Value::String(s)) => match s.to_lowercase().as_str() {
+            IacPropertyValue::Concrete(Value::Bool(b)) => Some(*b),
+            IacPropertyValue::Concrete(Value::String(s)) => match s.to_lowercase().as_str() {
                 "true" => Some(true),
                 "false" => Some(false),
                 _ => None,
             },
-            CfnPropertyValue::Concrete(_) => None,
-            CfnPropertyValue::ResourceRef(id) => {
-                tracing::warn!(key, ref_id = %id, "unresolved !Ref where bool expected; skipping");
+            IacPropertyValue::Concrete(_) => None,
+            IacPropertyValue::ResourceRef { logical_id } => {
+                tracing::warn!(key, ref_id = %logical_id, "unresolved !Ref where bool expected; skipping");
                 None
             }
-            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+            IacPropertyValue::ResourceAttr { logical_id, attr } => {
                 tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where bool expected; skipping");
                 None
             }
+            IacPropertyValue::Interpolated { .. } => None,
         }
     }
 
@@ -139,15 +176,16 @@ impl RawCfnResource {
     /// Returns `None` for unresolved intrinsic references.
     pub fn get_object(&self, key: &str) -> Option<&serde_json::Value> {
         match self.properties.get(key)? {
-            CfnPropertyValue::Concrete(v) => Some(v),
-            CfnPropertyValue::ResourceRef(id) => {
-                tracing::warn!(key, ref_id = %id, "unresolved !Ref where object expected; skipping");
+            IacPropertyValue::Concrete(v) => Some(v),
+            IacPropertyValue::ResourceRef { logical_id } => {
+                tracing::warn!(key, ref_id = %logical_id, "unresolved !Ref where object expected; skipping");
                 None
             }
-            CfnPropertyValue::ResourceGetAtt { logical_id, attr } => {
+            IacPropertyValue::ResourceAttr { logical_id, attr } => {
                 tracing::warn!(key, %logical_id, %attr, "unresolved !GetAtt where object expected; skipping");
                 None
             }
+            IacPropertyValue::Interpolated { .. } => None,
         }
     }
 }
@@ -218,15 +256,17 @@ impl CfnAdapterRegistry {
 
 /// A resolved Terraform resource with concrete attribute values.
 ///
-/// Attribute values are stored as `serde_json::Value` so adapters can use
+/// Attribute values are stored as `IacPropertyValue` so adapters can use
 /// `get_str`, `get_f64`, and `get_bool` methods without depending on the
-/// internal `TfValue` type.
+/// internal `TfValue` type.  Concrete scalars are wrapped in
+/// `IacPropertyValue::Concrete`; cross-resource references become
+/// `IacPropertyValue::ResourceRef` or `IacPropertyValue::ResourceAttr`.
 #[derive(Debug, Clone)]
 pub struct RawTfResource {
     pub logical_id: LogicalId,
     pub resource_type: ResourceType,
-    /// Flat attribute map with resolved (concrete) values.
-    pub attrs: HashMap<String, Value>,
+    /// Flat attribute map with resolved values.
+    pub attrs: HashMap<String, IacPropertyValue>,
     /// Block attributes (e.g., `container_properties` blocks).
     pub blocks: HashMap<String, Vec<HashMap<String, Value>>>,
 }
@@ -243,28 +283,40 @@ impl RawTfResource {
 
     /// Get a string attribute value.
     pub fn get_str(&self, key: &str) -> Option<&str> {
-        self.attrs.get(key)?.as_str()
+        match self.attrs.get(key)? {
+            IacPropertyValue::Concrete(Value::String(s)) => Some(s.as_str()),
+            IacPropertyValue::Concrete(_) => None,
+            IacPropertyValue::ResourceRef { .. }
+            | IacPropertyValue::ResourceAttr { .. }
+            | IacPropertyValue::Interpolated { .. } => None,
+        }
     }
 
     /// Get a numeric attribute value as f64.
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         match self.attrs.get(key)? {
-            Value::Number(n) => n.as_f64(),
-            Value::String(s) => s.parse::<f64>().ok(),
-            _ => None,
+            IacPropertyValue::Concrete(Value::Number(n)) => n.as_f64(),
+            IacPropertyValue::Concrete(Value::String(s)) => s.parse::<f64>().ok(),
+            IacPropertyValue::Concrete(_) => None,
+            IacPropertyValue::ResourceRef { .. }
+            | IacPropertyValue::ResourceAttr { .. }
+            | IacPropertyValue::Interpolated { .. } => None,
         }
     }
 
     /// Get a boolean attribute value.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         match self.attrs.get(key)? {
-            Value::Bool(b) => Some(*b),
-            Value::String(s) => match s.to_lowercase().as_str() {
+            IacPropertyValue::Concrete(Value::Bool(b)) => Some(*b),
+            IacPropertyValue::Concrete(Value::String(s)) => match s.to_lowercase().as_str() {
                 "true" => Some(true),
                 "false" => Some(false),
                 _ => None,
             },
-            _ => None,
+            IacPropertyValue::Concrete(_) => None,
+            IacPropertyValue::ResourceRef { .. }
+            | IacPropertyValue::ResourceAttr { .. }
+            | IacPropertyValue::Interpolated { .. } => None,
         }
     }
 
