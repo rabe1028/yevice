@@ -9,7 +9,7 @@ use yevice_core::{
     },
     types::{LogicalId, Region, ResourceType},
 };
-use yevice_service_api::{CfnAdapterRegistry, CfnPropertyValue, RawCfnResource};
+use yevice_service_api::{CfnAdapterRegistry, IacPropertyValue, IacStringPart, RawCfnResource};
 
 use crate::parser::{ResolvedResource, ResolvedTemplate};
 use crate::resolved::{Reference, ResolvedValue, StringPart, render_parts};
@@ -600,14 +600,14 @@ fn get_resolved_number(props: &ResolvedValue, key: &str) -> Option<f64> {
 }
 
 /// Convert a resolved properties block to a
-/// `BTreeMap<String, CfnPropertyValue>` for the adapter boundary.
+/// `BTreeMap<String, IacPropertyValue>` for the adapter boundary.
 ///
 /// Each top-level entry is converted: typed references (`Ref` / `GetAtt`,
 /// including an `Interpolated` value consisting of a single reference) become
-/// `ResourceRef` / `ResourceGetAtt`.  Everything else becomes `Concrete` JSON,
-/// with references nested inside containers or mixed with literal text
-/// rendered using the CFn-native `${LogicalId}` / `${LogicalId.Attr}` syntax.
-fn resolved_to_cfn_properties(value: &ResolvedValue) -> BTreeMap<String, CfnPropertyValue> {
+/// `ResourceRef` / `ResourceAttr`.  Multi-part `Interpolated` values are
+/// preserved as `IacPropertyValue::Interpolated`.  Everything else becomes
+/// `Concrete` JSON.
+fn resolved_to_cfn_properties(value: &ResolvedValue) -> BTreeMap<String, IacPropertyValue> {
     match value {
         ResolvedValue::Map(map) => map
             .iter()
@@ -618,18 +618,20 @@ fn resolved_to_cfn_properties(value: &ResolvedValue) -> BTreeMap<String, CfnProp
             .iter()
             .filter_map(|(k, v)| {
                 k.as_str()
-                    .map(|key| (key.to_string(), CfnPropertyValue::Concrete(yaml_to_json(v))))
+                    .map(|key| (key.to_string(), IacPropertyValue::Concrete(yaml_to_json(v))))
             })
             .collect(),
         _ => BTreeMap::new(),
     }
 }
 
-/// Convert a single top-level resolved property to a `CfnPropertyValue`.
-fn resolved_to_cfn_property(value: &ResolvedValue) -> CfnPropertyValue {
+/// Convert a single top-level resolved property to an `IacPropertyValue`.
+fn resolved_to_cfn_property(value: &ResolvedValue) -> IacPropertyValue {
     match value {
-        ResolvedValue::Ref(id) => CfnPropertyValue::ResourceRef(id.clone()),
-        ResolvedValue::GetAtt { logical_id, attr } => CfnPropertyValue::ResourceGetAtt {
+        ResolvedValue::Ref(id) => IacPropertyValue::ResourceRef {
+            logical_id: id.clone(),
+        },
+        ResolvedValue::GetAtt { logical_id, attr } => IacPropertyValue::ResourceAttr {
             logical_id: logical_id.clone(),
             attr: attr.clone(),
         },
@@ -643,17 +645,31 @@ fn resolved_to_cfn_property(value: &ResolvedValue) -> CfnPropertyValue {
                 .collect();
             if parts.len() == 1 && non_literal.len() == 1 {
                 return match non_literal[0] {
-                    StringPart::Ref(id) => CfnPropertyValue::ResourceRef(id.clone()),
-                    StringPart::GetAtt { logical_id, attr } => CfnPropertyValue::ResourceGetAtt {
+                    StringPart::Ref(id) => IacPropertyValue::ResourceRef {
+                        logical_id: id.clone(),
+                    },
+                    StringPart::GetAtt { logical_id, attr } => IacPropertyValue::ResourceAttr {
                         logical_id: logical_id.clone(),
                         attr: attr.clone(),
                     },
                     StringPart::Literal(_) => unreachable!("filtered above"),
                 };
             }
-            CfnPropertyValue::Concrete(serde_json::Value::String(render_parts(parts)))
+            // Multi-part interpolated: convert to typed IacStringParts.
+            let iac_parts: Vec<IacStringPart> = parts
+                .iter()
+                .map(|p| match p {
+                    StringPart::Literal(s) => IacStringPart::Literal(s.clone()),
+                    StringPart::Ref(id) => IacStringPart::Ref(id.clone()),
+                    StringPart::GetAtt { logical_id, attr } => IacStringPart::Attr {
+                        logical_id: logical_id.clone(),
+                        attr: attr.clone(),
+                    },
+                })
+                .collect();
+            IacPropertyValue::Interpolated { parts: iac_parts }
         }
-        other => CfnPropertyValue::Concrete(resolved_to_json(other)),
+        other => IacPropertyValue::Concrete(resolved_to_json(other)),
     }
 }
 
@@ -1686,28 +1702,28 @@ mod determinism_tests {
     }
 
     // -----------------------------------------------------------------------
-    // CfnPropertyValue conversion tests
+    // IacPropertyValue conversion tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn typed_ref_becomes_resource_ref() {
         let result = resolved_to_cfn_property(&rv_ref("MyBucket"));
         assert!(
-            matches!(result, CfnPropertyValue::ResourceRef(ref id) if id == "MyBucket"),
-            "expected ResourceRef(MyBucket), got {result:?}"
+            matches!(result, IacPropertyValue::ResourceRef { ref logical_id } if logical_id == "MyBucket"),
+            "expected ResourceRef {{ MyBucket }}, got {result:?}"
         );
     }
 
     #[test]
-    fn typed_getatt_becomes_resource_get_att() {
+    fn typed_getatt_becomes_resource_attr() {
         let result = resolved_to_cfn_property(&rv_getatt("MyFunction", "Arn"));
         assert!(
             matches!(
                 result,
-                CfnPropertyValue::ResourceGetAtt { ref logical_id, ref attr }
+                IacPropertyValue::ResourceAttr { ref logical_id, ref attr }
                     if logical_id == "MyFunction" && attr == "Arn"
             ),
-            "expected ResourceGetAtt{{ MyFunction, Arn }}, got {result:?}"
+            "expected ResourceAttr{{ MyFunction, Arn }}, got {result:?}"
         );
     }
 
@@ -1717,16 +1733,17 @@ mod determinism_tests {
         assert!(
             matches!(
                 result,
-                CfnPropertyValue::Concrete(serde_json::Value::String(ref s)) if s == "us-east-1"
+                IacPropertyValue::Concrete(serde_json::Value::String(ref s)) if s == "us-east-1"
             ),
             "expected Concrete(string), got {result:?}"
         );
     }
 
-    /// An Interpolated value mixing literal text and references renders to a
-    /// CFn-native `${...}` string (NOT an internal sentinel format).
+    /// An Interpolated value mixing literal text and references becomes an
+    /// `IacPropertyValue::Interpolated` with typed parts.
     #[test]
-    fn interpolated_with_literals_renders_to_cfn_native_string() {
+    fn interpolated_with_literals_becomes_iac_interpolated() {
+        use yevice_service_api::IacStringPart;
         let value = ResolvedValue::Interpolated(vec![
             part_lit("arn:aws:lambda:${AWS::Region}:fn:"),
             part_ref("MyFn"),
@@ -1735,10 +1752,26 @@ mod determinism_tests {
         ]);
         let result = resolved_to_cfn_property(&value);
         match result {
-            CfnPropertyValue::Concrete(serde_json::Value::String(s)) => {
-                assert_eq!(s, "arn:aws:lambda:${AWS::Region}:fn:${MyFn}:${Other.Arn}");
+            IacPropertyValue::Interpolated { ref parts } => {
+                assert_eq!(parts.len(), 4);
+                assert!(
+                    matches!(&parts[0], IacStringPart::Literal(s) if s == "arn:aws:lambda:${AWS::Region}:fn:"),
+                    "part[0] should be Literal"
+                );
+                assert!(
+                    matches!(&parts[1], IacStringPart::Ref(id) if id == "MyFn"),
+                    "part[1] should be Ref(MyFn)"
+                );
+                assert!(
+                    matches!(&parts[2], IacStringPart::Literal(s) if s == ":"),
+                    "part[2] should be Literal(:)"
+                );
+                assert!(
+                    matches!(&parts[3], IacStringPart::Attr { logical_id, attr } if logical_id == "Other" && attr == "Arn"),
+                    "part[3] should be Attr(Other, Arn)"
+                );
             }
-            other => panic!("expected Concrete(String), got {other:?}"),
+            other => panic!("expected Interpolated, got {other:?}"),
         }
     }
 
@@ -1749,8 +1782,8 @@ mod determinism_tests {
         let value = ResolvedValue::Interpolated(vec![part_ref("MyTable")]);
         let result = resolved_to_cfn_property(&value);
         assert!(
-            matches!(result, CfnPropertyValue::ResourceRef(ref id) if id == "MyTable"),
-            "expected ResourceRef(MyTable), got {result:?}"
+            matches!(result, IacPropertyValue::ResourceRef { ref logical_id } if logical_id == "MyTable"),
+            "expected ResourceRef {{ MyTable }}, got {result:?}"
         );
     }
 
@@ -1761,7 +1794,7 @@ mod determinism_tests {
         let value = rv_seq(vec![rv_ref("MyQueue"), rv_str("literal")]);
         let result = resolved_to_cfn_property(&value);
         match result {
-            CfnPropertyValue::Concrete(serde_json::Value::Array(items)) => {
+            IacPropertyValue::Concrete(serde_json::Value::Array(items)) => {
                 assert_eq!(
                     items[0],
                     serde_json::Value::String("${MyQueue}".to_string())
@@ -1782,15 +1815,15 @@ mod determinism_tests {
         let props = resolved_to_cfn_properties(&props_value);
 
         assert!(
-            matches!(props["Region"], CfnPropertyValue::Concrete(_)),
+            matches!(props["Region"], IacPropertyValue::Concrete(_)),
             "Region should be Concrete"
         );
         assert!(
-            matches!(props["FunctionArn"], CfnPropertyValue::ResourceGetAtt { ref logical_id, ref attr } if logical_id == "MyFunction" && attr == "Arn"),
-            "FunctionArn should be ResourceGetAtt"
+            matches!(props["FunctionArn"], IacPropertyValue::ResourceAttr { ref logical_id, ref attr } if logical_id == "MyFunction" && attr == "Arn"),
+            "FunctionArn should be ResourceAttr"
         );
         assert!(
-            matches!(props["TableName"], CfnPropertyValue::ResourceRef(ref id) if id == "MyTable"),
+            matches!(props["TableName"], IacPropertyValue::ResourceRef { ref logical_id } if logical_id == "MyTable"),
             "TableName should be ResourceRef"
         );
     }
