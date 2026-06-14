@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use yevice_core::{
     resource::ResourceShell,
@@ -45,7 +45,7 @@ pub enum IacError {
 /// future release is not a breaking change for downstream match arms that
 /// include a wildcard (`_`) arm.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum IacPropertyValue {
     /// A statically-resolved concrete JSON value.
     Concrete(serde_json::Value),
@@ -64,11 +64,45 @@ pub enum IacPropertyValue {
     Interpolated {
         parts: Vec<IacStringPart>,
         /// Pre-rendered CFN-native form (e.g. `"hello-${MyBucket}-suffix"`).
-        /// Skipped during serialization/deserialization; rebuild with
-        /// `render_iac_parts(&parts)` if needed after deserialization.
+        /// Skipped during serialization; recomputed from `parts` on
+        /// deserialization via the custom `Deserialize` impl below.
         #[serde(skip)]
         rendered: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Custom Deserialize for IacPropertyValue
+// ---------------------------------------------------------------------------
+
+impl<'de> Deserialize<'de> for IacPropertyValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Mirror the externally-tagged layout that `#[derive(Serialize)]` produces
+        // for an enum with no `#[serde(...)]` tag attributes.
+        // The `rendered` field is intentionally absent from `Interpolated` here —
+        // it is recomputed from `parts` so that serde round-trips always restore
+        // the correct rendered string instead of the empty default that
+        // `#[serde(skip)]` would leave behind.
+        #[derive(Deserialize)]
+        enum Wire {
+            Concrete(serde_json::Value),
+            ResourceRef { logical_id: String },
+            ResourceAttr { logical_id: String, attr: String },
+            Interpolated { parts: Vec<IacStringPart> },
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Concrete(v) => IacPropertyValue::Concrete(v),
+            Wire::ResourceRef { logical_id } => IacPropertyValue::ResourceRef { logical_id },
+            Wire::ResourceAttr { logical_id, attr } => {
+                IacPropertyValue::ResourceAttr { logical_id, attr }
+            }
+            Wire::Interpolated { parts } => {
+                let rendered = render_iac_parts(&parts);
+                IacPropertyValue::Interpolated { parts, rendered }
+            }
+        })
+    }
 }
 
 impl IacPropertyValue {
@@ -546,5 +580,37 @@ mod tests {
             },
         ];
         assert_eq!(render_iac_parts(&parts), "prefix-${ResA}:${ResB.Name}");
+    }
+
+    /// Serde round-trip: serialize `Interpolated` to JSON then deserialize back;
+    /// `get_str()` must return the original rendered string, not an empty string.
+    ///
+    /// Regression test for the bug where `#[serde(skip)]` on `rendered` caused
+    /// `String::default()` (empty string) to be used after deserialization.
+    #[test]
+    fn interpolated_serde_round_trip_preserves_rendered() {
+        let parts = vec![
+            IacStringPart::Literal("prefix-".to_string()),
+            IacStringPart::Ref("Bucket".to_string()),
+        ];
+        let original = IacPropertyValue::new_interpolated(parts);
+
+        // Serialize to JSON.
+        let json = serde_json::to_string(&original).expect("serialize must succeed");
+
+        // Deserialize back.
+        let restored: IacPropertyValue =
+            serde_json::from_str(&json).expect("deserialize must succeed");
+
+        // Insert into a RawCfnResource and call get_str().
+        let mut raw =
+            RawCfnResource::new("MyResource", "AWS::Test::Resource", serde_json::json!({}));
+        raw.properties.insert("Key".to_string(), restored);
+
+        assert_eq!(
+            raw.get_str("Key"),
+            Some("prefix-${Bucket}"),
+            "round-tripped Interpolated must restore the rendered string"
+        );
     }
 }
