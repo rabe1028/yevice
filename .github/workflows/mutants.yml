@@ -4,12 +4,21 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 18 * * 0' # 毎週日曜 18:00 UTC = 月曜 03:00 JST
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - 'crates/**'
+      - '.github/workflows/mutants.yml'
 
 permissions: {}
 
 jobs:
   mutants:
-    name: cargo-mutants
+    name: cargo-mutants (full sweep)
+    # 定期実行・手動実行のみ。PR では incremental-mutants ジョブが走る。
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -23,10 +32,64 @@ jobs:
       - uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
         with:
           install_args: github:sourcefrog/cargo-mutants
-      - run: cargo mutants --workspace --no-shuffle -j 2 --output mutants-out
+      - name: Run cargo-mutants (full workspace)
+        # 変異テストは「弱いテストの定期発見」が目的。
+        # missed (exit 2) / timeout (exit 3) は想定内の発見結果なので失敗扱いにせず警告に留め、
+        # baseline 崩壊 (exit 4) や usage/internal エラー (1/5/6/70) のみ失敗させる。
+        run: |
+          set +e
+          cargo mutants --workspace --no-shuffle -j 2 --output mutants-out
+          status=$?
+          set -e
+          case "${status}" in
+            0)
+              echo "cargo-mutants: all viable mutants caught."
+              ;;
+            2)
+              echo "::warning title=cargo-mutants::Missed mutants found (exit 2). See the mutants-report artifact to strengthen tests."
+              ;;
+            3)
+              echo "::warning title=cargo-mutants::Timeouts occurred (exit 3). See the mutants-report artifact."
+              ;;
+            *)
+              echo "::error title=cargo-mutants::cargo-mutants failed with exit code ${status} (baseline/usage/internal error)."
+              exit "${status}"
+              ;;
+          esac
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutants-report
           path: mutants-out/
+
+  incremental-mutants:
+    name: cargo-mutants (PR diff smoke test)
+    # PR の変更行に重なる mutant のみをテストする smoke test。新規・変更コードのテスト品質をゲートする。
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
+        with:
+          install_args: github:sourcefrog/cargo-mutants
+      - name: Generate diff against base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff "origin/${BASE_REF}...HEAD" > git.diff
+      - name: Run cargo-mutants on PR diff
+        run: cargo mutants --no-shuffle -j 2 --in-diff git.diff --output mutants-incremental-out
+      - name: Upload incremental mutants report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-incremental-report
+          path: mutants-incremental-out/
