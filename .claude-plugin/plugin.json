@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "yevice",
+  "displayName": "yevice — Cloud Cost Estimation from IaC",
+  "version": "0.1.0",
+  "description": "Estimate AWS / GCP cloud costs from CloudFormation / Terraform / Cloudflare Wrangler templates using the yevice Rust CLI. Includes a Claude Skill that drives generate / eval / sensitivity / optimize workflows and interactively fills the parameter file.",
+  "author": {
+    "name": "Ryo Abe",
+    "email": "ryo.abe@tier4.jp"
+  },
+  "homepage": "https://github.com/rabe1028/yevice",
+  "repository": "https://github.com/rabe1028/yevice",
+  "license": "MIT",
+  "keywords": ["cloud", "cost", "estimation", "aws", "gcp", "iac", "cloudformation", "terraform", "wrangler", "milp", "finops"],
+  "skills": "./skills/"
+}

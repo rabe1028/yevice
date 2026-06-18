@@ -1,0 +1,11 @@
+{
+  "name": "yevice",
+  "displayName": "yevice — Cloud Cost Estimation from IaC",
+  "version": "0.1.0",
+  "description": "Estimate AWS / GCP cloud costs from CloudFormation / Terraform / Cloudflare Wrangler templates using the yevice Rust CLI. Provides a Codex Skill that drives generate / eval / sensitivity / optimize workflows.",
+  "author": { "name": "Ryo Abe", "email": "ryo.abe@tier4.jp" },
+  "homepage": "https://github.com/rabe1028/yevice",
+  "repository": "https://github.com/rabe1028/yevice",
+  "license": "MIT",
+  "skills": "./skills/"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "yevice",
+  "owner": { "name": "Ryo Abe" },
+  "plugins": [
+    {
+      "name": "yevice",
+      "source": ".",
+      "version": "0.1.0",
+      "description": "Cloud cost estimation from IaC (CloudFormation / Terraform / Wrangler) using the yevice Rust CLI.",
+      "homepage": "https://github.com/rabe1028/yevice"
+    }
+  ]
+}

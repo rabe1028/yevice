@@ -43,6 +43,16 @@ cargo run --release -p yevice-cli -- --help
 
 ## Install
 
+### Easy install (recommended)
+
+```bash
+./scripts/install.sh              # default: ~/.cargo/bin/yevice
+./scripts/install.sh --highs      # enable HiGHS MILP backend for `optimize`
+./scripts/install.sh --root /usr/local --force
+```
+
+The script wraps `cargo install --path crates/cli/yevice-cli --locked`. See `./scripts/install.sh --help` for all options.
+
 ### From a local checkout
 
 `cargo install` builds in release mode and copies the `yevice` binary into
@@ -109,6 +119,42 @@ Other available subcommands:
 | `update-pricing`  | Download fresh AWS pricing data for a region        |
 
 Run `yevice <command> --help` for the full option list.
+
+## Use with AI assistants
+
+This repo ships as a plugin for AI coding assistants. The included Skill
+(`skills/yevice/SKILL.md`) encodes the canonical generate → eval → sensitivity /
+optimize workflow, including the interactive parameter-completion step (A.5).
+
+### Claude Code
+
+Install via Claude Code's plugin command (the exact form depends on your Claude
+Code version — refer to the Claude Code docs for the command supported by your
+version):
+
+```bash
+# from inside Claude Code
+/plugin install rabe1028/yevice
+```
+
+Or use the self-marketplace (`.claude-plugin/marketplace.json`) by pointing your
+Claude Code config at this repository.
+
+### OpenAI Codex
+
+The Skill at `skills/yevice/SKILL.md` and the project instructions at `AGENTS.md`
+are picked up by Codex automatically when the repo is the working directory. To
+install repo-wide via Codex's plugin system:
+
+```bash
+codex plugin install https://github.com/rabe1028/yevice
+```
+
+### Manual setup
+
+If your assistant does not have a plugin system, copy `skills/yevice/SKILL.md`
+into the assistant's skill directory (e.g. `~/.claude/skills/yevice/` for Claude
+Code or `~/.agents/skills/yevice/` for Codex-compatible tooling).
 
 ## Development
 
