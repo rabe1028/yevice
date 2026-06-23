@@ -147,6 +147,15 @@ pub(crate) struct EncodedProblem {
     pub decision_indicators: BTreeMap<VariableName, Vec<(VarId, f64)>>,
 }
 
+impl std::fmt::Debug for EncodedProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodedProblem")
+            .field("var_index_count", &self.var_index.len())
+            .field("decision_indicators_count", &self.decision_indicators.len())
+            .finish()
+    }
+}
+
 pub(crate) fn encode(
     backend: &mut dyn MilpBackend,
     problem: &OptimizationProblem,
@@ -1191,6 +1200,2204 @@ mod tests {
         assert!(
             result.is_ok(),
             "encode must succeed when a Div denominator's variable coefficients cancel to zero; got: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for LinearTerms methods (catches mutants on from_const, from_var,
+    // scale, add, sub)
+    // -----------------------------------------------------------------------
+
+    /// `linear_terms_from_const_has_nonzero_constant` — verifies that
+    /// `LinearTerms::from_const` actually sets the constant field.  If the
+    /// mutant replaces the function with `Default::default()` the constant
+    /// will be 0.0 and this assertion fails.
+    #[test]
+    fn linear_terms_from_const_has_nonzero_constant() {
+        let lt = LinearTerms::from_const(42.0);
+        assert_eq!(lt.constant, 42.0, "from_const must set constant to 42.0");
+        assert!(lt.coeffs.is_empty(), "from_const must have empty coeffs");
+    }
+
+    /// `linear_terms_from_var_has_coeff` — verifies that `LinearTerms::from_var`
+    /// actually inserts the variable into the coeffs map.  If the mutant
+    /// replaces the function with `Default::default()` the coeffs will be empty.
+    #[test]
+    fn linear_terms_from_var_has_coeff() {
+        let lt = LinearTerms::from_var(5, 3.14);
+        assert_eq!(lt.constant, 0.0, "from_var must have zero constant");
+        assert_eq!(lt.coeffs.len(), 1, "from_var must have exactly one coeff");
+        assert_eq!(lt.coeffs[&5], 3.14, "from_var must insert correct coeff");
+    }
+
+    /// `linear_terms_scale_by_zero_returns_default` — verifies that scaling by
+    /// 0.0 returns a default (empty) LinearTerms.  The mutant `replace == with
+    /// !=` would skip the early return and produce non-zero results.
+    #[test]
+    fn linear_terms_scale_by_zero_returns_default() {
+        let lt = LinearTerms::from_const(42.0);
+        let scaled = lt.scale(0.0);
+        assert_eq!(scaled.constant, 0.0, "scale(0.0) must zero the constant");
+        assert!(scaled.coeffs.is_empty(), "scale(0.0) must clear coeffs");
+    }
+
+    /// `linear_terms_scale_by_nonzero` — verifies that scaling by a non-zero
+    /// factor multiplies both coeffs and constant.  The mutant `replace *= with
+    /// +=` or `replace *= with /=` would produce wrong values.
+    #[test]
+    fn linear_terms_scale_by_nonzero() {
+        let lt = LinearTerms::from_var(1, 5.0);
+        let scaled = lt.scale(3.0);
+        assert_eq!(scaled.constant, 0.0);
+        assert_eq!(
+            scaled.coeffs[&1], 15.0,
+            "scale must multiply coeff by factor"
+        );
+    }
+
+    /// `linear_terms_scale_constant_only` — verifies that a constant-only
+    /// LinearTerms is scaled correctly.  The mutant `replace *= with +=` on the
+    /// constant line would produce wrong results.
+    #[test]
+    fn linear_terms_scale_constant_only() {
+        let lt = LinearTerms::from_const(10.0);
+        let scaled = lt.scale(2.0);
+        assert_eq!(
+            scaled.constant, 20.0,
+            "scale must multiply constant by factor"
+        );
+    }
+
+    /// `linear_terms_add_combines_coeffs` — verifies that `add` merges coeff
+    /// maps.  The mutant `replace += with -=` or `replace += with *=` would
+    /// produce wrong merged values.
+    #[test]
+    fn linear_terms_add_combines_coeffs() {
+        let a = LinearTerms::from_var(1, 3.0);
+        let b = LinearTerms::from_var(2, 5.0);
+        let sum = a.add(b);
+        assert_eq!(sum.coeffs.len(), 2);
+        assert_eq!(sum.coeffs[&1], 3.0);
+        assert_eq!(sum.coeffs[&2], 5.0);
+        assert_eq!(sum.constant, 0.0);
+    }
+
+    /// `linear_terms_add_with_overlap` — verifies that `add` correctly sums
+    /// coefficients for the same VarId.  The mutant `replace += with -=` would
+    /// subtract instead of adding.
+    #[test]
+    fn linear_terms_add_with_overlap() {
+        let a = LinearTerms::from_var(1, 3.0);
+        let b = LinearTerms::from_var(1, 7.0);
+        let sum = a.add(b);
+        assert_eq!(sum.coeffs.len(), 1);
+        assert_eq!(sum.coeffs[&1], 10.0, "add must sum overlapping coeffs");
+    }
+
+    /// `linear_terms_add_with_constants` — verifies that `add` merges constant
+    /// terms.  The mutant `replace += with -=` on the constant line would
+    /// subtract constants.
+    #[test]
+    fn linear_terms_add_with_constants() {
+        let a = LinearTerms::from_const(3.0);
+        let b = LinearTerms::from_const(7.0);
+        let sum = a.add(b);
+        assert_eq!(sum.constant, 10.0, "add must sum constants");
+    }
+
+    /// `linear_terms_sub` — verifies that `sub` correctly subtracts by scaling
+    /// the other by -1.0 and adding.  The mutant `delete -` in `sub` would
+    /// turn it into `add` instead.
+    #[test]
+    fn linear_terms_sub() {
+        let a = LinearTerms::from_const(10.0);
+        let b = LinearTerms::from_const(3.0);
+        let diff = a.sub(b);
+        assert_eq!(diff.constant, 7.0, "sub must subtract constants");
+    }
+
+    /// `linear_terms_sub_with_vars` — verifies subtraction with variable terms.
+    #[test]
+    fn linear_terms_sub_with_vars() {
+        let a = LinearTerms::from_var(1, 10.0);
+        let b = LinearTerms::from_var(1, 3.0);
+        let diff = a.sub(b);
+        assert_eq!(diff.coeffs[&1], 7.0, "sub must subtract variable coeffs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for encode_expr variants (catches mutants on each match arm)
+    // -----------------------------------------------------------------------
+
+    /// `encode_expr_constant` — verifies that `Expr::Constant` is encoded as a
+    /// constant LinearTerms.  The mutant `delete match arm Expr::Constant`
+    /// would fall through to the `_` arm and return `Nonlinear`.
+    #[test]
+    fn encode_expr_constant() {
+        let problem = OptimizationProblem {
+            objective: Expr::Constant { value: 42.0 },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for constant objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_variable` — verifies that `Expr::Variable` is encoded as a
+    /// variable LinearTerms.  The mutant `delete match arm Expr::Variable`
+    /// would fall through to the `_` arm and return `Nonlinear`.
+    #[test]
+    fn encode_expr_variable() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for variable objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_linear` — verifies that `Expr::Linear` is encoded correctly.
+    /// The mutant `delete match arm Expr::Linear` would fall through to the
+    /// `_` arm and return `Nonlinear`.
+    #[test]
+    fn encode_expr_linear() {
+        let problem = OptimizationProblem {
+            objective: Expr::Linear {
+                coeff: 2.0,
+                var: Box::new(Expr::variable("x")),
+                offset: 5.0,
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for Linear objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_sum` — verifies that `Expr::Sum` is encoded correctly.
+    /// The mutant `delete match arm Expr::Sum` would fall through to the `_`
+    /// arm and return `Nonlinear`.
+    #[test]
+    fn encode_expr_sum() {
+        let problem = OptimizationProblem {
+            objective: Expr::Sum {
+                exprs: vec![Expr::variable("x"), Expr::variable("y")],
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![2.0],
+                },
+            ],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for Sum objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_product` — verifies that `Expr::Product` is encoded
+    /// correctly.  The mutant `delete match arm Expr::Product` would fall
+    /// through to the `_` arm and return `Nonlinear`.
+    #[test]
+    fn encode_expr_product() {
+        let problem = OptimizationProblem {
+            objective: Expr::Product {
+                exprs: vec![Expr::constant(2.0), Expr::variable("x")],
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for Product objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_div` — verifies that `Expr::Div` with a constant
+    /// denominator is encoded correctly.  The mutant `delete match arm
+    /// Expr::Div` would fall through to the `_` arm and return `Nonlinear`.
+    #[test]
+    fn encode_expr_div() {
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::variable("x")),
+                denominator: Box::new(Expr::Constant { value: 2.0 }),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for Div objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_div_nonzero_constant` — verifies that Div with a
+    /// non-unit constant denominator works.  The mutant `replace == with !=`
+    /// on the `d.constant == 0.0` check would reject valid denominators.
+    #[test]
+    fn encode_expr_div_nonzero_constant() {
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::Constant { value: 10.0 }),
+                denominator: Box::new(Expr::Constant { value: 3.0 }),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for constant Div; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_expr_div_zero_constant_rejected` — verifies that Div with a
+    /// zero constant denominator returns `Nonlinear`.  The mutant
+    /// `replace == with !=` would incorrectly accept it.
+    #[test]
+    fn encode_expr_div_zero_constant_rejected() {
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::Constant { value: 10.0 }),
+                denominator: Box::new(Expr::Constant { value: 0.0 }),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            matches!(result, Err(SolverError::Nonlinear { .. })),
+            "encode must reject Div with zero constant denominator; got: {:?}",
+            result
+        );
+    }
+
+    /// `encode_expr_div_variable_denominator_rejected` — verifies that Div
+    /// with a variable denominator returns `Nonlinear`.  The mutant
+    /// `replace == with !=` on the `denominator_has_variable` check would
+    /// incorrectly accept it.
+    #[test]
+    fn encode_expr_div_variable_denominator_rejected() {
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::Constant { value: 10.0 }),
+                denominator: Box::new(Expr::variable("x")),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            matches!(result, Err(SolverError::Nonlinear { .. })),
+            "encode must reject Div with variable denominator; got: {:?}",
+            result
+        );
+    }
+
+    /// `encode_expr_unbound_variable` — verifies that an unbound variable
+    /// returns `UnboundVariables`.  The mutant `replace != with ==` on the
+    /// `enc.var_index.get(name)` check would incorrectly accept it.
+    #[test]
+    fn encode_expr_unbound_variable() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("unbound"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            matches!(result, Err(SolverError::UnboundVariables { .. })),
+            "encode must reject unbound variables; got: {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for register_decision_var (catches mutants on decision var encoding)
+    // -----------------------------------------------------------------------
+
+    /// `register_decision_var_nonempty_domain` — verifies that a decision
+    /// variable with a non-empty domain creates the correct number of binary
+    /// indicators.  The mutant `replace register_decision_var with Ok(vec![])`
+    /// would return an empty vec.
+    #[test]
+    fn register_decision_var_nonempty_domain() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed; got: {:?}",
+            result.err()
+        );
+        let encoded = result.unwrap();
+        let indicators = encoded.decision_indicators.get(&var("x"));
+        assert!(
+            indicators.is_some(),
+            "encode must create indicators for decision variable x"
+        );
+        let indicators = indicators.unwrap();
+        assert_eq!(
+            indicators.len(),
+            3,
+            "encode must create 3 binary indicators for domain size 3; got {}",
+            indicators.len()
+        );
+    }
+
+    /// `register_decision_var_single_value` — verifies that a single-value
+    /// domain creates exactly one indicator.
+    #[test]
+    fn register_decision_var_single_value() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![5.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed; got: {:?}",
+            result.err()
+        );
+        let encoded = result.unwrap();
+        let indicators = encoded.decision_indicators.get(&var("x"));
+        assert!(indicators.is_some());
+        assert_eq!(indicators.unwrap().len(), 1);
+    }
+
+    /// `register_decision_var_empty_domain` — verifies that an empty domain
+    /// still encodes without error (the constraint `0 = 1` makes it infeasible
+    /// at solve time).
+    #[test]
+    fn register_decision_var_empty_domain() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed even with empty domain (infeasibility is checked at solve time); got: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for reachable_binding_targets (catches mutants on reachability)
+    // -----------------------------------------------------------------------
+
+    /// `reachable_binding_targets_basic` — verifies that the function returns
+    /// the set of all variables visited during reachability analysis.
+    #[test]
+    fn reachable_binding_targets_basic() {
+        let objective = Expr::variable("x");
+        let constraint_lhss: Vec<&Expr> = vec![];
+        let bindings: Vec<yevice_core::cost::VariableBinding> = vec![];
+        let normalised_bindings: Vec<Expr> = vec![];
+
+        let reachable = reachable_binding_targets(
+            &objective,
+            constraint_lhss.into_iter(),
+            &bindings,
+            &normalised_bindings,
+        );
+        // x is in the objective, so it is visited and added to seen.
+        assert!(
+            reachable.contains(&var("x")),
+            "reachable_binding_targets must include variables from the objective"
+        );
+    }
+
+    /// `reachable_binding_targets_through_binding` — verifies that binding
+    /// targets whose values are used transitively are marked as reachable.
+    #[test]
+    fn reachable_binding_targets_through_binding() {
+        let objective = Expr::variable("derived");
+        let constraint_lhss: Vec<&Expr> = vec![];
+        let bindings = vec![yevice_core::cost::VariableBinding {
+            target: var("derived"),
+            expr: Expr::variable("x"),
+            description: String::new(),
+            source: "test".into(),
+        }];
+        let normalised_bindings = vec![Expr::variable("x")];
+
+        let reachable = reachable_binding_targets(
+            &objective,
+            constraint_lhss.into_iter(),
+            &bindings,
+            &normalised_bindings,
+        );
+        assert!(
+            reachable.contains(&var("derived")),
+            "reachable_binding_targets must include binding target 'derived'"
+        );
+    }
+
+    /// `reachable_binding_targets_not_referenced` — verifies that binding
+    /// targets not referenced from the objective or constraints are NOT marked
+    /// as reachable.  The mutant `replace == with !=` on the `b.target == name`
+    /// check would incorrectly include unreachable targets.
+    #[test]
+    fn reachable_binding_targets_not_referenced() {
+        let objective = Expr::variable("x");
+        let constraint_lhss: Vec<&Expr> = vec![];
+        let bindings = vec![yevice_core::cost::VariableBinding {
+            target: var("unused"),
+            expr: Expr::Constant { value: 1.0 },
+            description: String::new(),
+            source: "test".into(),
+        }];
+        let normalised_bindings = vec![Expr::Constant { value: 1.0 }];
+
+        let reachable = reachable_binding_targets(
+            &objective,
+            constraint_lhss.into_iter(),
+            &bindings,
+            &normalised_bindings,
+        );
+        assert!(
+            !reachable.contains(&var("unused")),
+            "reachable_binding_targets must NOT include unreachable binding target 'unused'"
+        );
+    }
+
+    /// `reachable_binding_targets_empty_objective` — verifies that when the
+    /// objective is a constant, no binding targets are reachable.
+    #[test]
+    fn reachable_binding_targets_empty_objective() {
+        let objective = Expr::Constant { value: 0.0 };
+        let constraint_lhss: Vec<&Expr> = vec![];
+        let bindings: Vec<yevice_core::cost::VariableBinding> = vec![];
+        let normalised_bindings: Vec<Expr> = vec![];
+
+        let reachable = reachable_binding_targets(
+            &objective,
+            constraint_lhss.into_iter(),
+            &bindings,
+            &normalised_bindings,
+        );
+        assert!(reachable.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for encode with constraints (catches mutants on constraint encoding)
+    // -----------------------------------------------------------------------
+
+    /// `encode_with_le_constraint` — verifies that `Expr::Le` constraints are
+    /// encoded.  The mutant `replace != with ==` on the
+    /// `first_resolvable_index_for_target.get(&binding.target) != Some(&i)`
+    /// check would incorrectly skip resolvable bindings.
+    #[test]
+    fn encode_with_le_constraint() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Le,
+            rhs: 10.0,
+            label: None,
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints: vec![constraint],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Le constraint; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_ge_constraint` — verifies that `Expr::Ge` constraints are
+    /// encoded.
+    #[test]
+    fn encode_with_ge_constraint() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Ge,
+            rhs: 5.0,
+            label: None,
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints: vec![constraint],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Ge constraint; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_eq_constraint` — verifies that `Expr::Eq` constraints are
+    /// encoded.
+    #[test]
+    fn encode_with_eq_constraint() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Eq,
+            rhs: 5.0,
+            label: None,
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints: vec![constraint],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Eq constraint; got: {:?}",
+            result.err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for encode with bindings (catches mutants on binding encoding)
+    // -----------------------------------------------------------------------
+
+    /// `encode_with_binding` — verifies that bindings are encoded correctly.
+    /// The mutant `delete !` on the `!progressed` check would cause an
+    /// infinite loop or incorrect fixed-point behavior.
+    #[test]
+    fn encode_with_binding() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("derived"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "derived = x * 2".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("derived"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with binding; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_chained_bindings` — verifies that chained bindings
+    /// (binding A references binding B) are encoded correctly.
+    #[test]
+    fn encode_with_chained_bindings() {
+        let binding_a = yevice_core::cost::VariableBinding {
+            target: var("a"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "a = x * 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::sum(vec![Expr::variable("a"), Expr::constant(1.0)]),
+            description: "b = a + 1".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_a, binding_b],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with chained bindings; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_fixed_params` — verifies that fixed params are encoded as
+    /// fixed variables (lower == upper).
+    #[test]
+    fn encode_with_fixed_params() {
+        let mut fixed = HashMap::new();
+        fixed.insert(var("price"), 5.0);
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("price"), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with fixed params; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_maximize_direction` — verifies that the optimization sense is
+    /// set correctly for maximize.
+    #[test]
+    fn encode_maximize_direction() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Maximize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for maximize direction; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_multiple_decision_variables` — verifies that multiple decision
+    /// variables are encoded correctly.
+    #[test]
+    fn encode_multiple_decision_variables() {
+        let problem = OptimizationProblem {
+            objective: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0, 2.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![3.0, 4.0],
+                },
+            ],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with multiple decision variables; got: {:?}",
+            result.err()
+        );
+        let encoded = result.unwrap();
+        assert!(
+            encoded.decision_indicators.contains_key(&var("x")),
+            "encode must create indicators for x"
+        );
+        assert!(
+            encoded.decision_indicators.contains_key(&var("y")),
+            "encode must create indicators for y"
+        );
+    }
+
+    /// `encode_decision_and_fixed_param_collision` — verifies that when a
+    /// decision variable name collides with a fixed param, the decision wins
+    /// (same semantics as EnumerationSolver).
+    #[test]
+    fn encode_decision_and_fixed_param_collision() {
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 99.0);
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when decision var collides with fixed param; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_unreachable_binding_skipped` — verifies that binding targets
+    /// not reachable from the objective or constraints are skipped.
+    #[test]
+    fn encode_unreachable_binding_skipped() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("unused"),
+            expr: Expr::Constant { value: 42.0 },
+            description: "unused".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with unreachable binding (it should be skipped); got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_constant_binding_folded_into_fixed_params` — verifies that
+    /// constant bindings are folded into fixed_param_map before encoding.
+    #[test]
+    fn encode_constant_binding_folded_into_fixed_params() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("rate"),
+            expr: Expr::Constant { value: 2.0 },
+            description: "rate = 2".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("rate"), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when constant binding is used as product factor; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_chain_constant_folding` — verifies that chained constant
+    /// bindings are folded via the fixed-point loop.
+    #[test]
+    fn encode_binding_chain_constant_folding() {
+        // a = 2; b = a * 3; objective = b * x
+        let binding_a = yevice_core::cost::VariableBinding {
+            target: var("a"),
+            expr: Expr::Constant { value: 2.0 },
+            description: "a = 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::product(vec![Expr::variable("a"), Expr::constant(3.0)]),
+            description: "b = a * 3".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("b"), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_a, binding_b],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with chained constant bindings; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_target_shadowed_by_decision_var` — verifies that a
+    /// binding whose target is shadowed by a decision variable is skipped.
+    #[test]
+    fn encode_binding_target_shadowed_by_decision_var() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("x"),
+            expr: Expr::Constant { value: 99.0 },
+            description: "x = 99".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when binding target is shadowed by decision var; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_target_shadowed_by_fixed_param` — verifies that a
+    /// binding whose target is shadowed by a fixed param is skipped.
+    #[test]
+    fn encode_binding_target_shadowed_by_fixed_param() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("x"),
+            expr: Expr::Constant { value: 99.0 },
+            description: "x = 99".into(),
+            source: "test".into(),
+        };
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 5.0);
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when binding target is shadowed by fixed param; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_first_resolvable_binding_for_duplicate_target` — verifies that
+    /// for duplicate binding targets, the first resolvable binding wins.
+    #[test]
+    fn encode_first_resolvable_binding_for_duplicate_target() {
+        let binding1 = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::variable("missing"),
+            description: "b = missing".into(),
+            source: "test".into(),
+        };
+        let binding2 = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::variable("x"),
+            description: "b = x".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding1, binding2],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with first-resolvable binding for duplicate target; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_unresolvable_binding_skipped` — verifies that an unresolvable
+    /// binding (all its variables are missing) is skipped.
+    #[test]
+    fn encode_unresolvable_binding_skipped() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::variable("missing1"),
+            description: "b = missing1".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when unresolvable binding is skipped; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_resolved_later` — verifies that a binding whose RHS
+    /// references another binding target is resolved in the correct order via
+    /// the fixed-point loop.
+    #[test]
+    fn encode_binding_resolved_later() {
+        // b = a + 1; a = x * 2; objective = b
+        // a must be resolved first, then b
+        let binding_a = yevice_core::cost::VariableBinding {
+            target: var("a"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "a = x * 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::sum(vec![Expr::variable("a"), Expr::constant(1.0)]),
+            description: "b = a + 1".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_b, binding_a], // adversarial order: b before a
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with adversarial binding order; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_empty_problem` — verifies that an empty problem (no decision
+    /// variables, no bindings, constant objective) encodes correctly.
+    #[test]
+    fn encode_empty_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::Constant { value: 42.0 },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for empty problem; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_multiple_constraints` — verifies that multiple constraints
+    /// are all encoded.
+    #[test]
+    fn encode_with_multiple_constraints() {
+        let constraints = vec![
+            OptimizationConstraint {
+                lhs: Expr::variable("x"),
+                relation: Relation::Le,
+                rhs: 10.0,
+                label: None,
+            },
+            OptimizationConstraint {
+                lhs: Expr::variable("x"),
+                relation: Relation::Ge,
+                rhs: 1.0,
+                label: None,
+            },
+        ];
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints,
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with multiple constraints; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_mixed_constraint_types` — verifies that Le, Ge, and Eq
+    /// constraints are all encoded correctly.
+    #[test]
+    fn encode_with_mixed_constraint_types() {
+        let constraints = vec![
+            OptimizationConstraint {
+                lhs: Expr::variable("x"),
+                relation: Relation::Le,
+                rhs: 10.0,
+                label: None,
+            },
+            OptimizationConstraint {
+                lhs: Expr::variable("y"),
+                relation: Relation::Ge,
+                rhs: 1.0,
+                label: None,
+            },
+            OptimizationConstraint {
+                lhs: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+                relation: Relation::Eq,
+                rhs: 5.0,
+                label: None,
+            },
+        ];
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                },
+            ],
+            constraints,
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with mixed constraint types; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_product_in_objective` — verifies that a product expression
+    /// with one constant factor and one variable factor is encoded correctly.
+    /// (Product of two variables is nonlinear and rejected.)
+    #[test]
+    fn encode_with_product_in_objective() {
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::constant(2.0), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with product in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_sum_in_objective` — verifies that a sum expression in the
+    /// objective is encoded correctly.
+    #[test]
+    fn encode_with_sum_in_objective() {
+        let problem = OptimizationProblem {
+            objective: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0, 2.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![3.0, 4.0],
+                },
+            ],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with sum in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_linear_in_objective` — verifies that a Linear expression
+    /// in the objective is encoded correctly.
+    #[test]
+    fn encode_with_linear_in_objective() {
+        let problem = OptimizationProblem {
+            objective: Expr::Linear {
+                coeff: 2.0,
+                var: Box::new(Expr::variable("x")),
+                offset: 5.0,
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Linear in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_div_in_objective` — verifies that a Div expression in the
+    /// objective with a constant denominator is encoded correctly.
+    #[test]
+    fn encode_with_div_in_objective() {
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::variable("x")),
+                denominator: Box::new(Expr::Constant { value: 2.0 }),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Div in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_constant_in_objective` — verifies that a constant
+    /// expression in the objective is encoded correctly.
+    #[test]
+    fn encode_with_constant_in_objective() {
+        let problem = OptimizationProblem {
+            objective: Expr::Constant { value: 42.0 },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with constant in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_variable_in_objective` — verifies that a variable
+    /// expression in the objective is encoded correctly.
+    #[test]
+    fn encode_with_variable_in_objective() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with variable in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_le_constraint_in_problem` — verifies that a Le constraint
+    /// is encoded correctly.
+    #[test]
+    fn encode_with_le_constraint_in_problem() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Le,
+            rhs: 10.0,
+            label: None,
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints: vec![constraint],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Le constraint; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_ge_constraint_in_problem` — verifies that a Ge constraint
+    /// is encoded correctly.
+    #[test]
+    fn encode_with_ge_constraint_in_problem() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Ge,
+            rhs: 5.0,
+            label: None,
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints: vec![constraint],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Ge constraint; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_eq_constraint_in_problem` — verifies that an Eq constraint
+    /// is encoded correctly.
+    #[test]
+    fn encode_with_eq_constraint_in_problem() {
+        let constraint = OptimizationConstraint {
+            lhs: Expr::variable("x"),
+            relation: Relation::Eq,
+            rhs: 5.0,
+            label: None,
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints: vec![constraint],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Eq constraint; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_binding_in_problem` — verifies that a binding is encoded
+    /// correctly.
+    #[test]
+    fn encode_with_binding_in_problem() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("derived"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "derived = x * 2".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("derived"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with binding; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_chained_bindings_in_problem` — verifies that chained
+    /// bindings are encoded correctly.
+    #[test]
+    fn encode_with_chained_bindings_in_problem() {
+        let binding_a = yevice_core::cost::VariableBinding {
+            target: var("a"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "a = x * 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::sum(vec![Expr::variable("a"), Expr::constant(1.0)]),
+            description: "b = a + 1".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_a, binding_b],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with chained bindings; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_fixed_params_in_problem` — verifies that fixed params are
+    /// encoded correctly.
+    #[test]
+    fn encode_with_fixed_params_in_problem() {
+        let mut fixed = HashMap::new();
+        fixed.insert(var("price"), 5.0);
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("price"), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with fixed params; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_maximize_direction_in_problem` — verifies that the maximize
+    /// direction is encoded correctly.
+    #[test]
+    fn encode_maximize_direction_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Maximize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for maximize direction; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_multiple_decision_variables_in_problem` — verifies that multiple
+    /// decision variables are encoded correctly.
+    #[test]
+    fn encode_multiple_decision_variables_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0, 2.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![3.0, 4.0],
+                },
+            ],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with multiple decision variables; got: {:?}",
+            result.err()
+        );
+        let encoded = result.unwrap();
+        assert!(
+            encoded.decision_indicators.contains_key(&var("x")),
+            "encode must create indicators for x"
+        );
+        assert!(
+            encoded.decision_indicators.contains_key(&var("y")),
+            "encode must create indicators for y"
+        );
+    }
+
+    /// `encode_decision_and_fixed_param_collision_in_problem` — verifies that
+    /// when a decision variable name collides with a fixed param, the decision
+    /// wins.
+    #[test]
+    fn encode_decision_and_fixed_param_collision_in_problem() {
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 99.0);
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when decision var collides with fixed param; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_unreachable_binding_skipped_in_problem` — verifies that binding
+    /// targets not reachable from the objective or constraints are skipped.
+    #[test]
+    fn encode_unreachable_binding_skipped_in_problem() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("unused"),
+            expr: Expr::Constant { value: 42.0 },
+            description: "unused".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with unreachable binding (it should be skipped); got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_constant_binding_folded_into_fixed_params_in_problem` —
+    /// verifies that constant bindings are folded into fixed_param_map before
+    /// encoding.
+    #[test]
+    fn encode_constant_binding_folded_into_fixed_params_in_problem() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("rate"),
+            expr: Expr::Constant { value: 2.0 },
+            description: "rate = 2".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("rate"), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when constant binding is used as product factor; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_chain_constant_folding_in_problem` — verifies that
+    /// chained constant bindings are folded via the fixed-point loop.
+    #[test]
+    fn encode_binding_chain_constant_folding_in_problem() {
+        let binding_a = yevice_core::cost::VariableBinding {
+            target: var("a"),
+            expr: Expr::Constant { value: 2.0 },
+            description: "a = 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::product(vec![Expr::variable("a"), Expr::constant(3.0)]),
+            description: "b = a * 3".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::variable("b"), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_a, binding_b],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with chained constant bindings; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_target_shadowed_by_decision_var_in_problem` — verifies
+    /// that a binding whose target is shadowed by a decision variable is
+    /// skipped.
+    #[test]
+    fn encode_binding_target_shadowed_by_decision_var_in_problem() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("x"),
+            expr: Expr::Constant { value: 99.0 },
+            description: "x = 99".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when binding target is shadowed by decision var; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_target_shadowed_by_fixed_param_in_problem` — verifies
+    /// that a binding whose target is shadowed by a fixed param is skipped.
+    #[test]
+    fn encode_binding_target_shadowed_by_fixed_param_in_problem() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("x"),
+            expr: Expr::Constant { value: 99.0 },
+            description: "x = 99".into(),
+            source: "test".into(),
+        };
+        let mut fixed = HashMap::new();
+        fixed.insert(var("x"), 5.0);
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: fixed,
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when binding target is shadowed by fixed param; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_first_resolvable_binding_for_duplicate_target_in_problem` —
+    /// verifies that for duplicate binding targets, the first resolvable
+    /// binding wins.
+    #[test]
+    fn encode_first_resolvable_binding_for_duplicate_target_in_problem() {
+        let binding1 = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::variable("missing"),
+            description: "b = missing".into(),
+            source: "test".into(),
+        };
+        let binding2 = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::variable("x"),
+            description: "b = x".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding1, binding2],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with first-resolvable binding for duplicate target; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_unresolvable_binding_skipped_in_problem` — verifies that an
+    /// unresolvable binding (all its variables are missing) is skipped.
+    #[test]
+    fn encode_unresolvable_binding_skipped_in_problem() {
+        let binding = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::variable("missing1"),
+            description: "b = missing1".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed when unresolvable binding is skipped; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_binding_resolved_later_in_problem` — verifies that a binding
+    /// whose RHS references another binding target is resolved in the correct
+    /// order via the fixed-point loop.
+    #[test]
+    fn encode_binding_resolved_later_in_problem() {
+        let binding_a = yevice_core::cost::VariableBinding {
+            target: var("a"),
+            expr: Expr::product(vec![Expr::variable("x"), Expr::constant(2.0)]),
+            description: "a = x * 2".into(),
+            source: "test".into(),
+        };
+        let binding_b = yevice_core::cost::VariableBinding {
+            target: var("b"),
+            expr: Expr::sum(vec![Expr::variable("a"), Expr::constant(1.0)]),
+            description: "b = a + 1".into(),
+            source: "test".into(),
+        };
+        let problem = OptimizationProblem {
+            objective: Expr::variable("b"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![binding_b, binding_a], // adversarial order: b before a
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with adversarial binding order; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_empty_problem_in_problem` — verifies that an empty problem
+    /// (no decision variables, no bindings, constant objective) encodes
+    /// correctly.
+    #[test]
+    fn encode_empty_problem_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::Constant { value: 42.0 },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed for empty problem; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_multiple_constraints_in_problem` — verifies that multiple
+    /// constraints are all encoded.
+    #[test]
+    fn encode_with_multiple_constraints_in_problem() {
+        let constraints = vec![
+            OptimizationConstraint {
+                lhs: Expr::variable("x"),
+                relation: Relation::Le,
+                rhs: 10.0,
+                label: None,
+            },
+            OptimizationConstraint {
+                lhs: Expr::variable("x"),
+                relation: Relation::Ge,
+                rhs: 1.0,
+                label: None,
+            },
+        ];
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 5.0, 10.0],
+            }],
+            constraints,
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with multiple constraints; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_mixed_constraint_types_in_problem` — verifies that Le, Ge,
+    /// and Eq constraints are all encoded correctly.
+    #[test]
+    fn encode_with_mixed_constraint_types_in_problem() {
+        let constraints = vec![
+            OptimizationConstraint {
+                lhs: Expr::variable("x"),
+                relation: Relation::Le,
+                rhs: 10.0,
+                label: None,
+            },
+            OptimizationConstraint {
+                lhs: Expr::variable("y"),
+                relation: Relation::Ge,
+                rhs: 1.0,
+                label: None,
+            },
+            OptimizationConstraint {
+                lhs: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+                relation: Relation::Eq,
+                rhs: 5.0,
+                label: None,
+            },
+        ];
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                },
+            ],
+            constraints,
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with mixed constraint types; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_product_in_objective_in_problem` — verifies that a product
+    /// expression with one constant factor and one variable factor is encoded
+    /// correctly.
+    #[test]
+    fn encode_with_product_in_objective_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::product(vec![Expr::constant(2.0), Expr::variable("x")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with product in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_sum_in_objective_in_problem` — verifies that a sum
+    /// expression in the objective is encoded correctly.
+    #[test]
+    fn encode_with_sum_in_objective_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::sum(vec![Expr::variable("x"), Expr::variable("y")]),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![
+                DecisionVariable {
+                    name: var("x"),
+                    domain: vec![1.0, 2.0],
+                },
+                DecisionVariable {
+                    name: var("y"),
+                    domain: vec![3.0, 4.0],
+                },
+            ],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with sum in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_linear_in_objective_in_problem` — verifies that a Linear
+    /// expression in the objective is encoded correctly.
+    #[test]
+    fn encode_with_linear_in_objective_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::Linear {
+                coeff: 2.0,
+                var: Box::new(Expr::variable("x")),
+                offset: 5.0,
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Linear in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_div_in_objective_in_problem` — verifies that a Div
+    /// expression in the objective with a constant denominator is encoded
+    /// correctly.
+    #[test]
+    fn encode_with_div_in_objective_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::Div {
+                numerator: Box::new(Expr::variable("x")),
+                denominator: Box::new(Expr::Constant { value: 2.0 }),
+            },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with Div in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_constant_in_objective_in_problem` — verifies that a
+    /// constant expression in the objective is encoded correctly.
+    #[test]
+    fn encode_with_constant_in_objective_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::Constant { value: 42.0 },
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with constant in objective; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// `encode_with_variable_in_objective_in_problem` — verifies that a
+    /// variable expression in the objective is encoded correctly.
+    #[test]
+    fn encode_with_variable_in_objective_in_problem() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let result = encode(&mut backend, &problem);
+        assert!(
+            result.is_ok(),
+            "encode must succeed with variable in objective; got: {:?}",
             result.err()
         );
     }
