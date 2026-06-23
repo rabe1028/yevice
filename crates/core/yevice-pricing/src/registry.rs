@@ -885,4 +885,1163 @@ mod tests {
         // First GB is free
         assert_eq!(price.egress_tiers[0].price_per_gb, 0.0);
     }
+
+    // -----------------------------------------------------------------------
+    // Tests for EC2 Windows pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ec2_windows_price_m5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m5.large").unwrap(), 0.216);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m5.xlarge").unwrap(), 0.432);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m5_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m5.2xlarge").unwrap(), 0.864);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m6a_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m6a.large").unwrap(), 0.2036);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m6a_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m6a.xlarge").unwrap(), 0.4072);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m6a_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m6a.2xlarge").unwrap(), 0.8144);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m6i_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m6i.large").unwrap(), 0.216);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_m6i_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("m6i.xlarge").unwrap(), 0.432);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_t3_medium() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("t3.medium").unwrap(), 0.1464);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_t3_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ec2_windows_hourly_price("t3.large").unwrap(), 0.2008);
+    }
+
+    #[test]
+    fn test_ec2_windows_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.ec2_windows_hourly_price("unknown.instance").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Lambda streaming price (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lambda_http_stream_gb_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.lambda_http_stream_gb_price(), 0.008);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for RDS pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rds_price_mysql_db_m6i_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.m6i.large", "mysql").unwrap();
+        assert_eq!(price.hourly_price, 0.235);
+    }
+
+    #[test]
+    fn test_rds_price_postgres_db_m6i_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.m6i.large", "postgres").unwrap();
+        assert_eq!(price.hourly_price, 0.235);
+    }
+
+    #[test]
+    fn test_rds_price_sqlserver_se_db_r5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.r5.large", "sqlserver-se").unwrap();
+        assert_eq!(price.hourly_price, 1.050);
+    }
+
+    #[test]
+    fn test_rds_price_sqlserver_se_db_r5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.r5.xlarge", "sqlserver-se").unwrap();
+        assert_eq!(price.hourly_price, 2.100);
+    }
+
+    #[test]
+    fn test_rds_price_sqlserver_se_db_t3_medium() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.t3.medium", "sqlserver-se").unwrap();
+        assert_eq!(price.hourly_price, 0.342);
+    }
+
+    #[test]
+    fn test_rds_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.rds_price("db.unknown", "unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for CloudWatch custom metric price (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cloudwatch_custom_metric_month_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.cloudwatch_custom_metric_month_price(), 0.30);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for ElastiCache pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_elasticache_price_cache_r7g_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.elasticache_price("cache.r7g.large").unwrap();
+        assert_eq!(price.hourly_price, 0.263);
+    }
+
+    #[test]
+    fn test_elasticache_price_cache_m5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.elasticache_price("cache.m5.large").unwrap();
+        assert_eq!(price.hourly_price, 0.191);
+    }
+
+    #[test]
+    fn test_elasticache_price_cache_m5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.elasticache_price("cache.m5.xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.382);
+    }
+
+    #[test]
+    fn test_elasticache_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.elasticache_price("cache.unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Bedrock token prices (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bedrock_input_token_price_per_1k() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.bedrock_input_token_price_per_1k(), 0.003);
+    }
+
+    #[test]
+    fn test_bedrock_output_token_price_per_1k() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.bedrock_output_token_price_per_1k(), 0.015);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for EBS pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ebs_gb_month_price_gp3() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_gb_month_price("gp3").unwrap(), 0.096);
+    }
+
+    #[test]
+    fn test_ebs_gb_month_price_gp2() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_gb_month_price("gp2").unwrap(), 0.12);
+    }
+
+    #[test]
+    fn test_ebs_gb_month_price_st1() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_gb_month_price("st1").unwrap(), 0.054);
+    }
+
+    #[test]
+    fn test_ebs_gb_month_price_sc1() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_gb_month_price("sc1").unwrap(), 0.018);
+    }
+
+    #[test]
+    fn test_ebs_gb_month_price_io1() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_gb_month_price("io1").unwrap(), 0.142);
+    }
+
+    #[test]
+    fn test_ebs_gb_month_price_io2() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_gb_month_price("io2").unwrap(), 0.142);
+    }
+
+    #[test]
+    fn test_ebs_gb_month_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.ebs_gb_month_price("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for EC2 pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ec2_price_m6a_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("m6a.large").unwrap();
+        assert_eq!(price.hourly_price, 0.1116);
+    }
+
+    #[test]
+    fn test_ec2_price_m6a_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("m6a.xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.2232);
+    }
+
+    #[test]
+    fn test_ec2_price_m6a_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("m6a.2xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.4464);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for MSK broker pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_msk_broker_price_kafka_t3_small() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.msk_broker_price("kafka.t3.small").unwrap();
+        assert_eq!(price.hourly_price, 0.0456);
+    }
+
+    #[test]
+    fn test_msk_broker_price_kafka_m5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.msk_broker_price("kafka.m5.large").unwrap();
+        assert_eq!(price.hourly_price, 0.213);
+    }
+
+    #[test]
+    fn test_msk_broker_price_kafka_m5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.msk_broker_price("kafka.m5.xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.425);
+    }
+
+    #[test]
+    fn test_msk_broker_price_kafka_m5_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.msk_broker_price("kafka.m5.2xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.850);
+    }
+
+    #[test]
+    fn test_msk_broker_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.msk_broker_price("kafka.unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for OpenSearch Service pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opensearch_service_price_t3_small() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_service_price("t3.small.search").unwrap();
+        assert_eq!(price.instance_hour_price, 0.036);
+    }
+
+    #[test]
+    fn test_opensearch_service_price_t3_medium() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_service_price("t3.medium.search").unwrap();
+        assert_eq!(price.instance_hour_price, 0.073);
+    }
+
+    #[test]
+    fn test_opensearch_service_price_m5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_service_price("m5.large.search").unwrap();
+        assert_eq!(price.instance_hour_price, 0.182);
+    }
+
+    #[test]
+    fn test_opensearch_service_price_m5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_service_price("m5.xlarge.search").unwrap();
+        assert_eq!(price.instance_hour_price, 0.365);
+    }
+
+    #[test]
+    fn test_opensearch_service_price_r5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_service_price("r5.large.search").unwrap();
+        assert_eq!(price.instance_hour_price, 0.250);
+    }
+
+    #[test]
+    fn test_opensearch_service_price_r5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_service_price("r5.xlarge.search").unwrap();
+        assert_eq!(price.instance_hour_price, 0.501);
+    }
+
+    #[test]
+    fn test_opensearch_service_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.opensearch_service_price("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for DocumentDB pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_documentdb_price_db_t3_medium() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.documentdb_price("db.t3.medium").unwrap();
+        assert_eq!(price.instance_hour_price, 0.076);
+    }
+
+    #[test]
+    fn test_documentdb_price_db_r5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.documentdb_price("db.r5.large").unwrap();
+        assert_eq!(price.instance_hour_price, 0.277);
+    }
+
+    #[test]
+    fn test_documentdb_price_db_r5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.documentdb_price("db.r5.xlarge").unwrap();
+        assert_eq!(price.instance_hour_price, 0.554);
+    }
+
+    #[test]
+    fn test_documentdb_price_db_r5_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.documentdb_price("db.r5.2xlarge").unwrap();
+        assert_eq!(price.instance_hour_price, 1.108);
+    }
+
+    #[test]
+    fn test_documentdb_price_db_r6g_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.documentdb_price("db.r6g.large").unwrap();
+        assert_eq!(price.instance_hour_price, 0.264);
+    }
+
+    #[test]
+    fn test_documentdb_price_db_r6g_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.documentdb_price("db.r6g.xlarge").unwrap();
+        assert_eq!(price.instance_hour_price, 0.528);
+    }
+
+    #[test]
+    fn test_documentdb_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.documentdb_price("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Redshift pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_redshift_price_dc2_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.redshift_price("dc2.large").unwrap();
+        assert_eq!(price.node_hour_price, 0.314);
+    }
+
+    #[test]
+    fn test_redshift_price_dc2_8xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.redshift_price("dc2.8xlarge").unwrap();
+        assert_eq!(price.node_hour_price, 5.024);
+    }
+
+    #[test]
+    fn test_redshift_price_ra3_xlplus() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.redshift_price("ra3.xlplus").unwrap();
+        assert_eq!(price.node_hour_price, 1.086);
+    }
+
+    #[test]
+    fn test_redshift_price_ra3_4xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.redshift_price("ra3.4xlarge").unwrap();
+        assert_eq!(price.node_hour_price, 3.496);
+    }
+
+    #[test]
+    fn test_redshift_price_ra3_16xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.redshift_price("ra3.16xlarge").unwrap();
+        assert_eq!(price.node_hour_price, 13.985);
+    }
+
+    #[test]
+    fn test_redshift_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.redshift_price("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Lightsail bundle pricing (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lightsail_bundle_nano_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.lightsail_bundle_month_price("nano_2_0").unwrap(), 3.43);
+    }
+
+    #[test]
+    fn test_lightsail_bundle_micro_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.lightsail_bundle_month_price("micro_2_0").unwrap(), 5.0);
+    }
+
+    #[test]
+    fn test_lightsail_bundle_small_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.lightsail_bundle_month_price("small_2_0").unwrap(), 10.0);
+    }
+
+    #[test]
+    fn test_lightsail_bundle_medium_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.lightsail_bundle_month_price("medium_2_0").unwrap(),
+            20.0
+        );
+    }
+
+    #[test]
+    fn test_lightsail_bundle_large_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.lightsail_bundle_month_price("large_2_0").unwrap(), 40.0);
+    }
+
+    #[test]
+    fn test_lightsail_bundle_xlarge_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.lightsail_bundle_month_price("xlarge_2_0").unwrap(),
+            80.0
+        );
+    }
+
+    #[test]
+    fn test_lightsail_bundle_2xlarge_2_0() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.lightsail_bundle_month_price("2xlarge_2_0").unwrap(),
+            160.0
+        );
+    }
+
+    #[test]
+    fn test_lightsail_bundle_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.lightsail_bundle_month_price("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Lightsail price (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lightsail_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.lightsail_price();
+        assert_eq!(price.instance_bundle_month_price, 3.43);
+        assert_eq!(price.disk_gb_month_price, 0.10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for various constant-price methods (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rds_gp3_storage_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.rds_gp3_storage_price(), 0.1216);
+    }
+
+    #[test]
+    fn test_rds_gp3_iops_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.rds_gp3_iops_price(), 0.008);
+    }
+
+    #[test]
+    fn test_ebs_snapshot_gb_month_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.ebs_snapshot_gb_month_price(), 0.05);
+    }
+
+    #[test]
+    fn test_site_to_site_vpn_connection_hour_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.site_to_site_vpn_connection_hour_price(), 0.048);
+    }
+
+    #[test]
+    fn test_redshift_storage_gb_month_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.redshift_storage_gb_month_price(), 0.0261);
+    }
+
+    #[test]
+    fn test_redshift_spectrum_tb_scan_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.redshift_spectrum_tb_scan_price(), 5.00);
+    }
+
+    #[test]
+    fn test_documentdb_storage_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.documentdb_storage_price(), 0.110);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for various service prices (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sqs_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.sqs_price();
+        assert_eq!(price.standard_request_price, 0.0000004);
+        assert_eq!(price.fifo_request_price, 0.0000005);
+    }
+
+    #[test]
+    fn test_cloudwatch_logs_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.cloudwatch_logs_price();
+        assert_eq!(price.ingestion_price_per_gb, 0.76);
+        assert_eq!(price.storage_price_per_gb, 0.033);
+    }
+
+    #[test]
+    fn test_api_gateway_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.api_gateway_price();
+        assert_eq!(price.rest_api_request_price, 0.00000435);
+        assert_eq!(price.http_api_request_price, 0.00000120);
+    }
+
+    #[test]
+    fn test_nat_gateway_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.nat_gateway_price();
+        assert_eq!(price.hourly_price, 0.062);
+        assert_eq!(price.data_processing_price_per_gb, 0.062);
+    }
+
+    #[test]
+    fn test_cloudfront_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.cloudfront_price();
+        assert_eq!(price.request_price_per_10k, 0.0120);
+        assert_eq!(price.data_transfer_price_per_gb, 0.114);
+    }
+
+    #[test]
+    fn test_step_functions_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.step_functions_price();
+        assert_eq!(price.standard_transition_price, 0.000025);
+    }
+
+    #[test]
+    fn test_eventbridge_scheduler_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.eventbridge_scheduler_price();
+        assert_eq!(price.invocation_price, 0.00000106);
+    }
+
+    #[test]
+    fn test_batch_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.batch_price();
+        assert_eq!(price.fargate_vcpu_hour_price, 0.05056);
+        assert_eq!(price.fargate_memory_gb_hour_price, 0.00553);
+    }
+
+    #[test]
+    fn test_alb_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.alb_price();
+        assert_eq!(price.alb_hour_price, 0.0243);
+        assert_eq!(price.lcu_hour_price, 0.008);
+    }
+
+    #[test]
+    fn test_sns_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.sns_price();
+        assert_eq!(price.delivery_price_per_million, 0.50);
+    }
+
+    #[test]
+    fn test_eks_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.eks_price();
+        assert_eq!(price.cluster_hour_price, 0.10);
+    }
+
+    #[test]
+    fn test_firehose_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.firehose_price();
+        assert_eq!(price.ingestion_price_per_gb, 0.031);
+    }
+
+    #[test]
+    fn test_secrets_manager_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.secrets_manager_price();
+        assert_eq!(price.secret_month_price, 0.40);
+    }
+
+    #[test]
+    fn test_waf_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.waf_price();
+        assert_eq!(price.web_acl_month_price, 5.0);
+    }
+
+    #[test]
+    fn test_efs_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.efs_price();
+        assert_eq!(price.standard_gb_month_price, 0.36);
+    }
+
+    #[test]
+    fn test_eventbridge_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.eventbridge_price();
+        assert_eq!(price.custom_event_price_per_million, 1.0);
+    }
+
+    #[test]
+    fn test_athena_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.athena_price();
+        assert_eq!(price.scan_price_per_tb, 5.0);
+    }
+
+    #[test]
+    fn test_ecr_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ecr_price();
+        assert_eq!(price.private_storage_gb_month, 0.10);
+    }
+
+    #[test]
+    fn test_appsync_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.appsync_price();
+        assert_eq!(price.operation_price_per_million, 4.0);
+    }
+
+    #[test]
+    fn test_cognito_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.cognito_price();
+        assert_eq!(price.free_tier_mau, 50_000.0);
+        assert_eq!(price.tier1_price, 0.0055);
+    }
+
+    #[test]
+    fn test_route53_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.route53_price();
+        assert_eq!(price.hosted_zone_month_price, 0.50);
+    }
+
+    #[test]
+    fn test_glue_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.glue_price();
+        assert_eq!(price.standard_dpu_hour_price, 0.44);
+        assert_eq!(price.flex_dpu_hour_price, 0.29);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Kinesis pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kinesis_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.kinesis_price();
+        assert_eq!(price.shard_hour_price, 0.0195);
+        assert_eq!(price.put_payload_unit_price, 0.0000002);
+        assert_eq!(price.on_demand_ingestion_price_per_gb, 0.098);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Fargate pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fargate_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.fargate_price();
+        assert_eq!(price.vcpu_hour_price, 0.05056);
+        assert_eq!(price.memory_gb_hour_price, 0.00553);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for OpenSearch Serverless pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opensearch_serverless_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.opensearch_serverless_price();
+        assert_eq!(price.ocu_hour_price, 0.334);
+        assert_eq!(price.storage_price_per_gb, 0.026);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for DynamoDB pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dynamodb_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.dynamodb_price();
+        assert_eq!(price.write_request_price, 0.000000715);
+        assert_eq!(price.read_request_price, 0.000000143);
+        assert_eq!(price.storage_price_per_gb, 0.285);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for S3 pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_s3_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.s3_price();
+        assert_eq!(price.put_request_price, 0.0000047);
+        assert_eq!(price.get_request_price, 0.00000037);
+        assert_eq!(price.storage_tiers[0].price_per_gb, 0.025);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Lambda pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lambda_price_values() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.lambda_price();
+        assert_eq!(price.request_price, 0.0000002);
+        assert_eq!(price.gb_second_price, 0.0000166667);
+        assert_eq!(price.free_tier_requests, 1_000_000.0);
+        assert_eq!(price.free_tier_gb_seconds, 400_000.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for RDS pricing with various engines (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rds_price_aurora_mysql() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.r5.large", "aurora-mysql").unwrap();
+        assert_eq!(price.hourly_price, 0.350);
+    }
+
+    #[test]
+    fn test_rds_price_aurora_postgresql() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.rds_price("db.r5.xlarge", "aurora-postgresql").unwrap();
+        assert_eq!(price.hourly_price, 0.700);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for EC2 pricing with various instance types (catches match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ec2_price_t3_nano() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("t3.nano").unwrap();
+        assert_eq!(price.hourly_price, 0.0068);
+    }
+
+    #[test]
+    fn test_ec2_price_t3_small() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("t3.small").unwrap();
+        assert_eq!(price.hourly_price, 0.0272);
+    }
+
+    #[test]
+    fn test_ec2_price_t3_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("t3.large").unwrap();
+        assert_eq!(price.hourly_price, 0.1088);
+    }
+
+    #[test]
+    fn test_ec2_price_m5_4xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("m5.4xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.992);
+    }
+
+    #[test]
+    fn test_ec2_price_c5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("c5.large").unwrap();
+        assert_eq!(price.hourly_price, 0.107);
+    }
+
+    #[test]
+    fn test_ec2_price_c5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("c5.xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.214);
+    }
+
+    #[test]
+    fn test_ec2_price_c5_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("c5.2xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.428);
+    }
+
+    #[test]
+    fn test_ec2_price_r5_large() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("r5.large").unwrap();
+        assert_eq!(price.hourly_price, 0.152);
+    }
+
+    #[test]
+    fn test_ec2_price_r5_xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("r5.xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.304);
+    }
+
+    #[test]
+    fn test_ec2_price_r5_2xlarge() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.ec2_price("r5.2xlarge").unwrap();
+        assert_eq!(price.hourly_price, 0.608);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Kendra pricing (catches return value and match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kendra_index_hour_price_developer_edition() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.kendra_index_hour_price("DEVELOPER_EDITION").unwrap(),
+            1.125
+        );
+    }
+
+    #[test]
+    fn test_kendra_index_hour_price_enterprise_edition() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.kendra_index_hour_price("ENTERPRISE_EDITION").unwrap(),
+            1.40
+        );
+    }
+
+    #[test]
+    fn test_kendra_index_hour_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.kendra_index_hour_price("UNKNOWN_EDITION").is_err());
+    }
+
+    #[test]
+    fn test_kendra_connector_scan_document_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.kendra_connector_scan_document_price(), 0.000_001);
+    }
+
+    #[test]
+    fn test_kendra_connector_scan_hour_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.kendra_connector_scan_hour_price(), 0.35);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for FSx for Windows pricing (catches return value and match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fsx_windows_storage_gb_month_price_ssd_single_az() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.fsx_windows_storage_gb_month_price("ssd", "single_az")
+                .unwrap(),
+            0.156
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_storage_gb_month_price_ssd_multi_az() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.fsx_windows_storage_gb_month_price("ssd", "multi_az")
+                .unwrap(),
+            0.276
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_storage_gb_month_price_hdd_single_az() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.fsx_windows_storage_gb_month_price("hdd", "single_az")
+                .unwrap(),
+            0.016
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_storage_gb_month_price_hdd_multi_az() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.fsx_windows_storage_gb_month_price("hdd", "multi_az")
+                .unwrap(),
+            0.030
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_storage_gb_month_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(
+            reg.fsx_windows_storage_gb_month_price("unknown", "single_az")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_throughput_mbps_month_price_single_az() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.fsx_windows_throughput_mbps_month_price("single_az")
+                .unwrap(),
+            2.53
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_throughput_mbps_month_price_multi_az() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.fsx_windows_throughput_mbps_month_price("multi_az")
+                .unwrap(),
+            5.175
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_throughput_mbps_month_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(
+            reg.fsx_windows_throughput_mbps_month_price("unknown")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_fsx_windows_backup_gb_month_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.fsx_windows_backup_gb_month_price(), 0.05);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Directory Service pricing (catches return value and match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_directory_service_dc_hour_price_standard() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.directory_service_dc_hour_price("Standard").unwrap(),
+            0.073
+        );
+    }
+
+    #[test]
+    fn test_directory_service_dc_hour_price_enterprise() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.directory_service_dc_hour_price("Enterprise").unwrap(),
+            0.2225
+        );
+    }
+
+    #[test]
+    fn test_directory_service_dc_hour_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.directory_service_dc_hour_price("Unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for CloudWatch alarm price (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cloudwatch_alarm_month_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.cloudwatch_alarm_month_price(), 0.10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for CloudTrail pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cloudtrail_data_event_price_per_100k() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.cloudtrail_data_event_price_per_100k(), 0.10);
+    }
+
+    #[test]
+    fn test_cloudtrail_management_event_copy_price_per_100k() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.cloudtrail_management_event_copy_price_per_100k(), 2.00);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for Backup warm storage pricing (catches return value and match arm deletion mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_warm_storage_gb_month_price_ebs() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.backup_warm_storage_gb_month_price("ebs").unwrap(), 0.05);
+    }
+
+    #[test]
+    fn test_backup_warm_storage_gb_month_price_efs() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.backup_warm_storage_gb_month_price("efs").unwrap(), 0.06);
+    }
+
+    #[test]
+    fn test_backup_warm_storage_gb_month_price_rds() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.backup_warm_storage_gb_month_price("rds").unwrap(),
+            0.095
+        );
+    }
+
+    #[test]
+    fn test_backup_warm_storage_gb_month_price_aurora() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.backup_warm_storage_gb_month_price("aurora").unwrap(),
+            0.024
+        );
+    }
+
+    #[test]
+    fn test_backup_warm_storage_gb_month_price_dynamodb() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(
+            reg.backup_warm_storage_gb_month_price("dynamodb").unwrap(),
+            0.114
+        );
+    }
+
+    #[test]
+    fn test_backup_warm_storage_gb_month_price_not_found() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert!(reg.backup_warm_storage_gb_month_price("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for inter-region data transfer price (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_data_transfer_inter_region_price_per_gb() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.data_transfer_inter_region_price_per_gb(), 0.09);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for GuardDuty pricing (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_guardduty_cloudtrail_event_price() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        let price = reg.guardduty_price();
+        assert_eq!(price.cloudtrail_event_price, 0.000_004_72);
+        assert_eq!(price.flowlog_dns_gb_tiers.len(), 4);
+        assert_eq!(price.flowlog_dns_gb_tiers[0].price_per_gb, 1.18);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for transcribe standard batch price (catches return value mutants)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_transcribe_standard_batch_price_per_minute() {
+        let reg = PricingRegistry::new("ap-northeast-1");
+        assert_eq!(reg.transcribe_standard_batch_price_per_minute(), 0.024);
+    }
 }
