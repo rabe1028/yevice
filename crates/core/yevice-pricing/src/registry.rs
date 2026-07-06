@@ -1,10 +1,13 @@
 use crate::error::PricingError;
 use crate::model::*;
 
-/// Pricing registry that provides pricing data for AWS services.
+/// Static AWS pricing registry.
 ///
-/// For MVP, this uses hardcoded ap-northeast-1 pricing data.
-/// In the future, this will be populated from AWS Bulk Pricing API data.
+/// Follow-up note: this type remains only for services whose Bulk API
+/// file-backed parser has not been implemented yet, and for explicit
+/// hardcoded-only catalog construction. Services routed through
+/// `FilePricingRegistry` must not silently fall back here. A separate cleanup
+/// PR should rename/shrink this type once more AWS services are file-backed.
 pub struct PricingRegistry {
     pub region: String,
 }
