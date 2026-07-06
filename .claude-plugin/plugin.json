@@ -5,8 +5,8 @@
   "version": "0.1.0",
   "description": "Estimate AWS / GCP cloud costs from CloudFormation / Terraform / Cloudflare Wrangler templates using the yevice Rust CLI. Includes a Claude Skill that drives generate / eval / sensitivity / optimize workflows and interactively fills the parameter file.",
   "author": {
-    "name": "Ryo Abe",
-    "email": "ryo.abe@tier4.jp"
+    "name": "rabe1028",
+    "email": "rabe1028@users.noreply.github.com"
   },
   "homepage": "https://github.com/rabe1028/yevice",
   "repository": "https://github.com/rabe1028/yevice",
