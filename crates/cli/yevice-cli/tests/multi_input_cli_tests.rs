@@ -171,20 +171,13 @@ fn validate_supports_wrangler_directory_input() {
 const CFN_TEMPLATE_REQUIRES_PARAM: &str = r#"
 AWSTemplateFormatVersion: "2010-09-09"
 Parameters:
-  TableName:
+  BucketName:
     Type: String
 Resources:
-  Table:
-    Type: AWS::DynamoDB::Table
+  Bucket:
+    Type: AWS::S3::Bucket
     Properties:
-      TableName: !Ref TableName
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: pk
-          AttributeType: S
-      KeySchema:
-        - AttributeName: pk
-          KeyType: HASH
+      BucketName: !Ref BucketName
 "#;
 
 /// Default (Lenient) generate of a CFN template missing a required parameter

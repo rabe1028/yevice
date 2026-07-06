@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fixed Kinesis Data Streams pricing for `ap-northeast-1`: provisioned PUT
+  payload units, on-demand ingestion, and on-demand GetRecords retrieval now
+  use current AWS Price List API rates, and downloaded Kinesis pricing files
+  are parsed for on-demand stream components instead of falling back to stale
+  hardcoded defaults.
+- File-backed AWS pricing lookups now return `PricingError::NotFound` when a
+  loaded Bulk API catalog is missing the expected service entry instead of
+  silently returning in-memory prices. This covers Lambda, EC2, RDS, RDS gp3,
+  DynamoDB, and Kinesis lookups.
+- `AwsPricingCatalog::auto` now returns an actionable `MissingPricingData`
+  error for Bulk-API-backed services when `pricing-data/` is absent, prompting
+  users to run `yevice update-pricing --region <REGION>` instead of silently
+  using in-memory prices.
+- Cost-model generation now treats pricing lookup failures for registered
+  services as fatal even in lenient parse mode, so missing downloaded pricing
+  cannot produce a partial cost model that appears valid.
+- DynamoDB file-backed pricing now reads provisioned WCU/RCU hourly prices from
+  Bulk API `CommittedThroughput` entries instead of mixing downloaded
+  on-demand/storage prices with in-memory provisioned rates.
 - `RawCfnResource.properties` is now `BTreeMap<String, IacPropertyValue>`.
   The CFN convert layer (`resolved_to_cfn_property`) now emits typed
   `ResourceRef` / `ResourceAttr` for single-ref values and

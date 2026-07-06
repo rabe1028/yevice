@@ -14,9 +14,9 @@ fn fixture_dir() -> PathBuf {
 }
 
 #[test]
-fn file_registry_uses_loaded_lambda_prices_instead_of_fallback_defaults() {
+fn file_registry_uses_loaded_lambda_prices() {
     let registry = FilePricingRegistry::load("ap-northeast-1", fixture_dir());
-    let price = registry.lambda_price();
+    let price = registry.lambda_price().unwrap();
 
     assert_close(price.request_price, 0.0000009);
     assert_close(price.gb_second_price, 0.0000999);
@@ -31,13 +31,13 @@ fn file_registry_uses_loaded_lambda_prices_instead_of_fallback_defaults() {
 /// (0.1216 and 0.008), so if the file-backed lookup falls back to hardcoded
 /// values the assertions will fail.
 #[test]
-fn file_registry_returns_gp3_prices_from_rds_json_not_hardcoded_fallback() {
+fn file_registry_returns_gp3_prices_from_rds_json() {
     let registry = FilePricingRegistry::load("us-east-1", fixture_dir());
 
-    let storage_price = registry.rds_gp3_storage_price();
+    let storage_price = registry.rds_gp3_storage_price().unwrap();
     assert_close(storage_price, 0.1300);
 
-    let iops_price = registry.rds_gp3_iops_price();
+    let iops_price = registry.rds_gp3_iops_price().unwrap();
     assert_close(iops_price, 0.0090);
 }
 
@@ -48,14 +48,14 @@ fn file_registry_returns_gp3_prices_from_rds_json_not_hardcoded_fallback() {
 fn file_registry_gp3_lookup_selects_single_az_row_not_multi_az() {
     let registry = FilePricingRegistry::load("us-east-1", fixture_dir());
 
-    let storage_price = registry.rds_gp3_storage_price();
+    let storage_price = registry.rds_gp3_storage_price().unwrap();
     assert_close(storage_price, 0.1300);
     assert!(
         (storage_price - 0.2600).abs() > 1e-6,
         "must not return the Multi-AZ storage price ($0.2600)"
     );
 
-    let iops_price = registry.rds_gp3_iops_price();
+    let iops_price = registry.rds_gp3_iops_price().unwrap();
     assert_close(iops_price, 0.0090);
     assert!(
         (iops_price - 0.0180).abs() > 1e-6,

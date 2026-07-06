@@ -7,6 +7,15 @@ pub enum PricingError {
     #[error("pricing data not found for {service} in {region}")]
     NotFound { service: String, region: String },
 
+    #[error(
+        "downloaded pricing data for {service} is not available in {data_dir} for {region}; run `yevice update-pricing --region {region}` and retry"
+    )]
+    MissingPricingData {
+        service: String,
+        region: String,
+        data_dir: String,
+    },
+
     #[error("pricing data file not found: {0}")]
     FileNotFound(String),
 
