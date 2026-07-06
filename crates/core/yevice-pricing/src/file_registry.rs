@@ -168,6 +168,8 @@ impl FilePricingRegistry {
                     ("instanceType", instance_type),
                     ("databaseEngine", "SQL Server"),
                     ("databaseEdition", "Standard"),
+                    ("licenseModel", "License included"),
+                    ("deploymentOption", "Single-AZ"),
                 ],
             ),
             _ => find_entries(
@@ -681,6 +683,35 @@ mod tests {
         }
     }
 
+    fn rds_sqlserver_entry(
+        sku: &str,
+        license_model: &str,
+        deployment_option: &str,
+        price: f64,
+    ) -> PricingEntry {
+        PricingEntry {
+            sku: sku.to_string(),
+            product_family: "Database Instance".to_string(),
+            attributes: std::collections::HashMap::from([
+                ("instanceType".to_string(), "db.r5.large".to_string()),
+                ("databaseEngine".to_string(), "SQL Server".to_string()),
+                ("databaseEdition".to_string(), "Standard".to_string()),
+                ("licenseModel".to_string(), license_model.to_string()),
+                (
+                    "deploymentOption".to_string(),
+                    deployment_option.to_string(),
+                ),
+            ]),
+            dimensions: vec![PricingDimension {
+                description: format!("SQL Server Standard {license_model} {deployment_option}"),
+                unit: "Hrs".to_string(),
+                price_usd: price,
+                begin_range: 0.0,
+                end_range: None,
+            }],
+        }
+    }
+
     #[test]
     fn load_skips_service_files_without_implemented_file_backed_lookups() {
         let dir = make_temp_dir("unsupported_service_files");
@@ -695,6 +726,33 @@ mod tests {
         assert!(reg.metadata("s3").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rds_sqlserver_selects_single_az_license_included_row() {
+        let mut registry = test_registry();
+        registry.services.insert(
+            "rds".to_string(),
+            vec![
+                rds_sqlserver_entry(
+                    "RDS-SQLSERVER-SE-BYOL",
+                    "Bring your own license",
+                    "Single-AZ",
+                    0.111,
+                ),
+                rds_sqlserver_entry(
+                    "RDS-SQLSERVER-SE-MULTIAZ",
+                    "License included",
+                    "Multi-AZ",
+                    1.110,
+                ),
+                rds_sqlserver_entry("RDS-SQLSERVER-SE", "License included", "Single-AZ", 0.555),
+            ],
+        );
+
+        let price = registry.rds_price("db.r5.large", "sqlserver-se").unwrap();
+
+        assert_eq!(price.hourly_price, 0.555);
     }
 
     /// When a downloaded Lambda pricing file loads successfully but has no

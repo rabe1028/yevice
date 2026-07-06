@@ -41,7 +41,9 @@
       "attributes": {
         "instanceType": "db.r5.large",
         "databaseEngine": "SQL Server",
-        "databaseEdition": "Standard"
+        "databaseEdition": "Standard",
+        "licenseModel": "License included",
+        "deploymentOption": "Single-AZ"
       }
     },
     "RDS-GP3-STORAGE": {
