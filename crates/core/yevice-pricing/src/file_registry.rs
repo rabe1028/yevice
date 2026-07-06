@@ -41,17 +41,7 @@ impl FilePricingRegistry {
         let data_dir = data_dir.into();
         let region = region.into();
 
-        let service_names = [
-            "lambda",
-            "ec2",
-            "rds",
-            "s3",
-            "dynamodb",
-            "ecs",
-            "kinesis",
-            "sqs",
-            "cloudwatch",
-        ];
+        let service_names = ["lambda", "ec2", "rds", "dynamodb", "kinesis"];
 
         let mut services: HashMap<String, Vec<PricingEntry>> = HashMap::new();
         let mut metadata: HashMap<String, PricingMetadata> = HashMap::new();
@@ -146,20 +136,45 @@ impl FilePricingRegistry {
 
     pub fn rds_price(&self, instance_type: &str, engine: &str) -> Result<RdsPrice, PricingError> {
         let entries = self.entries_required("rds")?;
-        let db_engine = match engine {
-            "mysql" | "mariadb" => "MySQL",
-            "postgres" => "PostgreSQL",
-            "aurora-mysql" => "Aurora MySQL",
-            "aurora-postgresql" => "Aurora PostgreSQL",
-            _ => engine,
+        let matches = match engine {
+            "mysql" | "mariadb" => find_entries(
+                entries,
+                &[("instanceType", instance_type), ("databaseEngine", "MySQL")],
+            ),
+            "postgres" => find_entries(
+                entries,
+                &[
+                    ("instanceType", instance_type),
+                    ("databaseEngine", "PostgreSQL"),
+                ],
+            ),
+            "aurora-mysql" => find_entries(
+                entries,
+                &[
+                    ("instanceType", instance_type),
+                    ("databaseEngine", "Aurora MySQL"),
+                ],
+            ),
+            "aurora-postgresql" => find_entries(
+                entries,
+                &[
+                    ("instanceType", instance_type),
+                    ("databaseEngine", "Aurora PostgreSQL"),
+                ],
+            ),
+            "sqlserver-se" | "sqlserver" => find_entries(
+                entries,
+                &[
+                    ("instanceType", instance_type),
+                    ("databaseEngine", "SQL Server"),
+                    ("databaseEdition", "Standard"),
+                ],
+            ),
+            _ => find_entries(
+                entries,
+                &[("instanceType", instance_type), ("databaseEngine", engine)],
+            ),
         };
-        let matches = find_entries(
-            entries,
-            &[
-                ("instanceType", instance_type),
-                ("databaseEngine", db_engine),
-            ],
-        );
 
         Ok(RdsPrice {
             instance_type: instance_type.to_string(),
@@ -308,7 +323,14 @@ fn dynamodb_required_price(
     required_price(
         registry,
         label,
-        find_entries(entries, &[("group", group), ("operation", operation)]),
+        entries.iter().filter(|entry| {
+            entry.attributes.get("group").is_some_and(|v| v == group)
+                && entry
+                    .attributes
+                    .get("operation")
+                    .is_some_and(|v| v == operation)
+                && is_dynamodb_standard_table_class(entry)
+        }),
     )
 }
 
@@ -321,12 +343,33 @@ fn dynamodb_storage_price(
         "dynamodb:storage",
         entries.iter().filter(|entry| {
             entry.product_family == "Database Storage"
+                && is_dynamodb_standard_table_class(entry)
                 && entry
                     .attributes
                     .get("usagetype")
                     .is_some_and(|usage| usage.ends_with("-TimedStorage-ByteHrs"))
         }),
     )
+}
+
+fn is_dynamodb_standard_table_class(entry: &PricingEntry) -> bool {
+    if let Some(table_class) = entry.attributes.get("tableClass") {
+        return matches!(
+            table_class.as_str(),
+            "Standard" | "DynamoDB Standard" | "DynamoDB Standard table class"
+        );
+    }
+
+    let has_ia_usage = entry
+        .attributes
+        .get("usagetype")
+        .is_some_and(|usage| usage.contains("-IA-"));
+    let has_ia_description = entry.dimensions.iter().any(|dim| {
+        dim.description.contains("Standard-IA")
+            || dim.description.contains("Standard Infrequent Access")
+    });
+
+    !has_ia_usage && !has_ia_description
 }
 
 fn required_price<'a>(
@@ -619,6 +662,41 @@ mod tests {
         }
     }
 
+    fn dynamodb_entry(group: &str, operation: &str, usagetype: &str, price: f64) -> PricingEntry {
+        PricingEntry {
+            sku: format!("{group}:{operation}:{usagetype}"),
+            product_family: "Amazon DynamoDB".to_string(),
+            attributes: std::collections::HashMap::from([
+                ("group".to_string(), group.to_string()),
+                ("operation".to_string(), operation.to_string()),
+                ("usagetype".to_string(), usagetype.to_string()),
+            ]),
+            dimensions: vec![PricingDimension {
+                description: format!("{usagetype} test price"),
+                unit: "Requests".to_string(),
+                price_usd: price,
+                begin_range: 0.0,
+                end_range: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn load_skips_service_files_without_implemented_file_backed_lookups() {
+        let dir = make_temp_dir("unsupported_service_files");
+        std::fs::write(
+            dir.join("s3.json"),
+            minimal_bulk_json_with_wrong_group("AmazonS3"),
+        )
+        .unwrap();
+
+        let reg = FilePricingRegistry::load("ap-northeast-1", &dir);
+
+        assert!(reg.metadata("s3").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// When a downloaded Lambda pricing file loads successfully but has no
     /// `AWS-Lambda-Requests` group, lookup must fail instead of returning a
     /// hardcoded price.
@@ -656,9 +734,54 @@ mod tests {
     }
 
     #[test]
+    fn dynamodb_required_price_prefers_standard_table_class_over_standard_ia() {
+        let registry = test_registry();
+        let entries = vec![
+            dynamodb_entry(
+                "DDB-WriteUnits",
+                "PayPerRequestThroughput",
+                "APN1-IA-WriteRequestUnits",
+                999.0,
+            ),
+            dynamodb_entry(
+                "DDB-WriteUnits",
+                "PayPerRequestThroughput",
+                "APN1-WriteRequestUnits",
+                0.00000125,
+            ),
+        ];
+
+        let price = dynamodb_required_price(
+            &registry,
+            &entries,
+            "dynamodb:pay_per_request_write",
+            "DDB-WriteUnits",
+            "PayPerRequestThroughput",
+        )
+        .unwrap();
+
+        assert_eq!(price, 0.00000125);
+    }
+
+    #[test]
+    fn dynamodb_standard_table_class_rejects_infrequent_access_description() {
+        let mut entry = dynamodb_entry(
+            "DDB-ReadUnits",
+            "PayPerRequestThroughput",
+            "APN1-ReadRequestUnits",
+            999.0,
+        );
+        entry.dimensions[0].description =
+            "DynamoDB Standard Infrequent Access read request".to_string();
+
+        assert!(!is_dynamodb_standard_table_class(&entry));
+    }
+
+    #[test]
     fn dynamodb_storage_price_requires_storage_family_and_timed_storage_usage() {
         let registry = test_registry();
         let entries = vec![
+            pricing_entry("Database Storage", "APN1-IA-TimedStorage-ByteHrs", 1.10),
             pricing_entry("Wrong Family", "APN1-TimedStorage-ByteHrs", 999.0),
             pricing_entry("Database Storage", "APN1-NotStorage-ByteHrs", 888.0),
             pricing_entry("Database Storage", "APN1-TimedStorage-ByteHrs", 0.275),

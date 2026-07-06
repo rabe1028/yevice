@@ -84,6 +84,10 @@ fn file_registry_maps_rds_engine_aliases_to_bulk_api_database_engine_names() {
         .unwrap();
     assert_close(aurora_postgresql.hourly_price, 0.444);
     assert_close(aurora_postgresql.storage_price_per_gb, 0.138);
+
+    let sqlserver = registry.rds_price("db.r5.large", "sqlserver-se").unwrap();
+    assert_close(sqlserver.hourly_price, 0.555);
+    assert_close(sqlserver.storage_price_per_gb, 0.138);
 }
 
 /// Metadata is populated from top-level fields in the Bulk API JSON.
