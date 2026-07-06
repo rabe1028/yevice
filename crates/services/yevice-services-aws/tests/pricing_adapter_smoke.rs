@@ -72,6 +72,13 @@ const DYNAMIC_SKU_SAMPLES: &[&str] = &[
 /// supported region for the in-memory registry, so every SKU should resolve here.
 const TEST_REGION: &str = "ap-northeast-1";
 
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn every_static_sku_literal_resolves() {
     let services_dir = service_source_dir();
@@ -247,6 +254,27 @@ fn auto_missing_pricing_data_dir_prompts_update_pricing_for_file_backed_services
     }
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_backed_catalog_returns_gp3_prices_from_downloaded_rds_json() {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../core/yevice-pricing/tests/fixtures/file-registry");
+    let catalog = AwsPricingCatalog::with_data_dir("us-east-1", fixture_dir);
+
+    let storage_price = catalog
+        .lookup(&Sku::new("aws.rds.gp3_storage_gb_month"))
+        .unwrap()
+        .as_scalar()
+        .unwrap();
+    assert_close(storage_price, 0.1300);
+
+    let iops_price = catalog
+        .lookup(&Sku::new("aws.rds.gp3_iops_month"))
+        .unwrap()
+        .as_scalar()
+        .unwrap();
+    assert_close(iops_price, 0.0090);
 }
 
 // ---------------------------------------------------------------------------

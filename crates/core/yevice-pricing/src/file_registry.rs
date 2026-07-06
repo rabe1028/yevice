@@ -384,6 +384,7 @@ fn load_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bulk_api::PricingDimension;
 
     /// Build a minimal Bulk Pricing JSON fixture with a single SKU whose
     /// `group` attribute is deliberately set to `WRONG_GROUP_NAME`.  When the
@@ -591,6 +592,33 @@ mod tests {
         }
     }
 
+    fn test_registry() -> FilePricingRegistry {
+        FilePricingRegistry {
+            region: "ap-northeast-1".to_string(),
+            data_dir: std::path::PathBuf::new(),
+            services: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+
+    fn pricing_entry(product_family: &str, usagetype: &str, price: f64) -> PricingEntry {
+        PricingEntry {
+            sku: format!("{product_family}:{usagetype}"),
+            product_family: product_family.to_string(),
+            attributes: std::collections::HashMap::from([(
+                "usagetype".to_string(),
+                usagetype.to_string(),
+            )]),
+            dimensions: vec![PricingDimension {
+                description: "test price".to_string(),
+                unit: "GB-Mo".to_string(),
+                price_usd: price,
+                begin_range: 0.0,
+                end_range: None,
+            }],
+        }
+    }
+
     /// When a downloaded Lambda pricing file loads successfully but has no
     /// `AWS-Lambda-Requests` group, lookup must fail instead of returning a
     /// hardcoded price.
@@ -625,6 +653,20 @@ mod tests {
         assert_not_found(reg.dynamodb_price(), "dynamodb:pay_per_request_write");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamodb_storage_price_requires_storage_family_and_timed_storage_usage() {
+        let registry = test_registry();
+        let entries = vec![
+            pricing_entry("Wrong Family", "APN1-TimedStorage-ByteHrs", 999.0),
+            pricing_entry("Database Storage", "APN1-NotStorage-ByteHrs", 888.0),
+            pricing_entry("Database Storage", "APN1-TimedStorage-ByteHrs", 0.275),
+        ];
+
+        let price = dynamodb_storage_price(&registry, &entries).unwrap();
+
+        assert_eq!(price, 0.275);
     }
 
     /// When a downloaded Kinesis pricing file loads successfully but has no
