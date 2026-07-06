@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
-          install_args: github:sourcefrog/cargo-mutants
+          install_args: cargo:cargo-mutants
       - name: Run cargo-mutants (full workspace)
         # 変異テストは「弱いテストの定期発見」が目的。
         # missed (exit 2) / timeout (exit 3) は想定内の発見結果なので失敗扱いにせず警告に留め、
@@ -80,7 +80,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
-          install_args: github:sourcefrog/cargo-mutants
+          install_args: cargo:cargo-mutants
       - name: Generate diff against base branch
         env:
           BASE_REF: ${{ github.base_ref }}

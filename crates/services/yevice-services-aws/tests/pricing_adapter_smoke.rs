@@ -69,9 +69,15 @@ const DYNAMIC_SKU_SAMPLES: &[&str] = &[
 ];
 
 /// Region used for all smoke-test catalog lookups. Tokyo is the default
-/// supported region for the hardcoded fallback registry, so every SKU
-/// should resolve here.
+/// supported region for the in-memory registry, so every SKU should resolve here.
 const TEST_REGION: &str = "ap-northeast-1";
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "expected {expected}, got {actual}"
+    );
+}
 
 #[test]
 fn every_static_sku_literal_resolves() {
@@ -175,9 +181,148 @@ fn every_dynamic_sku_sample_resolves() {
     );
 }
 
+#[test]
+fn file_backed_kinesis_missing_price_returns_error_not_hardcoded_price() {
+    let dir = make_temp_dir("aws_catalog_missing_kinesis_price");
+    fs::write(dir.join("kinesis.json"), minimal_wrong_group_bulk_json()).unwrap();
+
+    let catalog = AwsPricingCatalog::with_data_dir(TEST_REGION, &dir);
+    let err = catalog
+        .lookup(&Sku::new("aws.kinesis.put_payload_unit_price"))
+        .expect_err("missing Kinesis price must not fall back to hardcoded pricing");
+
+    match err {
+        PricingError::NotFound { service, region } => {
+            assert!(
+                service.starts_with("kinesis:"),
+                "expected Kinesis-specific NotFound, got {service}"
+            );
+            assert_eq!(region, TEST_REGION);
+        }
+        other => panic!("expected NotFound, got {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_backed_kinesis_missing_file_returns_error_not_hardcoded_price() {
+    let dir = make_temp_dir("aws_catalog_missing_kinesis_file");
+
+    let catalog = AwsPricingCatalog::with_data_dir(TEST_REGION, &dir);
+    let err = catalog
+        .lookup(&Sku::new("aws.kinesis.put_payload_unit_price"))
+        .expect_err("missing kinesis.json must not fall back to hardcoded pricing");
+
+    match err {
+        PricingError::NotFound { service, region } => {
+            assert_eq!(service, "kinesis");
+            assert_eq!(region, TEST_REGION);
+        }
+        other => panic!("expected NotFound, got {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn auto_missing_pricing_data_dir_prompts_update_pricing_for_file_backed_services() {
+    let dir = make_temp_dir("aws_catalog_missing_pricing_data_dir");
+    let missing_dir = dir.join("pricing-data");
+
+    let catalog = AwsPricingCatalog::auto_with_data_dir(TEST_REGION, &missing_dir);
+    let err = catalog
+        .lookup(&Sku::new("aws.kinesis.put_payload_unit_price"))
+        .expect_err("auto without pricing-data must not fall back to hardcoded Kinesis pricing");
+    let message = err.to_string();
+
+    match err {
+        PricingError::MissingPricingData {
+            service,
+            region,
+            data_dir,
+        } => {
+            assert_eq!(service, "kinesis");
+            assert_eq!(region, TEST_REGION);
+            assert_eq!(data_dir, missing_dir.display().to_string());
+            assert!(
+                message.contains("yevice update-pricing"),
+                "error should tell the user how to fetch pricing data: {message}"
+            );
+        }
+        other => panic!("expected MissingPricingData, got {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn file_backed_catalog_returns_gp3_prices_from_downloaded_rds_json() {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../core/yevice-pricing/tests/fixtures/file-registry");
+    let catalog = AwsPricingCatalog::with_data_dir("us-east-1", fixture_dir);
+
+    let storage_price = catalog
+        .lookup(&Sku::new("aws.rds.gp3_storage_gb_month"))
+        .unwrap()
+        .as_scalar()
+        .unwrap();
+    assert_close(storage_price, 0.1300);
+
+    let iops_price = catalog
+        .lookup(&Sku::new("aws.rds.gp3_iops_month"))
+        .unwrap()
+        .as_scalar()
+        .unwrap();
+    assert_close(iops_price, 0.0090);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn make_temp_dir(suffix: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "yevice_services_aws_test_{}_{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn minimal_wrong_group_bulk_json() -> &'static str {
+    r#"{
+      "offerCode": "AmazonKinesis",
+      "products": {
+        "SKU001": {
+          "sku": "SKU001",
+          "productFamily": "Kinesis Streams",
+          "attributes": {
+            "group": "WRONG_GROUP_NAME",
+            "operation": "WrongOperation"
+          }
+        }
+      },
+      "terms": {
+        "OnDemand": {
+          "SKU001": {
+            "SKU001.TERM": {
+              "sku": "SKU001",
+              "priceDimensions": {
+                "SKU001.DIM": {
+                  "description": "wrong Kinesis row",
+                  "beginRange": "0",
+                  "endRange": "Inf",
+                  "unit": "Requests",
+                  "pricePerUnit": {"USD": "999.0"}
+                }
+              }
+            }
+          }
+        }
+      }
+    }"#
+}
 
 fn service_source_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

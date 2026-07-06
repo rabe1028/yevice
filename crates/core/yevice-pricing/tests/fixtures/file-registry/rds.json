@@ -35,6 +35,17 @@
         "databaseEngine": "Aurora PostgreSQL"
       }
     },
+    "RDS-SQLSERVER-SE": {
+      "sku": "RDS-SQLSERVER-SE",
+      "productFamily": "Database Instance",
+      "attributes": {
+        "instanceType": "db.r5.large",
+        "databaseEngine": "SQL Server",
+        "databaseEdition": "Standard",
+        "licenseModel": "License included",
+        "deploymentOption": "Single-AZ"
+      }
+    },
     "RDS-GP3-STORAGE": {
       "sku": "RDS-GP3-STORAGE",
       "productFamily": "Database Storage",
@@ -129,6 +140,22 @@
               "unit": "Hrs",
               "pricePerUnit": {
                 "USD": "0.444"
+              }
+            }
+          }
+        }
+      },
+      "RDS-SQLSERVER-SE": {
+        "RDS-SQLSERVER-SE.JRTCKXETXF": {
+          "sku": "RDS-SQLSERVER-SE",
+          "priceDimensions": {
+            "RDS-SQLSERVER-SE-DIM": {
+              "description": "SQL Server Standard hourly",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Hrs",
+              "pricePerUnit": {
+                "USD": "0.555"
               }
             }
           }

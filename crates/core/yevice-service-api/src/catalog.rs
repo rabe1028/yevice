@@ -131,6 +131,7 @@ impl ServiceCatalog {
                 catalog,
             ) {
                 Ok(cost) => resource_costs.push(cost),
+                Err(e @ CostError::Pricing(_)) => return Err(e),
                 Err(e) => {
                     if strict {
                         return Err(e);

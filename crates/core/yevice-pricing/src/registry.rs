@@ -1,10 +1,13 @@
 use crate::error::PricingError;
 use crate::model::*;
 
-/// Pricing registry that provides pricing data for AWS services.
+/// Static AWS pricing registry.
 ///
-/// For MVP, this uses hardcoded ap-northeast-1 pricing data.
-/// In the future, this will be populated from AWS Bulk Pricing API data.
+/// Follow-up note: this type remains only for services whose Bulk API
+/// file-backed parser has not been implemented yet, and for explicit
+/// hardcoded-only catalog construction. Services routed through
+/// `FilePricingRegistry` must not silently fall back here. A separate cleanup
+/// PR should rename/shrink this type once more AWS services are file-backed.
 pub struct PricingRegistry {
     pub region: String,
 }
@@ -233,7 +236,13 @@ impl PricingRegistry {
     /// Kinesis: shard-hour price fallback (matches `kinesis_price`).
     pub(crate) const KINESIS_SHARD_HOUR_PRICE: f64 = 0.0195;
     /// Kinesis: PUT-payload-unit price fallback (matches `kinesis_price`).
-    pub(crate) const KINESIS_PUT_PAYLOAD_UNIT_PRICE: f64 = 0.0000002;
+    pub(crate) const KINESIS_PUT_PAYLOAD_UNIT_PRICE: f64 = 0.0000000215;
+    /// Kinesis on-demand: ingestion price per GB fallback (matches `kinesis_price`).
+    pub(crate) const KINESIS_ON_DEMAND_INGESTION_PRICE_PER_GB: f64 = 0.104;
+    /// Kinesis on-demand: GetRecords retrieval price per GB fallback (matches `kinesis_price`).
+    pub(crate) const KINESIS_ON_DEMAND_RETRIEVAL_PRICE_PER_GB: f64 = 0.052;
+    /// Kinesis on-demand: stream-hour price fallback (matches `kinesis_price`).
+    pub(crate) const KINESIS_ON_DEMAND_STREAM_HOUR_PRICE: f64 = 0.052;
 
     /// Kinesis Data Streams pricing for ap-northeast-1.
     pub fn kinesis_price(&self) -> KinesisPrice {
@@ -242,9 +251,9 @@ impl PricingRegistry {
             shard_hour_price: Self::KINESIS_SHARD_HOUR_PRICE,
             put_payload_unit_price: Self::KINESIS_PUT_PAYLOAD_UNIT_PRICE,
             // On-Demand mode
-            on_demand_ingestion_price_per_gb: 0.098, // $0.098 per GB
-            on_demand_retrieval_price_per_gb: 0.034, // $0.034 per GB
-            on_demand_stream_hour_price: 0.052,      // $0.052 per stream-hour
+            on_demand_ingestion_price_per_gb: Self::KINESIS_ON_DEMAND_INGESTION_PRICE_PER_GB,
+            on_demand_retrieval_price_per_gb: Self::KINESIS_ON_DEMAND_RETRIEVAL_PRICE_PER_GB,
+            on_demand_stream_hour_price: Self::KINESIS_ON_DEMAND_STREAM_HOUR_PRICE,
         }
     }
 
@@ -1621,8 +1630,10 @@ mod tests {
         let reg = PricingRegistry::new("ap-northeast-1");
         let price = reg.kinesis_price();
         assert_eq!(price.shard_hour_price, 0.0195);
-        assert_eq!(price.put_payload_unit_price, 0.0000002);
-        assert_eq!(price.on_demand_ingestion_price_per_gb, 0.098);
+        assert_eq!(price.put_payload_unit_price, 0.0000000215);
+        assert_eq!(price.on_demand_ingestion_price_per_gb, 0.104);
+        assert_eq!(price.on_demand_retrieval_price_per_gb, 0.052);
+        assert_eq!(price.on_demand_stream_hour_price, 0.052);
     }
 
     // -----------------------------------------------------------------------

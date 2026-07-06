@@ -37,8 +37,8 @@
 # cargo-mutants: source build (cargo backend) instead of the github prebuilt
 # binary. The upstream prebuilt release links against GLIBC 2.39, which fails to
 # start on older hosts (e.g. Ubuntu 22.04 / GLIBC 2.35). Building from source
-# matches the local toolchain. CI installs the github prebuilt directly via
-# `install_args` in .github/workflows/mutants.yml, so it is unaffected.
+# matches the local toolchain. CI installs this configured tool via
+# `install_args` in .github/workflows/mutants.yml so mise activates the shim.
 "cargo:cargo-mutants" = "27.1.0" # mutation testing (run on demand)
 
 # GitHub Actions security & linting (aqua backend; run in the actions-security CI job).

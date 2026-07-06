@@ -3,9 +3,9 @@
 //! Maps SKU strings (e.g. `"aws.lambda.gb_second"`) to the corresponding
 //! method on `PricingRegistry`.
 //!
-//! When constructed with `with_data_dir` or `auto`, looks up Lambda/EC2/RDS/S3/
-//! DynamoDB/ECS/Kinesis/SQS/CloudWatch prices from downloaded Bulk-API JSON
-//! files (`pricing-data/*.json`); other services use the hardcoded fallback.
+//! When constructed with `with_data_dir` or `auto`, looks up services with
+//! implemented Bulk-API parsers from downloaded JSON files (`pricing-data/*.json`).
+//! Missing file-backed prices are errors, not hardcoded fallbacks.
 
 use std::path::{Path, PathBuf};
 
@@ -16,17 +16,27 @@ use yevice_pricing::{
     catalog::{PriceCatalog, PricedValue, Sku},
     error::PricingError,
     file_registry::FilePricingRegistry,
+    model::{
+        ApiGatewayPrice, BatchPrice, CloudFrontPrice, CloudWatchLogsPrice, DataTransferPrice,
+        DynamoDbPrice, Ec2Price, ElastiCachePrice, EventBridgeSchedulerPrice, FargatePrice,
+        KinesisPrice, LambdaPrice, NatGatewayPrice, OpenSearchServerlessPrice, RdsPrice, S3Price,
+        SqsPrice, StepFunctionsPrice,
+    },
     registry::PricingRegistry,
 };
 use yevice_service_api::PriceCatalogResolver;
 
-use crate::pricing_provider::PricingProvider;
-
 pub struct AwsPricingCatalog {
-    /// Always populated; used as the fallback or as the sole source.
+    /// Always populated; used as the primary source for services whose Bulk
+    /// API parser has not been implemented yet.
     memory: PricingRegistry,
-    /// Optional file-backed registry (used for the services it knows about).
+    /// Optional file-backed registry. Services routed here must fail when the
+    /// requested price is missing.
     file: Option<FilePricingRegistry>,
+    /// Set by `auto` when `pricing-data/` is absent. Services whose Bulk API
+    /// parser exists fail with an actionable update-pricing message instead of
+    /// silently using the in-memory registry.
+    missing_data_dir: Option<PathBuf>,
     /// When `true`, promotional AWS Free Tier allowances (`*free_tier*` SKUs)
     /// resolve to `0`, so costs reflect list prices. Product-included
     /// allocations (e.g. QuickSight `free_spice_gb`, gp3 baseline IOPS) are
@@ -42,17 +52,18 @@ impl AwsPricingCatalog {
         Self {
             memory: PricingRegistry::new(&region),
             file: None,
+            missing_data_dir: None,
             list_price: false,
         }
     }
 
-    /// Use downloaded pricing data from `data_dir` for supported services,
-    /// falling back to hardcoded prices for everything else.
+    /// Use downloaded pricing data from `data_dir` for supported services.
     pub fn with_data_dir(region: impl Into<String>, data_dir: impl Into<PathBuf>) -> Self {
         let region = region.into();
         Self {
             memory: PricingRegistry::new(&region),
             file: Some(FilePricingRegistry::load(&region, data_dir)),
+            missing_data_dir: None,
             list_price: false,
         }
     }
@@ -64,42 +75,144 @@ impl AwsPricingCatalog {
         self
     }
 
-    /// Auto-select: use `pricing-data/` directory if present, otherwise hardcoded.
+    /// Auto-select: use `pricing-data/` directory if present. If the directory
+    /// is missing, Bulk-API-backed services return an actionable error.
     pub fn auto(region: impl Into<String>) -> Self {
-        let data_dir = Path::new("pricing-data");
+        Self::auto_with_data_dir(region, Path::new("pricing-data"))
+    }
+
+    #[doc(hidden)]
+    pub fn auto_with_data_dir(region: impl Into<String>, data_dir: impl AsRef<Path>) -> Self {
+        let data_dir = data_dir.as_ref();
         if data_dir.is_dir() {
             tracing::info!("using pricing data from {}", data_dir.display());
             Self::with_data_dir(region, data_dir)
         } else {
-            Self::new(region)
+            let region = region.into();
+            Self {
+                memory: PricingRegistry::new(&region),
+                file: None,
+                missing_data_dir: Some(data_dir.to_path_buf()),
+                list_price: false,
+            }
         }
     }
 
-    /// Returns the file-backed provider when available, otherwise the memory
-    /// registry. Used for trait-defined price methods so downloaded data wins.
-    fn provider(&self) -> &dyn PricingProvider {
+    fn missing_pricing_data(&self, service: &str) -> Option<PricingError> {
+        self.missing_data_dir
+            .as_ref()
+            .map(|data_dir| PricingError::MissingPricingData {
+                service: service.to_string(),
+                region: self.memory.region.clone(),
+                data_dir: data_dir.display().to_string(),
+            })
+    }
+
+    fn lambda_price(&self) -> Result<LambdaPrice, PricingError> {
         match &self.file {
-            Some(f) => f,
-            None => &self.memory,
+            Some(f) => f.lambda_price(),
+            None if let Some(err) = self.missing_pricing_data("lambda") => Err(err),
+            None => Ok(self.memory.lambda_price()),
         }
     }
 
-    /// RDS gp3 storage price per GB-month, routed through the file registry so
-    /// non-Tokyo regions emit a fallback warning consistent with other RDS paths.
-    fn rds_gp3_storage_price(&self) -> f64 {
+    fn ec2_price(&self, instance_type: &str) -> Result<Ec2Price, PricingError> {
+        match &self.file {
+            Some(f) => f.ec2_price(instance_type),
+            None if let Some(err) = self.missing_pricing_data("ec2") => Err(err),
+            None => self.memory.ec2_price(instance_type),
+        }
+    }
+
+    fn rds_price(&self, instance_type: &str, engine: &str) -> Result<RdsPrice, PricingError> {
+        match &self.file {
+            Some(f) => f.rds_price(instance_type, engine),
+            None if let Some(err) = self.missing_pricing_data("rds") => Err(err),
+            None => self.memory.rds_price(instance_type, engine),
+        }
+    }
+
+    fn dynamodb_price(&self) -> Result<DynamoDbPrice, PricingError> {
+        match &self.file {
+            Some(f) => f.dynamodb_price(),
+            None if let Some(err) = self.missing_pricing_data("dynamodb") => Err(err),
+            None => Ok(self.memory.dynamodb_price()),
+        }
+    }
+
+    fn kinesis_price(&self) -> Result<KinesisPrice, PricingError> {
+        match &self.file {
+            Some(f) => f.kinesis_price(),
+            None if let Some(err) = self.missing_pricing_data("kinesis") => Err(err),
+            None => Ok(self.memory.kinesis_price()),
+        }
+    }
+
+    fn s3_price(&self) -> S3Price {
+        self.memory.s3_price()
+    }
+
+    fn fargate_price(&self) -> FargatePrice {
+        self.memory.fargate_price()
+    }
+
+    fn opensearch_serverless_price(&self) -> OpenSearchServerlessPrice {
+        self.memory.opensearch_serverless_price()
+    }
+
+    fn sqs_price(&self) -> SqsPrice {
+        self.memory.sqs_price()
+    }
+
+    fn cloudwatch_logs_price(&self) -> CloudWatchLogsPrice {
+        self.memory.cloudwatch_logs_price()
+    }
+
+    fn api_gateway_price(&self) -> ApiGatewayPrice {
+        self.memory.api_gateway_price()
+    }
+
+    fn nat_gateway_price(&self) -> NatGatewayPrice {
+        self.memory.nat_gateway_price()
+    }
+
+    fn cloudfront_price(&self) -> CloudFrontPrice {
+        self.memory.cloudfront_price()
+    }
+
+    fn elasticache_price(&self, node_type: &str) -> Result<ElastiCachePrice, PricingError> {
+        self.memory.elasticache_price(node_type)
+    }
+
+    fn step_functions_price(&self) -> StepFunctionsPrice {
+        self.memory.step_functions_price()
+    }
+
+    fn eventbridge_scheduler_price(&self) -> EventBridgeSchedulerPrice {
+        self.memory.eventbridge_scheduler_price()
+    }
+
+    fn batch_price(&self) -> BatchPrice {
+        self.memory.batch_price()
+    }
+
+    fn data_transfer_price(&self) -> DataTransferPrice {
+        self.memory.data_transfer_price()
+    }
+
+    fn rds_gp3_storage_price(&self) -> Result<f64, PricingError> {
         match &self.file {
             Some(f) => f.rds_gp3_storage_price(),
-            None => self.memory.rds_gp3_storage_price(),
+            None if let Some(err) = self.missing_pricing_data("rds") => Err(err),
+            None => Ok(self.memory.rds_gp3_storage_price()),
         }
     }
 
-    /// RDS gp3 excess IOPS price per IOPS-month, routed through the file
-    /// registry so non-Tokyo regions emit a fallback warning consistent with
-    /// other RDS paths.
-    fn rds_gp3_iops_price(&self) -> f64 {
+    fn rds_gp3_iops_price(&self) -> Result<f64, PricingError> {
         match &self.file {
             Some(f) => f.rds_gp3_iops_price(),
-            None => self.memory.rds_gp3_iops_price(),
+            None if let Some(err) = self.missing_pricing_data("rds") => Err(err),
+            None => Ok(self.memory.rds_gp3_iops_price()),
         }
     }
 }
@@ -148,11 +261,11 @@ impl PriceCatalog for AwsPricingCatalog {
         let record: Result<PricedValue, PricingError> = match sku.as_str() {
             // Lambda
             "aws.lambda.request_price" => Ok(PricedValue::scalar(
-                self.provider().lambda_price().request_price,
+                self.lambda_price()?.request_price,
                 "USD",
             )),
             "aws.lambda.gb_second" => Ok(PricedValue::scalar(
-                self.provider().lambda_price().gb_second_price,
+                self.lambda_price()?.gb_second_price,
                 "USD",
             )),
             "aws.lambda.http_stream_gb" => Ok(PricedValue::scalar(
@@ -160,85 +273,81 @@ impl PriceCatalog for AwsPricingCatalog {
                 "USD",
             )),
             "aws.lambda.free_tier_requests" => Ok(PricedValue::scalar(
-                self.provider().lambda_price().free_tier_requests,
+                self.lambda_price()?.free_tier_requests,
                 "USD",
             )),
             "aws.lambda.free_tier_gb_seconds" => Ok(PricedValue::scalar(
-                self.provider().lambda_price().free_tier_gb_seconds,
+                self.lambda_price()?.free_tier_gb_seconds,
                 "USD",
             )),
 
             // DynamoDB
             "aws.dynamodb.write_request_price" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().write_request_price,
+                self.dynamodb_price()?.write_request_price,
                 "USD",
             )),
             "aws.dynamodb.read_request_price" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().read_request_price,
+                self.dynamodb_price()?.read_request_price,
                 "USD",
             )),
             "aws.dynamodb.wcu_hour_price" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().wcu_hour_price,
+                self.dynamodb_price()?.wcu_hour_price,
                 "USD",
             )),
             "aws.dynamodb.rcu_hour_price" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().rcu_hour_price,
+                self.dynamodb_price()?.rcu_hour_price,
                 "USD",
             )),
             "aws.dynamodb.storage_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().storage_price_per_gb,
+                self.dynamodb_price()?.storage_price_per_gb,
                 "USD",
             )),
             "aws.dynamodb.free_tier_wru" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().free_tier_wru,
+                self.dynamodb_price()?.free_tier_wru,
                 "USD",
             )),
             "aws.dynamodb.free_tier_rru" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().free_tier_rru,
+                self.dynamodb_price()?.free_tier_rru,
                 "USD",
             )),
             "aws.dynamodb.free_tier_storage_gb" => Ok(PricedValue::scalar(
-                self.provider().dynamodb_price().free_tier_storage_gb,
+                self.dynamodb_price()?.free_tier_storage_gb,
                 "USD",
             )),
 
             // Kinesis
             "aws.kinesis.shard_hour_price" => Ok(PricedValue::scalar(
-                self.provider().kinesis_price().shard_hour_price,
+                self.kinesis_price()?.shard_hour_price,
                 "USD",
             )),
             "aws.kinesis.put_payload_unit_price" => Ok(PricedValue::scalar(
-                self.provider().kinesis_price().put_payload_unit_price,
+                self.kinesis_price()?.put_payload_unit_price,
                 "USD",
             )),
             "aws.kinesis.on_demand_ingestion_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .kinesis_price()
-                    .on_demand_ingestion_price_per_gb,
+                self.kinesis_price()?.on_demand_ingestion_price_per_gb,
                 "USD",
             )),
             "aws.kinesis.on_demand_retrieval_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .kinesis_price()
-                    .on_demand_retrieval_price_per_gb,
+                self.kinesis_price()?.on_demand_retrieval_price_per_gb,
                 "USD",
             )),
             "aws.kinesis.on_demand_stream_hour_price" => Ok(PricedValue::scalar(
-                self.provider().kinesis_price().on_demand_stream_hour_price,
+                self.kinesis_price()?.on_demand_stream_hour_price,
                 "USD",
             )),
 
             // S3
             "aws.s3.put_request_price" => Ok(PricedValue::scalar(
-                self.provider().s3_price().put_request_price,
+                self.s3_price().put_request_price,
                 "USD",
             )),
             "aws.s3.get_request_price" => Ok(PricedValue::scalar(
-                self.provider().s3_price().get_request_price,
+                self.s3_price().get_request_price,
                 "USD",
             )),
             "aws.s3.storage_tiers" => {
-                let price = self.provider().s3_price();
+                let price = self.s3_price();
                 let tiers = price
                     .storage_tiers
                     .iter()
@@ -252,47 +361,43 @@ impl PriceCatalog for AwsPricingCatalog {
 
             // SQS
             "aws.sqs.standard_request_price" => Ok(PricedValue::scalar(
-                self.provider().sqs_price().standard_request_price,
+                self.sqs_price().standard_request_price,
                 "USD",
             )),
             "aws.sqs.fifo_request_price" => Ok(PricedValue::scalar(
-                self.provider().sqs_price().fifo_request_price,
+                self.sqs_price().fifo_request_price,
                 "USD",
             )),
             "aws.sqs.free_tier_requests" => Ok(PricedValue::scalar(
-                self.provider().sqs_price().free_tier_requests,
+                self.sqs_price().free_tier_requests,
                 "USD",
             )),
 
             // Fargate (ECS/Batch)
             "aws.fargate.vcpu_hour_price" => Ok(PricedValue::scalar(
-                self.provider().fargate_price().vcpu_hour_price,
+                self.fargate_price().vcpu_hour_price,
                 "USD",
             )),
             "aws.fargate.memory_gb_hour_price" => Ok(PricedValue::scalar(
-                self.provider().fargate_price().memory_gb_hour_price,
+                self.fargate_price().memory_gb_hour_price,
                 "USD",
             )),
 
             // CloudWatch Logs
             "aws.cloudwatch_logs.ingestion_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .cloudwatch_logs_price()
-                    .ingestion_price_per_gb,
+                self.cloudwatch_logs_price().ingestion_price_per_gb,
                 "USD",
             )),
             "aws.cloudwatch_logs.storage_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider().cloudwatch_logs_price().storage_price_per_gb,
+                self.cloudwatch_logs_price().storage_price_per_gb,
                 "USD",
             )),
             "aws.cloudwatch_logs.free_tier_ingestion_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .cloudwatch_logs_price()
-                    .free_tier_ingestion_gb,
+                self.cloudwatch_logs_price().free_tier_ingestion_gb,
                 "USD",
             )),
             "aws.cloudwatch_logs.free_tier_storage_gb" => Ok(PricedValue::scalar(
-                self.provider().cloudwatch_logs_price().free_tier_storage_gb,
+                self.cloudwatch_logs_price().free_tier_storage_gb,
                 "USD",
             )),
 
@@ -304,81 +409,68 @@ impl PriceCatalog for AwsPricingCatalog {
 
             // API Gateway
             "aws.api_gateway.rest_api_request_price" => Ok(PricedValue::scalar(
-                self.provider().api_gateway_price().rest_api_request_price,
+                self.api_gateway_price().rest_api_request_price,
                 "USD",
             )),
             "aws.api_gateway.http_api_request_price" => Ok(PricedValue::scalar(
-                self.provider().api_gateway_price().http_api_request_price,
+                self.api_gateway_price().http_api_request_price,
                 "USD",
             )),
             "aws.api_gateway.free_tier_requests" => Ok(PricedValue::scalar(
-                self.provider().api_gateway_price().free_tier_requests,
+                self.api_gateway_price().free_tier_requests,
                 "USD",
             )),
 
             // NAT Gateway
             "aws.nat_gateway.hourly_price" => Ok(PricedValue::scalar(
-                self.provider().nat_gateway_price().hourly_price,
+                self.nat_gateway_price().hourly_price,
                 "USD",
             )),
             "aws.nat_gateway.data_processing_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .nat_gateway_price()
-                    .data_processing_price_per_gb,
+                self.nat_gateway_price().data_processing_price_per_gb,
                 "USD",
             )),
 
             // CloudFront
             "aws.cloudfront.request_price_per_10k" => Ok(PricedValue::scalar(
-                self.provider().cloudfront_price().request_price_per_10k,
+                self.cloudfront_price().request_price_per_10k,
                 "USD",
             )),
             "aws.cloudfront.data_transfer_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .cloudfront_price()
-                    .data_transfer_price_per_gb,
+                self.cloudfront_price().data_transfer_price_per_gb,
                 "USD",
             )),
             "aws.cloudfront.free_tier_data_transfer_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .cloudfront_price()
-                    .free_tier_data_transfer_gb,
+                self.cloudfront_price().free_tier_data_transfer_gb,
                 "USD",
             )),
 
             // Step Functions
             "aws.step_functions.standard_transition_price" => Ok(PricedValue::scalar(
-                self.provider()
-                    .step_functions_price()
-                    .standard_transition_price,
+                self.step_functions_price().standard_transition_price,
                 "USD",
             )),
             "aws.step_functions.express_request_price" => Ok(PricedValue::scalar(
-                self.provider().step_functions_price().express_request_price,
+                self.step_functions_price().express_request_price,
                 "USD",
             )),
             "aws.step_functions.express_duration_price_per_gb_second" => Ok(PricedValue::scalar(
-                self.provider()
-                    .step_functions_price()
+                self.step_functions_price()
                     .express_duration_price_per_gb_second,
                 "USD",
             )),
             "aws.step_functions.free_tier_transitions" => Ok(PricedValue::scalar(
-                self.provider().step_functions_price().free_tier_transitions,
+                self.step_functions_price().free_tier_transitions,
                 "USD",
             )),
 
             // EventBridge Scheduler
             "aws.eventbridge_scheduler.invocation_price" => Ok(PricedValue::scalar(
-                self.provider()
-                    .eventbridge_scheduler_price()
-                    .invocation_price,
+                self.eventbridge_scheduler_price().invocation_price,
                 "USD",
             )),
             "aws.eventbridge_scheduler.free_tier_invocations" => Ok(PricedValue::scalar(
-                self.provider()
-                    .eventbridge_scheduler_price()
-                    .free_tier_invocations,
+                self.eventbridge_scheduler_price().free_tier_invocations,
                 "USD",
             )),
 
@@ -392,7 +484,7 @@ impl PriceCatalog for AwsPricingCatalog {
 
             // Data transfer (egress)
             "aws.data_transfer.egress_tiers" => {
-                let price = self.provider().data_transfer_price();
+                let price = self.data_transfer_price();
                 let tiers = price
                     .egress_tiers
                     .iter()
@@ -498,43 +590,39 @@ impl PriceCatalog for AwsPricingCatalog {
 
             // Batch
             "aws.batch.fargate_vcpu_hour_price" => Ok(PricedValue::scalar(
-                self.provider().batch_price().fargate_vcpu_hour_price,
+                self.batch_price().fargate_vcpu_hour_price,
                 "USD",
             )),
             "aws.batch.fargate_memory_gb_hour_price" => Ok(PricedValue::scalar(
-                self.provider().batch_price().fargate_memory_gb_hour_price,
+                self.batch_price().fargate_memory_gb_hour_price,
                 "USD",
             )),
             "aws.batch.fargate_ephemeral_storage_gb_hour_price" => Ok(PricedValue::scalar(
-                self.provider()
-                    .batch_price()
-                    .fargate_ephemeral_storage_gb_hour_price,
+                self.batch_price().fargate_ephemeral_storage_gb_hour_price,
                 "USD",
             )),
             "aws.batch.fargate_ephemeral_free_gb" => Ok(PricedValue::scalar(
-                self.provider().batch_price().fargate_ephemeral_free_gb,
+                self.batch_price().fargate_ephemeral_free_gb,
                 "USD",
             )),
             "aws.batch.ebs_gp3_gb_month_price" => Ok(PricedValue::scalar(
-                self.provider().batch_price().ebs_gp3_gb_month_price,
+                self.batch_price().ebs_gp3_gb_month_price,
                 "USD",
             )),
             "aws.batch.ebs_gp3_iops_month_price" => Ok(PricedValue::scalar(
-                self.provider().batch_price().ebs_gp3_iops_month_price,
+                self.batch_price().ebs_gp3_iops_month_price,
                 "USD",
             )),
             "aws.batch.ebs_gp3_iops_free" => Ok(PricedValue::scalar(
-                self.provider().batch_price().ebs_gp3_iops_free,
+                self.batch_price().ebs_gp3_iops_free,
                 "USD",
             )),
             "aws.batch.ebs_gp3_throughput_mibps_month_price" => Ok(PricedValue::scalar(
-                self.provider()
-                    .batch_price()
-                    .ebs_gp3_throughput_mibps_month_price,
+                self.batch_price().ebs_gp3_throughput_mibps_month_price,
                 "USD",
             )),
             "aws.batch.ebs_gp3_throughput_free_mibps" => Ok(PricedValue::scalar(
-                self.provider().batch_price().ebs_gp3_throughput_free_mibps,
+                self.batch_price().ebs_gp3_throughput_free_mibps,
                 "USD",
             )),
 
@@ -578,13 +666,11 @@ impl PriceCatalog for AwsPricingCatalog {
 
             // OpenSearch Serverless
             "aws.opensearch_serverless.ocu_hour_price" => Ok(PricedValue::scalar(
-                self.provider().opensearch_serverless_price().ocu_hour_price,
+                self.opensearch_serverless_price().ocu_hour_price,
                 "USD",
             )),
             "aws.opensearch_serverless.storage_price_per_gb" => Ok(PricedValue::scalar(
-                self.provider()
-                    .opensearch_serverless_price()
-                    .storage_price_per_gb,
+                self.opensearch_serverless_price().storage_price_per_gb,
                 "USD",
             )),
 
@@ -610,7 +696,7 @@ impl PriceCatalog for AwsPricingCatalog {
             sku if sku.starts_with("aws.ec2.instance.") => {
                 let itype = sku.strip_prefix("aws.ec2.instance.").unwrap_or("");
                 Ok(PricedValue::scalar(
-                    self.provider().ec2_price(itype)?.hourly_price,
+                    self.ec2_price(itype)?.hourly_price,
                     "USD",
                 ))
             }
@@ -618,20 +704,17 @@ impl PriceCatalog for AwsPricingCatalog {
             // before the generic `aws.rds.*` prefix guard below, as Rust
             // evaluates match arms in order and the prefix guard would shadow
             // these exact-string arms.
-            // Route through the file registry so that non-Tokyo regions emit a
-            // fallback warning consistent with other RDS paths (via
-            // FilePricingRegistry::warn_fallback_once).
             "aws.rds.gp3_storage_gb_month" => {
-                Ok(PricedValue::scalar(self.rds_gp3_storage_price(), "USD"))
+                Ok(PricedValue::scalar(self.rds_gp3_storage_price()?, "USD"))
             }
-            "aws.rds.gp3_iops_month" => Ok(PricedValue::scalar(self.rds_gp3_iops_price(), "USD")),
+            "aws.rds.gp3_iops_month" => Ok(PricedValue::scalar(self.rds_gp3_iops_price()?, "USD")),
             sku if sku.starts_with("aws.rds.") => {
                 // Format: aws.rds.<engine>.<instance_type>
                 let rest = sku.strip_prefix("aws.rds.").unwrap_or("");
                 let mut parts = rest.splitn(2, '.');
                 let engine = parts.next().unwrap_or("mysql");
                 let itype = parts.next().unwrap_or("db.t3.micro");
-                let price = self.provider().rds_price(itype, engine)?;
+                let price = self.rds_price(itype, engine)?;
                 Ok(PricedValue::scalar(price.hourly_price, "USD"))
             }
             sku if sku.starts_with("aws.rds_storage.") => {
@@ -639,13 +722,13 @@ impl PriceCatalog for AwsPricingCatalog {
                 let mut parts = rest.splitn(2, '.');
                 let engine = parts.next().unwrap_or("mysql");
                 let itype = parts.next().unwrap_or("db.t3.micro");
-                let price = self.provider().rds_price(itype, engine)?;
+                let price = self.rds_price(itype, engine)?;
                 Ok(PricedValue::scalar(price.storage_price_per_gb, "USD"))
             }
             sku if sku.starts_with("aws.elasticache.") => {
                 let node_type = sku.strip_prefix("aws.elasticache.").unwrap_or("");
                 Ok(PricedValue::scalar(
-                    self.provider().elasticache_price(node_type)?.hourly_price,
+                    self.elasticache_price(node_type)?.hourly_price,
                     "USD",
                 ))
             }

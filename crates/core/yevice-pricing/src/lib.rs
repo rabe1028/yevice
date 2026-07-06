@@ -3,11 +3,15 @@
 //! The cross-provider abstraction is [`catalog::PriceCatalog`]; every
 //! [`ProviderPlugin`](../yevice_service_api/trait.ProviderPlugin.html)
 //! returns its own implementation. The remaining modules are AWS-shaped
-//! internals (Bulk API parser, hardcoded fallback registry, downloaded-file
+//! internals (Bulk API parser, static AWS registry, downloaded-file
 //! registry, AWS price-model structs) used by `yevice-services-aws`. They
 //! live here so the download/parse plumbing is not duplicated, but no
 //! cross-provider code path depends on them — provider-neutral access goes
 //! through [`PriceCatalog`].
+//!
+//! The static AWS registry is intentionally still present for services whose
+//! Bulk API parser has not been implemented yet. File-backed services must not
+//! use it as a fallback; rename/shrink it in a focused follow-up PR.
 //!
 //! The AWS-specific `PricingProvider` trait that exposed those internals lives
 //! in `yevice-services-aws::pricing_provider`. See
