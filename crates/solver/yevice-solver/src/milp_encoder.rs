@@ -3401,4 +3401,41 @@ mod tests {
             result.err()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Tests for EncodedProblem Debug implementation (catches fn value mutants)
+    // -----------------------------------------------------------------------
+
+    /// `encoded_problem_debug_fmt` — verifies that the `Debug` impl for
+    /// `EncodedProblem` actually calls `fmt` and produces output containing
+    /// the struct name.  If the mutant replaces `fmt` with
+    /// `Ok(Default::default())` the debug string will be empty and this
+    /// assertion fails.
+    #[test]
+    fn encoded_problem_debug_fmt() {
+        let problem = OptimizationProblem {
+            objective: Expr::variable("x"),
+            direction: ObjectiveDirection::Minimize,
+            decision_variables: vec![DecisionVariable {
+                name: var("x"),
+                domain: vec![1.0, 2.0, 3.0],
+            }],
+            constraints: vec![],
+            fixed_params: HashMap::new(),
+            bindings: vec![],
+        };
+        let mut backend = CountingBackend::new();
+        let encoded = encode(&mut backend, &problem).expect("encode must succeed");
+        let debug_str = format!("{:?}", encoded);
+        assert!(
+            debug_str.contains("EncodedProblem"),
+            "Debug output must contain struct name; got: {}",
+            debug_str
+        );
+        assert!(
+            debug_str.contains("var_index_count"),
+            "Debug output must contain var_index_count; got: {}",
+            debug_str
+        );
+    }
 }
